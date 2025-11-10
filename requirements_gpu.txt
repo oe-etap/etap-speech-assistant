@@ -1,0 +1,11 @@
+# Python packages for GPU mode (UNTESTED)
+# External runtime dependency (install separately): ffmpeg (CLI must be on PATH)
+# Also ensure a CUDA-capable GPU and a matching PyTorch CUDA build.
+faster-whisper
+TTS
+torch
+sounddevice
+soundfile
+numpy
+requests
+scipy
