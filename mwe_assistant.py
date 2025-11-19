@@ -23,6 +23,7 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 import requests
+import json as _json
 
 import wave, json
 from vosk import Model, KaldiRecognizer
@@ -88,7 +89,6 @@ def stt_vosk(audio_int16, vosk_model_dir, samplerate=16000):
     rec = KaldiRecognizer(_vosk["model"], samplerate)
     rec.SetWords(True)
     ok = rec.AcceptWaveform(audio_int16.tobytes())
-    import json as _json
     if ok:
         result = _json.loads(rec.Result())
     else:
@@ -130,12 +130,21 @@ def tts_piper(text, piper_exe, piper_voice, output_file):
     cmd = [piper_exe, "-m", piper_voice, "-f", output_file]
     subprocess.run(cmd, input=text.encode("utf-8"), check=True)
 
-def tts_coqui(text, voice_model="xtts_v2", language="de", speaker="de_speaker_0", out_wav="out.wav"):
+def tts_coqui(text, voice_model="xtts_v2", language="de",
+              speaker="Aaron Dreschner", out_wav="out.wav"):
     global _coqui_tts
     if _coqui_tts is None:
         from TTS.api import TTS
         _coqui_tts = TTS(model_name=f"tts_models/multilingual/multi-dataset/{voice_model}")
-    _coqui_tts.tts_to_file(text=text, file_path=out_wav, speaker=speaker, language=language)
+    _coqui_tts.tts_to_file(
+        text=text,
+        file_path=out_wav,
+        speaker=speaker,
+        language=language
+    )
+
+
+
 
 
 # ---------- Main ----------
@@ -165,7 +174,12 @@ def main():
     parser.add_argument("--whisper-compute-type", default="float16", help="Compute type (float16, int8_float16, etc.)")
     parser.add_argument("--coqui-voice", default="xtts_v2", help="Coqui voice model key")
     parser.add_argument("--coqui-language", default="de", help="Language code for Coqui (e.g., de)")
-    parser.add_argument("--coqui-speaker", default="de_speaker_0", help="Speaker id for Coqui")
+    parser.add_argument("--coqui-speaker", default="Aaron Dreschner", help="Speaker id for Coqui")
+    # parser.add_argument(
+    # "--coqui-voice",
+    # default="thorsten",
+    # help="Coqui GPU voice: 'thorsten' for native German or 'xtts_v2' for multispeaker")
+
 
     # Shared LLM
     parser.add_argument("--ollama-model", default="phi3:mini", help="Ollama model (e.g., phi3:mini)")
@@ -193,11 +207,8 @@ def main():
         for turn in range(1, args.turns + 1):
             print("=" * 60)
 
-            # -------- Input: mic or file (file only allowed for CPU) --------
+            # -------- Input: mic or file --------
             if args.audio:
-                if args.mode != "cpu":
-                    print("[Error] File-based STT is only supported in CPU mode. Use: --mode cpu")
-                    return 1
                 audio = None
                 user_wav = os.path.join(run_dir, f"user_input_t{turn}.wav")
                 try:
@@ -221,22 +232,41 @@ def main():
             if args.audio:
                 print(f"[INFO] Processing audio file: {args.audio}")
                 wav_path = ensure_wav_mono_16k(args.audio)
+
                 t0 = time.perf_counter()
-                user_text = transcribe_with_vosk(wav_path, args.vosk_model)
+
+                if args.mode == "cpu":
+
+                    user_text = transcribe_with_vosk(wav_path, args.vosk_model)
+                else:
+                    audio_data, sr = sf.read(wav_path, dtype="int16")
+                    user_text = stt_whisper(
+                        audio_int16=audio_data,
+                        whisper_model_name=args.whisper_model,
+                        device=args.whisper_device,
+                        compute_type=args.whisper_compute_type,
+                        samplerate=16000
+                    )
                 t1 = time.perf_counter()
             else:
                 t0 = time.perf_counter()
+
                 if args.mode == "cpu":
-                    user_text = stt_vosk(audio_int16=audio,
-                                         vosk_model_dir=args.vosk_model,
-                                         samplerate=args.samplerate)
+                    user_text = stt_vosk(
+                        audio_int16=audio,
+                        vosk_model_dir=args.vosk_model,
+                        samplerate=args.samplerate
+                    )
                 else:
-                    user_text = stt_whisper(audio_int16=audio,
-                                            whisper_model_name=args.whisper_model,
-                                            device=args.whisper_device,
-                                            compute_type=args.whisper_compute_type,
-                                            samplerate=args.samplerate)
-                t1 = time.perf_counter()
+                    user_text = stt_whisper(
+                        audio_int16=audio,
+                        whisper_model_name=args.whisper_model,
+                        device=args.whisper_device,
+                        compute_type=args.whisper_compute_type,
+                        samplerate=args.samplerate
+                    )
+
+            t1 = time.perf_counter()
 
             writer.writerow([time.strftime("%Y-%m-%dT%H:%M:%S"), args.mode, turn, "stt", int((t1 - t0) * 1000)])
             print(f"[STT] {user_text!r}")
@@ -260,8 +290,13 @@ def main():
                 t1 = time.perf_counter()
             else:
                 t0 = time.perf_counter()
-                tts_coqui(text=reply, voice_model=args.coqui_voice, language=args.coqui_language,
-                          speaker=args.coqui_speaker, out_wav=out_wav)
+                tts_coqui(
+                text=reply,
+                voice_model=args.coqui_voice,
+                language=args.coqui_language,
+                speaker=args.coqui_speaker,
+                out_wav=out_wav)
+
                 t1 = time.perf_counter()
             writer.writerow([time.strftime("%Y-%m-%dT%H:%M:%S"), args.mode, turn, "tts", int((t1 - t0) * 1000)])
             print(f"[TTS] Saved to {out_wav}. Playing...")
