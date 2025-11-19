@@ -1,15 +1,15 @@
 # Offline Speech Assistant MWE (DE) – CPU/GPU
 
 Mic → STT → LLM → TTS, fully offline (except for Ollama model pulls). The script is turn-based
-and logs per-stage latency. **Tested path:** CPU mode. **GPU mode is provided but not yet tested.**
+and logs per-stage latency.
 
 ---
 
 ## Features
 - **CPU mode**: Vosk (STT) + Ollama (LLM) + Piper (TTS)
-- **GPU mode (untested)**: faster-whisper (STT) + Ollama (LLM) + Coqui TTS XTTS‑v2 (TTS)
+- **GPU mode**: faster-whisper (STT) + Ollama (LLM) + Coqui TTS XTTS‑v2 (TTS)
 - **Audio I/O**: microphone recording (sounddevice) + WAV playback (soundfile)
-- **File input**: in CPU mode you can process an existing audio file via `--audio <file>`
+- **File input**: you can process an existing audio file via `--audio <file>`
 - **Robust audio handling**: any input file is converted to mono 16 kHz WAV using **ffmpeg**
 - **Outputs**: every run creates `outputs/<timestamp>/` with all generated WAVs
 - **Latency CSV**: per-stage timings are appended to a CSV (path can be customized)
@@ -62,7 +62,7 @@ python mwe_assistant.py --mode cpu --turns 3 --rec-seconds 5 ^
   --ollama-model phi3:mini
 ```
 
-**File input (CPU mode only):**
+**File input**
 ```bash
 python mwe_assistant.py --mode cpu --audio .\budapest_wetter.wav ^
   --vosk-model .\vosk-model-small-de-0.15 ^
@@ -76,15 +76,74 @@ POSIX example:
 python mwe_assistant.py --mode cpu --turns 3 --rec-seconds 5   --vosk-model ./vosk-model-small-de-0.15   --piper-exe ./piper   --piper-voice ./de_DE-thorsten_high.onnx   --ollama-model phi3:mini
 ```
 
-### 3) GPU mode (UNTESTED)
+## 3) GPU Mode (Whisper GPU + Coqui XTTS-v2)
+
+---
+
+**1. GPU Dependencies**
+
+Install the required versions:
+
 ```bash
-pip install -r requirements_gpu.txt
-# ensure: CUDA-capable GPU + correct PyTorch CUDA build
+pip install TTS==0.22.0
+pip install transformers==4.35.2
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+  --index-url https://download.pytorch.org/whl/cu121
 ```
+
+These combinations are verified to work with:
+
+* **faster-whisper GPU**
+* **Coqui TTS XTTS-v2**
+* **CUDA 12.1 runtime on Windows**
+
+---
+
+**2. GPU Whisper STT**
+
+Whisper will run on GPU when:
+
+```bash
+--whisper-device cuda
+```
+
 Example:
+
 ```bash
-python mwe_assistant.py --mode gpu --turns 2 --rec-seconds 5   --whisper-model medium   --coqui-voice xtts_v2 --coqui-language de --coqui-speaker de_speaker_0   --ollama-model llama3:8b-instruct-q4_K_M
+python mwe_assistant.py --mode gpu \
+  --whisper-device cuda \
+  --whisper-model medium \
+  --whisper-compute-type float16
 ```
+
+---
+
+**3. GPU TTS – Coqui XTTS-v2**
+
+Coqui XTTS-v2 provides multilingual, multi-speaker text-to-speech. To use it on GPU:
+
+* `--coqui-voice xtts_v2`
+* `--coqui-language de`
+* `--coqui-speaker "Aaron Dreschner"` *(default)*
+
+Example command:
+
+```bash
+python mwe_assistant.py --mode gpu \
+  --whisper-device cuda \
+  --whisper-model medium \
+  --ollama-model phi3:mini
+```
+
+**Listing available speaker names**
+
+```python
+from TTS.api import TTS
+tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
+print(tts.speaker_manager.speakers.keys())
+```
+
+Choose any speaker and pass it to `--coqui-speaker`.
 
 ---
 
@@ -99,18 +158,19 @@ python mwe_assistant.py --mode gpu --turns 2 --rec-seconds 5   --whisper-model m
 - `--latency-csv PATH` path to CSV; default is auto‑generated inside `outputs/<timestamp>/`
 
 **CPU mode options**
-- `--audio PATH`           input audio file; *only supported in CPU mode*
+- `--audio PATH`           input audio file;
 - `--vosk-model PATH`      Vosk model directory
 - `--piper-exe PATH`       Piper executable
 - `--piper-voice PATH`     Piper German voice `.onnx`
 
-**GPU mode options (untested)**
+**GPU mode options**
+- `--audio PATH`           input audio file;
 - `--whisper-model NAME`   faster-whisper model name (e.g. `medium`)
 - `--whisper-device`       `cuda`/`cpu` (default: `cuda`)
 - `--whisper-compute-type` e.g. `float16`, `int8_float16`
 - `--coqui-voice`          Coqui voice key (e.g. `xtts_v2`)
 - `--coqui-language`       e.g. `de`
-- `--coqui-speaker`        e.g. `de_speaker_0`
+- `--coqui-speaker`        e.g. `Aaron Dreschner`
 
 **LLM**
 - `--ollama-model NAME`    e.g. `phi3:mini`, `llama3:8b-instruct-q4_K_M`
