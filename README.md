@@ -76,6 +76,15 @@ POSIX example:
 python mwe_assistant.py --mode cpu --turns 3 --rec-seconds 5   --vosk-model ./vosk-model-small-de-0.15   --piper-exe ./piper   --piper-voice ./de_DE-thorsten_high.onnx   --ollama-model phi3:mini
 ```
 
+**Low-Latency CPU Preset**
+
+The following configuration is optimized for reduced end-to-end latency on CPU-only systems. It uses a smaller Whisper model with INT8 quantization, a lightweight LLM (Gemma 2B), and shorter recording duration.
+
+```bash
+python mwe_assistant.py --mode cpu --turns 3 --rec-seconds 3 --whisper-model small --whisper-compute-type int8 --piper-exe .\piper\piper.exe --piper-voice .\piper\de_DE-thorsten_high.onnx --ollama-model gemma:2b
+```
+
+
 ## 3) GPU Mode (Whisper GPU + Coqui XTTS-v2)
 
 ---

@@ -115,11 +115,15 @@ def stt_whisper(audio_int16, whisper_model_name="medium", device="cuda", compute
 def llm_ollama_chat(user_text, model_name="phi3:mini", url="http://localhost:11434/api/generate"):
     system_prompt = (
         "Du bist ein knapper, sachlicher Assistent. "
-        "Antworte auf Deutsch in 1-2 Sätzen."
+        "Antworte kurz und präzise in einem einzigen Satz."
     )
     prompt = f"{system_prompt}\n\nNutzer sagte: \"{user_text}\"\n\nAntwort:"
     try:
-        r = requests.post(url, json={"model": model_name, "prompt": prompt, "stream": False}, timeout=120)
+        r = requests.post(url, json={"model": model_name, "prompt": prompt, "stream": False,"options": {
+        "num_predict": 50,
+        "temperature": 0.7
+            }
+        }, timeout=120)
         r.raise_for_status()
         data = r.json()
         return data.get("response", "").strip()
