@@ -173,8 +173,8 @@ def main():
     parser.add_argument("--piper-voice", default="./de_DE-thorsten_high.onnx", help="Path to Piper .onnx German voice")
 
     # GPU mode options
-    parser.add_argument("--whisper-model", default="medium", help="faster-whisper model name")
-    parser.add_argument("--whisper-device", default="cuda", help="Device for faster-whisper (cuda/cpu)")
+    parser.add_argument("--whisper-model", default=None, help="faster-whisper model name")
+    parser.add_argument("--whisper-device", default="cpu", help="Device for faster-whisper (cuda/cpu)")
     parser.add_argument("--whisper-compute-type", default="float16", help="Compute type (float16, int8_float16, etc.)")
     parser.add_argument("--coqui-voice", default="xtts_v2", help="Coqui voice model key")
     parser.add_argument("--coqui-language", default="de", help="Language code for Coqui (e.g., de)")
@@ -255,18 +255,18 @@ def main():
             else:
                 t0 = time.perf_counter()
 
-                if args.mode == "cpu":
-                    user_text = stt_vosk(
-                        audio_int16=audio,
-                        vosk_model_dir=args.vosk_model,
-                        samplerate=args.samplerate
-                    )
-                else:
+                if args.whisper_model:
                     user_text = stt_whisper(
                         audio_int16=audio,
                         whisper_model_name=args.whisper_model,
                         device=args.whisper_device,
                         compute_type=args.whisper_compute_type,
+                        samplerate=args.samplerate
+                    )
+                else:
+                    user_text = stt_vosk(
+                        audio_int16=audio,
+                        vosk_model_dir=args.vosk_model,
                         samplerate=args.samplerate
                     )
 
@@ -288,20 +288,20 @@ def main():
 
             # -------- TTS --------
             out_wav = os.path.join(run_dir, f"assistant_t{turn}.wav")
-            if args.mode == "cpu":
-                t0 = time.perf_counter()
-                tts_piper(text=reply, piper_exe=args.piper_exe, piper_voice=args.piper_voice, output_file=out_wav)
-                t1 = time.perf_counter()
-            else:
-                t0 = time.perf_counter()
-                tts_coqui(
-                text=reply,
-                voice_model=args.coqui_voice,
-                language=args.coqui_language,
-                speaker=args.coqui_speaker,
-                out_wav=out_wav)
+            # if args.mode == "cpu":
+            t0 = time.perf_counter()
+            tts_piper(text=reply, piper_exe=args.piper_exe, piper_voice=args.piper_voice, output_file=out_wav)
+            t1 = time.perf_counter()
+            # else:
+            #     t0 = time.perf_counter()
+            #     tts_coqui(
+            #     text=reply,
+            #     voice_model=args.coqui_voice,
+            #     language=args.coqui_language,
+            #     speaker=args.coqui_speaker,
+            #     out_wav=out_wav)
 
-                t1 = time.perf_counter()
+            # t1 = time.perf_counter()
             writer.writerow([time.strftime("%Y-%m-%dT%H:%M:%S"), args.mode, turn, "tts", int((t1 - t0) * 1000)])
             print(f"[TTS] Saved to {out_wav}. Playing...")
 
