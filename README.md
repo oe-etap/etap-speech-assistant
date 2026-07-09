@@ -1,214 +1,138 @@
-# Offline Speech Assistant MWE (DE) – CPU/GPU
+# Offline Speech Assistant MWE (EN) - File Input, CPU/GPU
 
-Mic → STT → LLM → TTS, fully offline (except for Ollama model pulls). The script is turn-based
-and logs per-stage latency.
+Existing audio file(s) -> STT -> LLM -> TTS, mostly offline. The only network-like dependency is the local Ollama HTTP API, and Ollama model downloads happen outside this script.
 
----
+The script is batch-oriented: it does not record from the microphone. It processes one or more pre-recorded English audio files, writes generated response WAVs, and logs latency plus best-effort CPU/RAM/GPU statistics.
 
 ## Features
-- **CPU mode**: Vosk (STT) + Ollama (LLM) + Piper (TTS)
-- **GPU mode**: faster-whisper (STT) + Ollama (LLM) + Coqui TTS XTTS‑v2 (TTS)
-- **Audio I/O**: microphone recording (sounddevice) + WAV playback (soundfile)
-- **File input**: you can process an existing audio file via `--audio <file>`
-- **Robust audio handling**: any input file is converted to mono 16 kHz WAV using **ffmpeg**
-- **Outputs**: every run creates `outputs/<timestamp>/` with all generated WAVs
-- **Latency CSV**: per-stage timings are appended to a CSV (path can be customized)
 
----
+- File-only input via `--audio file1.wav file2.mp3 ...`
+- English-only STT prompt flow and English TTS defaults
+- Selectable STT engine: `--stt-engine vosk` or `--stt-engine whisper`
+- Selectable TTS engine: `--tts-engine piper` or `--tts-engine coqui`
+- CPU/GPU preset via `--mode cpu|gpu`
+- Whisper can run on CPU or CUDA via `--whisper-device cpu|cuda`
+- Input audio is normalized to mono 16 kHz WAV using `ffmpeg`
+- Per-stage timing: `stt`, `llm`, `tts`
+- End-to-end timing: `e2e_response_ready`, measured from the end of the input audio being available to the response audio file being ready
+- Best-effort resource stats in CSV: CPU %, RAM %, process RSS, and NVIDIA GPU utilization/memory when available
 
 ## Requirements
 
-### Common (both modes)
-- Python **3.10+**
-- **Ollama** running locally (`ollama serve`), with a pulled model (e.g. `phi3:mini`)
-- **ffmpeg** accessible in your PATH (the script calls the `ffmpeg` CLI)
-- Packages: see the respective `requirements_*.txt`
+Common:
 
-### Additional assets to download
-- **Vosk German model** (for CPU mode), e.g. `vosk-model-small-de-0.15`
-- **Piper** binary and a **German voice** (e.g. `de_DE-thorsten_high.onnx`)
-- **CUDA runtime + PyTorch CUDA build** (for GPU mode)
+- Python 3.10+
+- `ffmpeg` on PATH
+- Ollama running locally, for example `ollama serve`
+- A pulled Ollama model, for example `ollama pull phi3:mini`
 
-> Tip (Windows): put `ffmpeg.exe`, `piper.exe`, and your `.onnx` voice into a known folder and add that folder to PATH,
-> or pass explicit paths to `--piper-exe`/`--piper-voice`.
+CPU package setup:
 
----
-
-## Install
-
-### 1) Common
-```bash
-# start the local LLM
-ollama serve
-# e.g., pull a model
-ollama pull phi3:mini
-```
-
-### 2) CPU‑only setup
 ```bash
 pip install -r requirements_cpu.txt
 ```
-Download:
-- Vosk German model (e.g. `vosk-model-small-de-0.15`) and unpack it somewhere.
-- Piper binary (`piper` / `piper.exe`) + a German voice ONNX (e.g. `de_DE-thorsten_high.onnx`).
-- ffmpeg (ensure `ffmpeg` is on PATH).
 
-**Run (Windows paths example):**
+GPU package setup:
+
 ```bash
-python mwe_assistant.py --mode cpu --turns 3 --rec-seconds 5 ^
-  --vosk-model .\vosk-model-small-de-0.15 ^
+pip install -r requirements_gpu.txt
+```
+
+Additional assets:
+
+- For Vosk: an English model, for example `vosk-model-small-en-us-0.15`
+- For Piper: an English voice, for example `en_US-lessac-medium.onnx`
+- For Coqui XTTS-v2: the model is loaded through the `TTS` package
+- For GPU stats: `nvidia-smi` must be available
+
+## Examples
+
+Whisper on CPU with Piper:
+
+```bash
+python mwe_assistant.py --audio .\sample_en.wav ^
+  --mode cpu ^
+  --stt-engine whisper ^
+  --whisper-device cpu ^
+  --whisper-model small ^
+  --whisper-compute-type int8 ^
+  --tts-engine piper ^
   --piper-exe .\piper\piper.exe ^
-  --piper-voice .\piper\de_DE-thorsten_high.onnx ^
+  --piper-voice .\piper\en_US-lessac-medium.onnx ^
   --ollama-model phi3:mini
 ```
 
-**File input**
+Vosk on CPU with Piper:
+
 ```bash
-python mwe_assistant.py --mode cpu --audio .\budapest_wetter.wav ^
-  --vosk-model .\vosk-model-small-de-0.15 ^
+python mwe_assistant.py --audio .\sample_en.wav ^
+  --mode cpu ^
+  --stt-engine vosk ^
+  --vosk-model .\vosk-model-small-en-us-0.15 ^
+  --tts-engine piper ^
   --piper-exe .\piper\piper.exe ^
-  --piper-voice .\piper\de_DE-thorsten_high.onnx ^
-  --ollama-model phi3:mini
+  --piper-voice .\piper\en_US-lessac-medium.onnx
 ```
 
-POSIX example:
-```bash
-python mwe_assistant.py --mode cpu --turns 3 --rec-seconds 5   --vosk-model ./vosk-model-small-de-0.15   --piper-exe ./piper   --piper-voice ./de_DE-thorsten_high.onnx   --ollama-model phi3:mini
-```
-
-**Low-Latency CPU Preset**
-
-The following configuration is optimized for reduced end-to-end latency on CPU-only systems. It uses a smaller Whisper model with INT8 quantization, a lightweight LLM (Gemma 2B), and shorter recording duration.
+Whisper on CUDA with Coqui:
 
 ```bash
-python mwe_assistant.py --mode cpu --turns 3 --rec-seconds 3 --whisper-model small --whisper-compute-type int8 --piper-exe .\piper\piper.exe --piper-voice .\piper\de_DE-thorsten_high.onnx --ollama-model gemma:2b
+python mwe_assistant.py --audio .\sample_en.wav ^
+  --mode gpu ^
+  --stt-engine whisper ^
+  --whisper-device cuda ^
+  --whisper-model medium ^
+  --whisper-compute-type float16 ^
+  --tts-engine coqui ^
+  --coqui-language en ^
+  --coqui-speaker "Daisy Studious"
 ```
 
-
-## 3) GPU Mode (Whisper GPU + Coqui XTTS-v2)
-
----
-
-**1. GPU Dependencies**
-
-Install the required versions:
+Multiple files:
 
 ```bash
-pip install TTS==0.22.0
-pip install transformers==4.35.2
-pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
-  --index-url https://download.pytorch.org/whl/cu121
+python mwe_assistant.py --audio .\a.wav .\b.mp3 .\c.flac --stt-engine whisper --tts-engine piper
 ```
 
-These combinations are verified to work with:
+## Important Arguments
 
-* **faster-whisper GPU**
-* **Coqui TTS XTTS-v2**
-* **CUDA 12.1 runtime on Windows**
-
----
-
-**2. GPU Whisper STT**
-
-Whisper will run on GPU when:
-
-```bash
---whisper-device cuda
-```
-
-Example:
-
-```bash
-python mwe_assistant.py --mode gpu \
-  --whisper-device cuda \
-  --whisper-model medium \
-  --whisper-compute-type float16
-```
-
----
-
-**3. GPU TTS – Coqui XTTS-v2**
-
-Coqui XTTS-v2 provides multilingual, multi-speaker text-to-speech. To use it on GPU:
-
-* `--coqui-voice xtts_v2`
-* `--coqui-language de`
-* `--coqui-speaker "Aaron Dreschner"` *(default)*
-
-Example command:
-
-```bash
-python mwe_assistant.py --mode gpu \
-  --whisper-device cuda \
-  --whisper-model medium \
-  --ollama-model phi3:mini
-```
-
-**Listing available speaker names**
-
-```python
-from TTS.api import TTS
-tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
-print(tts.speaker_manager.speakers.keys())
-```
-
-Choose any speaker and pass it to `--coqui-speaker`.
-
----
-
-## Arguments (highlights)
-
-- `--mode {cpu,gpu}` (required)
-- `--turns N` (default: 3 for mic; 1 when `--audio` is used)
-- `--rec-seconds SEC` microphone record duration per turn (default 5.0)
-- `--samplerate` mic sample rate (default 16000)
-- `--save-inputs` also save recorded user WAVs
-- `--out-dir DIR` base folder for run outputs (default: `outputs`)
-- `--latency-csv PATH` path to CSV; default is auto‑generated inside `outputs/<timestamp>/`
-
-**CPU mode options**
-- `--audio PATH`           input audio file;
-- `--vosk-model PATH`      Vosk model directory
-- `--piper-exe PATH`       Piper executable
-- `--piper-voice PATH`     Piper German voice `.onnx`
-
-**GPU mode options**
-- `--audio PATH`           input audio file;
-- `--whisper-model NAME`   faster-whisper model name (e.g. `medium`)
-- `--whisper-device`       `cuda`/`cpu` (default: `cuda`)
-- `--whisper-compute-type` e.g. `float16`, `int8_float16`
-- `--coqui-voice`          Coqui voice key (e.g. `xtts_v2`)
-- `--coqui-language`       e.g. `de`
-- `--coqui-speaker`        e.g. `Aaron Dreschner`
-
-**LLM**
-- `--ollama-model NAME`    e.g. `phi3:mini`, `llama3:8b-instruct-q4_K_M`
-
----
+- `--audio PATH [PATH ...]`: required; one or more input files
+- `--mode {cpu,gpu}`: default device preset
+- `--stt-engine {vosk,whisper}`: speech-to-text engine
+- `--tts-engine {piper,coqui}`: text-to-speech engine
+- `--out-dir DIR`: base output directory, default `outputs`
+- `--latency-csv PATH`: custom CSV path
+- `--keep-normalized`: keep the intermediate mono 16 kHz WAV files
+- `--vosk-model PATH`: English Vosk model directory
+- `--whisper-model NAME`: faster-whisper model name, default `small`
+- `--whisper-device {cpu,cuda}`: explicit Whisper device
+- `--whisper-compute-type TYPE`: for example `int8` on CPU or `float16` on CUDA
+- `--piper-exe PATH`: Piper executable
+- `--piper-voice PATH`: English Piper `.onnx` voice
+- `--coqui-voice NAME`: default `xtts_v2`
+- `--coqui-language CODE`: default `en`
+- `--coqui-speaker NAME`: default `Daisy Studious`
+- `--ollama-model NAME`: default `phi3:mini`
+- `--ollama-url URL`: default `http://localhost:11434/api/generate`
 
 ## Outputs
+
 Each run creates `outputs/<YYYYMMDD_HHMMSS>/` containing:
-- `assistant_t{turn}.wav`  — synthesized reply audio
-- (optional) `user_t{turn}.wav` if `--save-inputs` is used
-- `latency_log_<timestamp>.csv` with rows: `ts_iso,mode,turn,stage,duration_ms`
 
----
+- Copied input files as `input_<n>_<name>`
+- Generated assistant responses as `assistant_<n>_<input-stem>.wav`
+- `latency_log_<timestamp>.csv`
 
-## Troubleshooting
-- **ffmpeg not found**: install ffmpeg and ensure the `ffmpeg` CLI is on PATH.
-- **No text recognized**: check mic selection/levels; try a longer `--rec-seconds`.
-- **Piper voice errors**: verify the voice `.onnx` path; use a voice matching your Piper build.
-- **Ollama errors**: ensure `ollama serve` is running and the specified model is pulled.
-- **GPU mode**: verify CUDA drivers and that your PyTorch build matches your CUDA version.
+The CSV contains:
 
----
+- `stage`: `stt`, `llm`, `tts`, or `e2e_response_ready`
+- `duration_ms`: stage duration in milliseconds
+- `cpu_percent`, `ram_percent`, `rss_mb`
+- `gpu_util_percent`, `gpu_mem_used_mb`, `gpu_mem_total_mb`, `gpu_name`
+- `extra_json`: additional metadata, including input duration and output path where relevant
 
-## Useful downloads (direct links)
-- **Ollama**: https://ollama.com/download
-- **Vosk German model** (small 0.15): https://alphacephei.com/vosk/models
-- **Piper releases**: https://github.com/rhasspy/piper/releases
-  - German Thorsten voice pack: https://github.com/rhasspy/piper/blob/master/VOICES.md
-- **ffmpeg**: https://ffmpeg.org/download.html  (Windows static builds: https://www.gyan.dev/ffmpeg/builds/)
-- **faster-whisper**: https://github.com/SYSTRAN/faster-whisper
-- **Coqui TTS** (XTTS‑v2): https://github.com/coqui-ai/TTS
-- **PyTorch (CUDA install selector)**: https://pytorch.org/get-started/locally/
+## Notes
+
+- CPU/RAM stats require `psutil`; if unavailable, those fields stay blank.
+- GPU stats are read from `nvidia-smi`; if unavailable or no NVIDIA GPU is present, those fields stay blank.
+- The end-to-end metric is measured in batch mode after the full input audio file is available, so it represents processing latency from input-audio end to response-audio readiness.
