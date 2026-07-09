@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Offline Speech Assistant MWE (DE): Mic -> STT -> LLM -> TTS
-Supports two modes:
-  - cpu: Vosk (STT) + Ollama (LLM) + Piper (TTS)
-  - gpu: Whisper (faster-whisper) + Ollama (LLM) + Coqui TTS (XTTS-v2)
+Offline Speech Assistant MWE (EN): audio file -> STT -> LLM -> TTS.
+Supports selectable engines:
+  - STT: Vosk or faster-whisper
+  - TTS: Piper or Coqui TTS
+  - mode: CPU/GPU preset, with Whisper available on CPU too
 
-Platform: Windows or Ubuntu (also WSL with audio support)
-Audio flow: Turn-based: press ENTER to record for N seconds, then processing, then playback.
-Latency is measured per stage and saved to CSV.
+Audio flow: batch file processing only, no microphone recording or playback.
+Latency is measured per stage and saved to CSV, together with best-effort
+CPU/RAM/GPU snapshots.
 """
 
 import argparse
@@ -19,14 +20,11 @@ import subprocess
 import shutil
 from pathlib import Path
 
-import numpy as np
-import sounddevice as sd
 import soundfile as sf
 import requests
 import json as _json
 
 import wave, json
-from vosk import Model, KaldiRecognizer
 from datetime import datetime
 
 # Optional lazy singletons
@@ -36,20 +34,102 @@ _coqui_tts = None
 
 
 # ---------- Helpers ----------
-def ensure_wav_mono_16k(path):
+def ensure_wav_mono_16k(path, out_dir=None, prefix=None):
     """Convert any audio to mono 16kHz WAV using ffmpeg."""
-    base, _ = os.path.splitext(path)
-    out_path = base + "_16k.wav"
-    cmd = ["ffmpeg", "-y", "-i", path, "-ac", "1", "-ar", "16000", "-f", "wav", out_path]
-    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-    return out_path
+    source = Path(path)
+    if out_dir:
+        stem = f"{prefix}_{source.stem}" if prefix else source.stem
+        out_path = Path(out_dir) / f"{stem}_16k.wav"
+    else:
+        base, _ = os.path.splitext(path)
+        out_path = Path(base + "_16k.wav")
+    cmd = ["ffmpeg", "-y", "-i", str(source), "-ac", "1", "-ar", "16000", "-f", "wav", str(out_path)]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode("utf-8", errors="replace"))
+    return str(out_path)
+
+
+def wav_duration_ms(wav_path):
+    with sf.SoundFile(wav_path) as wav:
+        return int((len(wav) / wav.samplerate) * 1000)
+
+
+def collect_resource_snapshot():
+    """Best-effort resource snapshot. Missing psutil/nvidia-smi leaves blanks."""
+    stats = {
+        "cpu_percent": "",
+        "ram_percent": "",
+        "rss_mb": "",
+        "gpu_util_percent": "",
+        "gpu_mem_used_mb": "",
+        "gpu_mem_total_mb": "",
+        "gpu_name": "",
+    }
+
+    try:
+        import psutil
+
+        proc = psutil.Process(os.getpid())
+        stats["cpu_percent"] = psutil.cpu_percent(interval=None)
+        stats["ram_percent"] = psutil.virtual_memory().percent
+        stats["rss_mb"] = round(proc.memory_info().rss / (1024 * 1024), 1)
+    except Exception:
+        pass
+
+    try:
+        cmd = [
+            "nvidia-smi",
+            "--query-gpu=name,utilization.gpu,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        if result.returncode == 0 and result.stdout.strip():
+            first_gpu = result.stdout.strip().splitlines()[0]
+            name, util, mem_used, mem_total = [part.strip() for part in first_gpu.split(",", 3)]
+            stats["gpu_name"] = name
+            stats["gpu_util_percent"] = util
+            stats["gpu_mem_used_mb"] = mem_used
+            stats["gpu_mem_total_mb"] = mem_total
+    except Exception:
+        pass
+
+    return stats
+
+
+def write_timing(writer, args, item, stage, duration_ms, extra=None):
+    stats = collect_resource_snapshot()
+    writer.writerow({
+        "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "mode": args.mode,
+        "stt_engine": args.stt_engine,
+        "tts_engine": args.tts_engine,
+        "item": item,
+        "stage": stage,
+        "duration_ms": int(duration_ms),
+        "cpu_percent": stats["cpu_percent"],
+        "ram_percent": stats["ram_percent"],
+        "rss_mb": stats["rss_mb"],
+        "gpu_util_percent": stats["gpu_util_percent"],
+        "gpu_mem_used_mb": stats["gpu_mem_used_mb"],
+        "gpu_mem_total_mb": stats["gpu_mem_total_mb"],
+        "gpu_name": stats["gpu_name"],
+        "extra_json": json.dumps(extra or {}, ensure_ascii=True),
+    })
+
 
 def transcribe_with_vosk(wav_path, model_dir):
     """STT from WAV file using Vosk (expects mono 16 kHz 16-bit PCM)."""
+    global _vosk
+    from vosk import Model, KaldiRecognizer
+
+    if _vosk is None:
+        _vosk = {"model": Model(model_dir)}
+
     wf = wave.open(wav_path, "rb")
     assert wf.getnchannels() == 1 and wf.getframerate() == 16000 and wf.getsampwidth() == 2, \
         "Use mono/16 kHz/16-bit PCM WAV for Vosk"
-    rec = KaldiRecognizer(Model(model_dir), wf.getframerate())
+    rec = KaldiRecognizer(_vosk["model"], wf.getframerate())
     rec.SetWords(True)
 
     results = []
@@ -61,66 +141,33 @@ def transcribe_with_vosk(wav_path, model_dir):
             results.append(json.loads(rec.Result()))
     results.append(json.loads(rec.FinalResult()))
     text = " ".join([r.get("text", "") for r in results]).strip()
+    wf.close()
     return text
 
-def record_from_mic(seconds=5, samplerate=16000, channels=1, dtype='int16'):
-    print(f"[Mic] Recording {seconds}s at {samplerate} Hz ...")
-    audio = sd.rec(int(seconds * samplerate), samplerate=samplerate, channels=channels, dtype=dtype, blocking=True)
-    sd.wait()
-    if audio.dtype != np.int16:
-        audio = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
-    if audio.ndim == 2 and audio.shape[1] > 1:
-        audio = audio.mean(axis=1).astype(np.int16)
-    return audio
 
-def save_wav(path, audio_int16, samplerate=16000):
-    sf.write(path, audio_int16, samplerate)
-    print(f"[File] Saved WAV: {path}")
-
-def play_wav(path):
-    data, sr = sf.read(path, dtype="float32")
-    sd.play(data, sr)
-    sd.wait()
-
-def stt_vosk(audio_int16, vosk_model_dir, samplerate=16000):
-    global _vosk
-    if _vosk is None:
-        _vosk = {"model": Model(vosk_model_dir)}
-    rec = KaldiRecognizer(_vosk["model"], samplerate)
-    rec.SetWords(True)
-    ok = rec.AcceptWaveform(audio_int16.tobytes())
-    if ok:
-        result = _json.loads(rec.Result())
-    else:
-        result = _json.loads(rec.FinalResult())
-    return (result.get("text") or "").strip()
-
-def stt_whisper(audio_int16, whisper_model_name="medium", device="cuda", compute_type="float16", samplerate=16000):
+def stt_whisper(wav_path, whisper_model_name="small", device="cpu", compute_type="int8"):
     global _whisper
-    if _whisper is None:
+    cache_key = (whisper_model_name, device, compute_type)
+    if _whisper is None or _whisper.get("key") != cache_key:
         from faster_whisper import WhisperModel
-        _whisper = {"model": WhisperModel(whisper_model_name, device=device, compute_type=compute_type)}
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        sf.write(tmp.name, audio_int16, samplerate)
-        tmp_path = tmp.name
-    segments, _ = _whisper["model"].transcribe(tmp_path, language="de")
-    text = " ".join([s.text for s in segments]).strip()
-    try:
-        os.remove(tmp_path)
-    except Exception:
-        pass
+        _whisper = {
+            "key": cache_key,
+            "model": WhisperModel(whisper_model_name, device=device, compute_type=compute_type),
+        }
+    segments, _ = _whisper["model"].transcribe(wav_path, language="en")
+    text = " ".join([s.text.strip() for s in segments]).strip()
     return text
+
 
 def llm_ollama_chat(user_text, model_name="phi3:mini", url="http://localhost:11434/api/generate"):
     system_prompt = (
-        "Du bist ein knapper, sachlicher Assistent. "
-        "Antworte kurz und präzise in einem einzigen Satz."
+        "You are a concise, factual but friendly voice assistant. "
+        "Answer in English in 1-3 medium length sentences."
     )
-    prompt = f"{system_prompt}\n\nNutzer sagte: \"{user_text}\"\n\nAntwort:"
+    prompt = f'{system_prompt}\n\nThe user said: "{user_text}"\n\nAnswer:'
     try:
-        r = requests.post(url, json={"model": model_name, "prompt": prompt, "stream": False,"options": {
-        "num_predict": 50,
+        r = requests.post(url, json={"model": model_name, "prompt": prompt, "stream": False, "options": {
+        "num_predict": 150,
         "temperature": 0.7
             }
         }, timeout=120)
@@ -128,14 +175,16 @@ def llm_ollama_chat(user_text, model_name="phi3:mini", url="http://localhost:114
         data = r.json()
         return data.get("response", "").strip()
     except Exception as e:
-        return f"(Fehler beim LLM-Aufruf: {e})"
+        return f"(LLM call failed: {e})"
+
 
 def tts_piper(text, piper_exe, piper_voice, output_file):
     cmd = [piper_exe, "-m", piper_voice, "-f", output_file]
     subprocess.run(cmd, input=text.encode("utf-8"), check=True)
 
-def tts_coqui(text, voice_model="xtts_v2", language="de",
-              speaker="Aaron Dreschner", out_wav="out.wav"):
+
+def tts_coqui(text, voice_model="xtts_v2", language="en",
+              speaker="Daisy Studious", out_wav="out.wav"):
     global _coqui_tts
     if _coqui_tts is None:
         from TTS.api import TTS
@@ -148,52 +197,44 @@ def tts_coqui(text, voice_model="xtts_v2", language="de",
     )
 
 
-
-
-
 # ---------- Main ----------
 def main():
-    parser = argparse.ArgumentParser(description="Offline Speech Assistant MWE (DE)")
-    parser.add_argument("--mode", choices=["cpu", "gpu"], required=True, help="cpu: Vosk+Piper; gpu: Whisper+Coqui")
-    parser.add_argument("--turns", type=int, default=None, help="How many turns to run")
-    parser.add_argument("--rec-seconds", type=float, default=5.0, help="Recording duration per turn (seconds)")
-    parser.add_argument("--samplerate", type=int, default=16000, help="Microphone sample rate")
-    parser.add_argument("--save-inputs", action="store_true", help="Save recorded user WAVs")
+    parser = argparse.ArgumentParser(description="Offline Speech Assistant MWE (EN, file input only)")
+    parser.add_argument("--audio", nargs="+", required=True, help="One or more audio files (wav/mp3/flac/etc.)")
+    parser.add_argument("--mode", choices=["cpu", "gpu"], default="cpu", help="Default compute preset")
+    parser.add_argument("--stt-engine", choices=["vosk", "whisper"], default="whisper", help="Speech-to-text engine")
+    parser.add_argument("--tts-engine", choices=["piper", "coqui"], default="piper", help="Text-to-speech engine")
 
     parser.add_argument("--out-dir", type=str, default="outputs", help="Where to save the audiofiles")
-    parser.add_argument("--latency-csv", type=str, default=None, help="CSV file to append latency logs")
+    parser.add_argument("--latency-csv", type=str, default=None, help="CSV file to append latency/resource logs")
+    parser.add_argument("--keep-normalized", action="store_true", help="Keep ffmpeg-normalized input WAVs")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    parser.add_argument("--audio", type=str, default=None, help="Path to an audio file (wav/mp3/flac)")
+    # STT options
+    parser.add_argument("--vosk-model", default="./vosk-model-small-en-us-0.15", help="Path to English Vosk model dir")
+    parser.add_argument("--whisper-model", default="small", help="faster-whisper model name")
+    parser.add_argument("--whisper-device", choices=["cpu", "cuda"], default=None, help="Device for faster-whisper")
+    parser.add_argument("--whisper-compute-type", default=None, help="Compute type (int8, float16, etc.)")
 
-    # CPU mode options
-    parser.add_argument("--vosk-model", default="./vosk-model-small-de-0.15", help="Path to Vosk German model dir")
-    parser.add_argument("--piper-exe", default="./piper", help="Path to Piper executable (piper or piper.exe)")
-    parser.add_argument("--piper-voice", default="./de_DE-thorsten_high.onnx", help="Path to Piper .onnx German voice")
-
-    # GPU mode options
-    parser.add_argument("--whisper-model", default=None, help="faster-whisper model name")
-    parser.add_argument("--whisper-device", default="cpu", help="Device for faster-whisper (cuda/cpu)")
-    parser.add_argument("--whisper-compute-type", default="float16", help="Compute type (float16, int8_float16, etc.)")
+    # TTS options
+    parser.add_argument("--piper-exe", default="./piper/piper.exe", help="Path to Piper executable (piper or piper.exe)")
+    parser.add_argument("--piper-voice", default="./piper/en_US-lessac-medium.onnx", help="Path to English Piper .onnx voice")
     parser.add_argument("--coqui-voice", default="xtts_v2", help="Coqui voice model key")
-    parser.add_argument("--coqui-language", default="de", help="Language code for Coqui (e.g., de)")
-    parser.add_argument("--coqui-speaker", default="Aaron Dreschner", help="Speaker id for Coqui")
-    # parser.add_argument(
-    # "--coqui-voice",
-    # default="thorsten",
-    # help="Coqui GPU voice: 'thorsten' for native German or 'xtts_v2' for multispeaker")
-
+    parser.add_argument("--coqui-language", default="en", help="Language code for Coqui")
+    parser.add_argument("--coqui-speaker", default="Daisy Studious", help="Speaker id for Coqui")
 
     # Shared LLM
-    parser.add_argument("--ollama-model", default="phi3:mini", help="Ollama model (e.g., phi3:mini)")
+    parser.add_argument("--ollama-model", default="phi3:mini", help="Ollama model (e.g. phi3:mini)")
+    parser.add_argument("--ollama-url", default="http://localhost:11434/api/generate", help="Ollama generate endpoint")
 
     # ---- parse ----
     args = parser.parse_args()
 
-    # turns default: file módban 1, különben 3
-    if args.turns is None:
-        args.turns = 1 if args.audio else 3
+    if args.whisper_device is None:
+        args.whisper_device = "cuda" if args.mode == "gpu" else "cpu"
+    if args.whisper_compute_type is None:
+        args.whisper_compute_type = "float16" if args.whisper_device == "cuda" else "int8"
 
     run_dir = os.path.join(args.out_dir, timestamp)
     os.makedirs(run_dir, exist_ok=True)
@@ -201,118 +242,94 @@ def main():
     if not args.latency_csv:
         args.latency_csv = os.path.join(run_dir, f"latency_log_{timestamp}.csv")
 
+    fieldnames = [
+        "ts_iso", "mode", "stt_engine", "tts_engine", "item", "stage", "duration_ms",
+        "cpu_percent", "ram_percent", "rss_mb",
+        "gpu_util_percent", "gpu_mem_used_mb", "gpu_mem_total_mb", "gpu_name",
+        "extra_json",
+    ]
+
     # Prepare CSV
     csv_exists = os.path.exists(args.latency_csv)
     with open(args.latency_csv, "a", newline="", encoding="utf-8") as fcsv:
-        writer = csv.writer(fcsv)
+        writer = csv.DictWriter(fcsv, fieldnames=fieldnames)
         if not csv_exists:
-            writer.writerow(["ts_iso", "mode", "turn", "stage", "duration_ms"])
+            writer.writeheader()
 
-        for turn in range(1, args.turns + 1):
+        for item_index, audio_path in enumerate(args.audio, start=1):
             print("=" * 60)
+            audio_file = Path(audio_path)
+            if not audio_file.exists():
+                raise FileNotFoundError(audio_path)
 
-            # -------- Input: mic or file --------
-            if args.audio:
-                audio = None
-                user_wav = os.path.join(run_dir, f"user_input_t{turn}.wav")
-                try:
-                    if os.path.abspath(args.audio) != os.path.abspath(user_wav):
-                        shutil.copyfile(args.audio, user_wav)
-                except Exception as e:
-                    print(f"[WARN] Copy failed: {e}")
-            else:
-                input(f"Press ENTER to speak... (will record for {args.rec_seconds}s)")
-                t0 = time.perf_counter()
-                audio = record_from_mic(seconds=args.rec_seconds,
-                                        samplerate=args.samplerate,
-                                        channels=1, dtype="int16")
-                t1 = time.perf_counter()
-                writer.writerow([time.strftime("%Y-%m-%dT%H:%M:%S"), args.mode, turn, "record", int((t1 - t0) * 1000)])
-                if args.save_inputs:
-                    user_wav = os.path.join(run_dir, f"user_t{turn}.wav")
-                    save_wav(user_wav, audio, args.samplerate)
+            item_name = audio_file.stem
+            print(f"[INFO] Processing audio file: {audio_file}")
+
+            user_wav = os.path.join(run_dir, f"user_input_{item_index}_{audio_file.name}")
+            try:
+                if os.path.abspath(audio_path) != os.path.abspath(user_wav):
+                    shutil.copyfile(audio_path, user_wav)
+            except Exception as e:
+                print(f"[WARN] Copy failed: {e}")
+
+            wav_path = ensure_wav_mono_16k(audio_path, out_dir=run_dir, prefix=f"input_{item_index}")
+            input_duration_ms = wav_duration_ms(wav_path)
+            e2e_t0 = time.perf_counter()
 
             # -------- STT --------
-            if args.audio:
-                print(f"[INFO] Processing audio file: {args.audio}")
-                wav_path = ensure_wav_mono_16k(args.audio)
-
-                t0 = time.perf_counter()
-
-                if args.mode == "cpu":
-
-                    user_text = transcribe_with_vosk(wav_path, args.vosk_model)
-                else:
-                    audio_data, sr = sf.read(wav_path, dtype="int16")
-                    user_text = stt_whisper(
-                        audio_int16=audio_data,
-                        whisper_model_name=args.whisper_model,
-                        device=args.whisper_device,
-                        compute_type=args.whisper_compute_type,
-                        samplerate=16000
-                    )
-                t1 = time.perf_counter()
+            t0 = time.perf_counter()
+            if args.stt_engine == "vosk":
+                user_text = transcribe_with_vosk(wav_path, args.vosk_model)
             else:
-                t0 = time.perf_counter()
-
-                if args.whisper_model:
-                    user_text = stt_whisper(
-                        audio_int16=audio,
-                        whisper_model_name=args.whisper_model,
-                        device=args.whisper_device,
-                        compute_type=args.whisper_compute_type,
-                        samplerate=args.samplerate
-                    )
-                else:
-                    user_text = stt_vosk(
-                        audio_int16=audio,
-                        vosk_model_dir=args.vosk_model,
-                        samplerate=args.samplerate
-                    )
-
+                user_text = stt_whisper(
+                    wav_path=wav_path,
+                    whisper_model_name=args.whisper_model,
+                    device=args.whisper_device,
+                    compute_type=args.whisper_compute_type
+                )
             t1 = time.perf_counter()
-
-            writer.writerow([time.strftime("%Y-%m-%dT%H:%M:%S"), args.mode, turn, "stt", int((t1 - t0) * 1000)])
+            write_timing(writer, args, item_name, "stt", int((t1 - t0) * 1000),
+                         {"input_duration_ms": input_duration_ms})
             print(f"[STT] {user_text!r}")
 
             if not user_text:
-                print("[Warn] No text recognized. Skipping to next turn.")
+                print("[Warn] No text recognized. Skipping to next file.")
+                write_timing(writer, args, item_name, "e2e_response_ready", int((time.perf_counter() - e2e_t0) * 1000),
+                             {"input_duration_ms": input_duration_ms, "skipped": True})
                 continue
 
             # -------- LLM --------
             t0 = time.perf_counter()
-            reply = llm_ollama_chat(user_text=user_text, model_name=args.ollama_model)
+            reply = llm_ollama_chat(user_text=user_text, model_name=args.ollama_model, url=args.ollama_url)
             t1 = time.perf_counter()
-            writer.writerow([time.strftime("%Y-%m-%dT%H:%M:%S"), args.mode, turn, "llm", int((t1 - t0) * 1000)])
+            write_timing(writer, args, item_name, "llm", int((t1 - t0) * 1000))
             print(f"[LLM] {reply}")
 
             # -------- TTS --------
-            out_wav = os.path.join(run_dir, f"assistant_t{turn}.wav")
-            # if args.mode == "cpu":
+            out_wav = os.path.join(run_dir, f"assistant_{item_index}_{item_name}.wav")
             t0 = time.perf_counter()
-            tts_piper(text=reply, piper_exe=args.piper_exe, piper_voice=args.piper_voice, output_file=out_wav)
+            if args.tts_engine == "piper":
+                tts_piper(text=reply, piper_exe=args.piper_exe, piper_voice=args.piper_voice, output_file=out_wav)
+            else:
+                tts_coqui(
+                    text=reply,
+                    voice_model=args.coqui_voice,
+                    language=args.coqui_language,
+                    speaker=args.coqui_speaker,
+                    out_wav=out_wav)
             t1 = time.perf_counter()
-            # else:
-            #     t0 = time.perf_counter()
-            #     tts_coqui(
-            #     text=reply,
-            #     voice_model=args.coqui_voice,
-            #     language=args.coqui_language,
-            #     speaker=args.coqui_speaker,
-            #     out_wav=out_wav)
+            write_timing(writer, args, item_name, "tts", int((t1 - t0) * 1000))
+            write_timing(writer, args, item_name, "e2e_response_ready", int((time.perf_counter() - e2e_t0) * 1000),
+                         {"input_duration_ms": input_duration_ms, "output_wav": out_wav})
+            print(f"[TTS] Saved to {out_wav}.")
 
-            # t1 = time.perf_counter()
-            writer.writerow([time.strftime("%Y-%m-%dT%H:%M:%S"), args.mode, turn, "tts", int((t1 - t0) * 1000)])
-            print(f"[TTS] Saved to {out_wav}. Playing...")
+            if not args.keep_normalized:
+                try:
+                    os.remove(wav_path)
+                except Exception:
+                    pass
 
-            # -------- Playback --------
-            play_wav(out_wav)
-
-            if args.audio:
-                break
-
-    print(f"\nDone. Latency log appended to: {args.latency_csv}")
-    print("Tip: open the CSV in a spreadsheet to analyze per-stage timings.")
+    print(f"\nDone. Latency/resource log appended to: {args.latency_csv}")
     return 0
 
 
