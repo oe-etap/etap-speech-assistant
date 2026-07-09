@@ -1,8 +1,9 @@
 # Python packages for CPU mode
 # External runtime dependency (install separately): ffmpeg (CLI must be on PATH)
 vosk
-sounddevice
+faster-whisper
 soundfile
 numpy
 requests
 scipy
+psutil

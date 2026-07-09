@@ -4,8 +4,8 @@
 faster-whisper
 TTS
 torch
-sounddevice
 soundfile
 numpy
 requests
 scipy
+psutil
