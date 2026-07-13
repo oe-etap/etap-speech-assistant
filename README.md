@@ -136,3 +136,122 @@ The CSV contains:
 - CPU/RAM stats require `psutil`; if unavailable, those fields stay blank.
 - GPU stats are read from `nvidia-smi`; if unavailable or no NVIDIA GPU is present, those fields stay blank.
 - The end-to-end metric is measured in batch mode after the full input audio file is available, so it represents processing latency from input-audio end to response-audio readiness.
+
+
+# Metric Descriptions
+
+## Timeline
+
+```
+User finishes speaking
+  │
+  ├─── STT ───────┬─── LLM TTFC ───┬──── TTS₁ ──┐
+  │    (stt)      │   (llm_ttfc)   │(tts_first) │
+  │               │                │            │
+  │               │                │   TTFA ◄───┘
+  │               │                │
+  │               │  ┌─── LLM eval ──────────────┐  ← Ollama server-side
+  │               │  │   (llm_eval)              │
+  │               │  └───────────────────────────┘
+  │               │                │
+  │               ├─── TTS₂ ──┬─── TTS₃ ──┐
+  │               │           │           │
+  │               └───────────┴───────────┘
+  │                  (tts_total = Σ TTS)
+  │                                        │
+  ├────────────────────────────────────────┘
+  │              e2e_response_ready
+```
+
+---
+
+## CSV Stages
+
+### `stt` – Speech-to-Text processing time
+
+| | |
+|---|---|
+| **What it measures** | The net time to convert the input audio to text (Vosk or Whisper). |
+| **Measurement point** | Before → after the STT function call. |
+| **duration_ms** | STT net processing time. |
+| **extra_json** | `input_duration_ms` – length of input audio (ms); `stt_rtf` – Real-Time Factor (stt / input_duration; <1.0 = faster than real-time). |
+
+---
+
+### `llm_ttfc` – LLM Time to First (synthesizable) Chunk
+
+| | |
+|---|---|
+| **What it measures** | The time elapsed from starting the LLM request until the first synthesizable text chunk (sentence) arrives at the client side. Includes sending the HTTP request, Ollama server prompt processing, and the tokens of the first complete sentence. |
+| **Measurement point** | Starting LLM streaming request → arrival of the first chunk from the generator. |
+| **duration_ms** | Prompt → first sentence client-side latency. |
+| **extra_json** | – |
+
+---
+
+### `tts_first_chunk` – TTS first chunk synthesis time
+
+| | |
+|---|---|
+| **What it measures** | The time to convert the first LLM sentence into speech. This is the last component of TTFA: after this, the user would first hear a response. |
+| **Measurement point** | Before → after the TTS function call (for the first chunk only). |
+| **duration_ms** | TTS synthesis time of the first sentence. |
+| **extra_json** | – |
+
+---
+
+### `ttfa` – Time to First Audio ⭐
+
+| | |
+|---|---|
+| **What it measures** | The most important metric from a user perspective: how long they have to wait to hear the first word of the response. Calculated metric: `stt + llm_ttfc + tts_first_chunk`. |
+| **Measurement point** | Calculated (not directly measured). |
+| **duration_ms** | `stt + llm_ttfc + tts_first_chunk` |
+| **extra_json** | – |
+
+---
+
+### `llm_eval` – LLM server-side token generation time
+
+| | |
+|---|---|
+| **What it measures** | The net token generation time (eval_duration) measured on the Ollama server. This is ground truth: it does not include network latency, client-side processing, or TTS time. |
+| **Measurement point** | Read from Ollama's `done: true` message (server-side measurement). |
+| **duration_ms** | Net token generation time on the server. |
+| **extra_json** | `eval_tokens` – number of generated tokens; `tokens_per_sec` – generation speed (tok/s); `prompt_tokens` – number of prompt tokens; `prompt_eval_ms` – prompt processing time (ms); `total_duration_ms` – total Ollama server-side time (load + prompt eval + eval + overhead). |
+
+---
+
+### `tts_total` – TTS total synthesis time
+
+| | |
+|---|---|
+| **What it measures** | The sum of the synthesis times of all TTS chunks. Net TTS time, does not include LLM waiting or I/O. |
+| **Measurement point** | Σ (Before → after TTS call) for every chunk. |
+| **duration_ms** | Total TTS synthesis time. |
+| **extra_json** | – |
+
+---
+
+### `e2e_response_ready` – End-to-End processing time
+
+| | |
+|---|---|
+| **What it measures** | The total processing time: from the availability of the normalized audio to the closing of the final response WAV file. In batch mode, this is the "processing latency". |
+| **Measurement point** | After audio normalization → closing WAV file + final write_timing calls. |
+| **duration_ms** | Total STT + LLM streaming + TTS streaming time. |
+| **extra_json** | `input_duration_ms` – length of input audio; `output_duration_ms` – length of output (response) audio; `output_wav` – path of the generated WAV file; `full_text` – full text response of the LLM; `response_word_count` – number of words in the response; `response_char_count` – number of characters in the response; `llm_chunk_count` – number of sentence-level chunks. |
+
+---
+
+## Relationships Between Metrics
+
+| Relationship | Always true? |
+|-------------|-------------|
+| `ttfa = stt + llm_ttfc + tts_first_chunk` | ✅ By definition |
+| `e2e >= ttfa` | ✅ E2E includes TTFA + the processing of the remaining chunks |
+| `tts_total >= tts_first_chunk` | ✅ The total is the sum of all chunks |
+| `llm_eval < total_duration_ms` (extra_json) | ✅ The total also includes prompt eval and overhead |
+| `llm_ttfc >= llm_eval` | ❌ Not always! TTFC measures until the first sentence arrives, eval is the generation time of **all** tokens. For short responses TTFC ≈ eval; for long responses TTFC < eval. |
+| `tokens_per_sec ≈ eval_tokens / (llm_eval / 1000)` | ✅ By definition |
+| `stt_rtf = stt / input_duration_ms` | ✅ By definition |

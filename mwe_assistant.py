@@ -13,29 +13,52 @@ CPU/RAM/GPU snapshots.
 """
 
 import argparse
-import time
 import csv
+import json
 import os
-import subprocess
 import shutil
+import subprocess
+import time
+import wave
+from datetime import datetime
 from pathlib import Path
 
-import soundfile as sf
+import numpy as np
 import requests
-import json as _json
+import soundfile as sf
 
-import wave, json
-from datetime import datetime
+# Optional module-level imports
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
 
 # Optional lazy singletons
 _vosk = None
 _whisper = None
 _coqui_tts = None
+_piper_voice = None  # PiperVoice Python API singleton
+
+# nvidia-smi cache (timestamp, stats_dict)
+_gpu_cache = (0.0, None)
+_GPU_CACHE_TTL = 2.0
 
 
 # ---------- Helpers ----------
+def is_mono_16k_pcm(path):
+    """Check if a file is already mono 16kHz 16-bit PCM WAV."""
+    try:
+        with wave.open(str(path), "rb") as wf:
+            return (wf.getnchannels() == 1 and
+                    wf.getframerate() == 16000 and
+                    wf.getsampwidth() == 2)
+    except Exception:
+        return False
+
+
 def ensure_wav_mono_16k(path, out_dir=None, prefix=None):
-    """Convert any audio to mono 16kHz WAV using ffmpeg."""
+    """Convert any audio to mono 16kHz WAV using ffmpeg. Skips if already correct format."""
     source = Path(path)
     if out_dir:
         stem = f"{prefix}_{source.stem}" if prefix else source.stem
@@ -43,6 +66,12 @@ def ensure_wav_mono_16k(path, out_dir=None, prefix=None):
     else:
         base, _ = os.path.splitext(path)
         out_path = Path(base + "_16k.wav")
+
+    # Skip ffmpeg if input is already mono 16kHz 16-bit PCM WAV
+    if is_mono_16k_pcm(source):
+        shutil.copyfile(str(source), str(out_path))
+        return str(out_path)
+
     cmd = ["ffmpeg", "-y", "-i", str(source), "-ac", "1", "-ar", "16000", "-f", "wav", str(out_path)]
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     if result.returncode != 0:
@@ -55,28 +84,19 @@ def wav_duration_ms(wav_path):
         return int((len(wav) / wav.samplerate) * 1000)
 
 
-def collect_resource_snapshot():
-    """Best-effort resource snapshot. Missing psutil/nvidia-smi leaves blanks."""
-    stats = {
-        "cpu_percent": "",
-        "ram_percent": "",
-        "rss_mb": "",
+def _query_gpu_stats():
+    """Query nvidia-smi with caching to avoid subprocess overhead on every call."""
+    global _gpu_cache
+    now = time.monotonic()
+    if _gpu_cache[1] is not None and (now - _gpu_cache[0]) < _GPU_CACHE_TTL:
+        return _gpu_cache[1]
+
+    gpu_stats = {
         "gpu_util_percent": "",
         "gpu_mem_used_mb": "",
         "gpu_mem_total_mb": "",
         "gpu_name": "",
     }
-
-    try:
-        import psutil
-
-        proc = psutil.Process(os.getpid())
-        stats["cpu_percent"] = psutil.cpu_percent(interval=None)
-        stats["ram_percent"] = psutil.virtual_memory().percent
-        stats["rss_mb"] = round(proc.memory_info().rss / (1024 * 1024), 1)
-    except Exception:
-        pass
-
     try:
         cmd = [
             "nvidia-smi",
@@ -87,13 +107,35 @@ def collect_resource_snapshot():
         if result.returncode == 0 and result.stdout.strip():
             first_gpu = result.stdout.strip().splitlines()[0]
             name, util, mem_used, mem_total = [part.strip() for part in first_gpu.split(",", 3)]
-            stats["gpu_name"] = name
-            stats["gpu_util_percent"] = util
-            stats["gpu_mem_used_mb"] = mem_used
-            stats["gpu_mem_total_mb"] = mem_total
+            gpu_stats["gpu_name"] = name
+            gpu_stats["gpu_util_percent"] = util
+            gpu_stats["gpu_mem_used_mb"] = mem_used
+            gpu_stats["gpu_mem_total_mb"] = mem_total
     except Exception:
         pass
 
+    _gpu_cache = (now, gpu_stats)
+    return gpu_stats
+
+
+def collect_resource_snapshot():
+    """Best-effort resource snapshot. Missing psutil/nvidia-smi leaves blanks."""
+    stats = {
+        "cpu_percent": "",
+        "ram_percent": "",
+        "rss_mb": "",
+    }
+
+    if _HAS_PSUTIL:
+        try:
+            proc = psutil.Process(os.getpid())
+            stats["cpu_percent"] = psutil.cpu_percent(interval=None)
+            stats["ram_percent"] = psutil.virtual_memory().percent
+            stats["rss_mb"] = round(proc.memory_info().rss / (1024 * 1024), 1)
+        except Exception:
+            pass
+
+    stats.update(_query_gpu_stats())
     return stats
 
 
@@ -159,42 +201,97 @@ def stt_whisper(wav_path, whisper_model_name="small", device="cpu", compute_type
     return text
 
 
-def llm_ollama_chat(user_text, model_name="phi3:mini", url="http://localhost:11434/api/generate"):
+def stream_llm_ollama_chat(user_text, model_name="phi3:mini", url="http://localhost:11434/api/generate"):
+    """Stream LLM response from Ollama, yielding sentence-level chunks as dicts.
+    
+    Yields dicts with keys:
+      - 'text': the synthesizable text chunk (str)
+      - 'ollama_stats': None for text chunks; dict with server-side timing for the final metadata chunk
+    
+    The last yielded dict may have empty 'text' and non-None 'ollama_stats' containing
+    Ollama's server-side performance metrics (eval_count, eval_duration, etc.).
+    """
     system_prompt = (
         "You are a concise, factual but friendly voice assistant. "
         "Answer in English in 1-3 medium length sentences."
     )
     prompt = f'{system_prompt}\n\nThe user said: "{user_text}"\n\nAnswer:'
     try:
-        r = requests.post(url, json={"model": model_name, "prompt": prompt, "stream": False, "options": {
+        r = requests.post(url, json={"model": model_name, "prompt": prompt, "stream": True, "options": {
         "num_predict": 150,
         "temperature": 0.7
             }
         }, timeout=120)
         r.raise_for_status()
-        data = r.json()
-        return data.get("response", "").strip()
+        
+        buffer = ""
+        terminators = {".", "?", "!", ":", ";", "\n"}
+        ollama_stats = None
+        for line in r.iter_lines():
+            if line:
+                data = json.loads(line)
+                piece = data.get("response", "")
+                buffer += piece
+                
+                # Capture Ollama server-side stats from the final message
+                if data.get("done", False):
+                    ollama_stats = {
+                        "prompt_eval_count": data.get("prompt_eval_count", 0),
+                        "prompt_eval_duration_ns": data.get("prompt_eval_duration", 0),
+                        "eval_count": data.get("eval_count", 0),
+                        "eval_duration_ns": data.get("eval_duration", 0),
+                        "total_duration_ns": data.get("total_duration", 0),
+                    }
+                
+                if any(t in piece for t in terminators):
+                    if len(buffer.strip()) > 2:
+                        yield {"text": buffer.strip(), "ollama_stats": None}
+                        buffer = ""
+        if buffer.strip():
+            yield {"text": buffer.strip(), "ollama_stats": None}
+        # Yield final metadata-only entry with Ollama server-side stats
+        if ollama_stats:
+            yield {"text": "", "ollama_stats": ollama_stats}
     except Exception as e:
-        return f"(LLM call failed: {e})"
+        yield {"text": f"(LLM call failed: {e})", "ollama_stats": None}
 
 
-def tts_piper(text, piper_exe, piper_voice, output_file):
-    cmd = [piper_exe, "-m", piper_voice, "-f", output_file]
-    subprocess.run(cmd, input=text.encode("utf-8"), check=True)
+def tts_piper_python(text):
+    """Returns raw 16-bit PCM bytes and sample rate from Piper using the Python API.
+    Requires _piper_voice to be pre-loaded. No subprocess overhead per chunk."""
+    global _piper_voice
+    pcm_parts = []
+    sample_rate = None
+    for audio_chunk in _piper_voice.synthesize(text):
+        pcm_parts.append(audio_chunk.audio_int16_bytes)
+        if sample_rate is None:
+            sample_rate = audio_chunk.sample_rate
+    return b"".join(pcm_parts), sample_rate or 22050
 
 
-def tts_coqui(text, voice_model="xtts_v2", language="en",
-              speaker="Daisy Studious", out_wav="out.wav"):
+def tts_piper_exe(text, piper_exe, piper_voice, sample_rate=16000):
+    """Returns raw 16-bit PCM bytes and sample rate from Piper CLI executable.
+    Fallback for when the Python API is not available."""
+    cmd = [piper_exe, "-m", piper_voice, "--output_raw"]
+    result = subprocess.run(cmd, input=text.encode("utf-8"), stdout=subprocess.PIPE, check=True)
+    return result.stdout, sample_rate
+
+
+def tts_coqui_stream(text, voice_model="xtts_v2", language="en", speaker="Daisy Studious"):
+    """Returns raw 16-bit PCM bytes and sample rate from Coqui."""
     global _coqui_tts
     if _coqui_tts is None:
         from TTS.api import TTS
         _coqui_tts = TTS(model_name=f"tts_models/multilingual/multi-dataset/{voice_model}")
-    _coqui_tts.tts_to_file(
-        text=text,
-        file_path=out_wav,
-        speaker=speaker,
-        language=language
-    )
+    
+    wav = _coqui_tts.tts(text=text, speaker=speaker, language=language)
+    
+    audio_data = np.array(wav, dtype=np.float32)
+    audio_data = np.clip(audio_data, -1.0, 1.0)
+    audio_data = (audio_data * 32767.0).astype(np.int16)
+    
+    sample_rate = _coqui_tts.synthesizer.output_sample_rate
+    return audio_data.tobytes(), sample_rate
 
 
 # ---------- Main ----------
@@ -220,6 +317,7 @@ def main():
     # TTS options
     parser.add_argument("--piper-exe", default="./piper/piper.exe", help="Path to Piper executable (piper or piper.exe)")
     parser.add_argument("--piper-voice", default="./piper/en_US-lessac-medium.onnx", help="Path to English Piper .onnx voice")
+    parser.add_argument("--piper-use-exe", action="store_true", help="Use Piper CLI executable instead of Python API (slower, spawns subprocess per chunk)")
     parser.add_argument("--coqui-voice", default="xtts_v2", help="Coqui voice model key")
     parser.add_argument("--coqui-language", default="en", help="Language code for Coqui")
     parser.add_argument("--coqui-speaker", default="Daisy Studious", help="Speaker id for Coqui")
@@ -235,6 +333,55 @@ def main():
         args.whisper_device = "cuda" if args.mode == "gpu" else "cpu"
     if args.whisper_compute_type is None:
         args.whisper_compute_type = "float16" if args.whisper_device == "cuda" else "int8"
+
+    # Pre-load Piper sample rate to avoid disk I/O on every chunk (only needed for --piper-use-exe fallback)
+    piper_sample_rate = 16000
+    if args.tts_engine == "piper":
+        json_path = args.piper_voice + ".json"
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    vdata = json.load(f)
+                    piper_sample_rate = vdata.get("audio", {}).get("sample_rate", 16000)
+            except Exception:
+                pass
+
+    # Pre-load (warmup) models so their initialization time isn't counted in the latency of the first file
+    print("[INFO] Pre-loading AI models (STT, LLM, TTS)...")
+    
+    # Ollama Warmup (betöltés VRAM/RAM-ba)
+    try:
+        requests.post(args.ollama_url, json={
+            "model": args.ollama_model,
+            "prompt": "",
+            "options": {"num_predict": 1}
+        }, timeout=120)
+    except Exception as e:
+        print(f"[WARN] Failed to warmup Ollama: {e}")
+
+    global _vosk, _whisper, _coqui_tts, _piper_voice
+    if args.stt_engine == "vosk":
+        from vosk import Model
+        _vosk = {"model": Model(args.vosk_model)}
+    elif args.stt_engine == "whisper":
+        from faster_whisper import WhisperModel
+        _whisper = {
+            "key": (args.whisper_model, args.whisper_device, args.whisper_compute_type),
+            "model": WhisperModel(args.whisper_model, device=args.whisper_device, compute_type=args.whisper_compute_type),
+        }
+
+    if args.tts_engine == "piper" and not args.piper_use_exe:
+        try:
+            from piper.voice import PiperVoice
+            _piper_voice = PiperVoice.load(args.piper_voice)
+            print(f"[INFO] Piper Python API loaded (model: {args.piper_voice})")
+        except Exception as e:
+            print(f"[WARN] Piper Python API failed ({e}), falling back to CLI executable")
+            args.piper_use_exe = True
+
+    if args.tts_engine == "coqui":
+        from TTS.api import TTS
+        _coqui_tts = TTS(model_name=f"tts_models/multilingual/multi-dataset/{args.coqui_voice}")
 
     run_dir = os.path.join(args.out_dir, timestamp)
     os.makedirs(run_dir, exist_ok=True)
@@ -288,8 +435,10 @@ def main():
                     compute_type=args.whisper_compute_type
                 )
             t1 = time.perf_counter()
-            write_timing(writer, args, item_name, "stt", int((t1 - t0) * 1000),
-                         {"input_duration_ms": input_duration_ms})
+            stt_ms = int((t1 - t0) * 1000)
+            stt_rtf = round(stt_ms / input_duration_ms, 3) if input_duration_ms > 0 else 0.0
+            write_timing(writer, args, item_name, "stt", stt_ms,
+                         {"input_duration_ms": input_duration_ms, "stt_rtf": stt_rtf})
             print(f"[STT] {user_text!r}")
 
             if not user_text:
@@ -298,30 +447,108 @@ def main():
                              {"input_duration_ms": input_duration_ms, "skipped": True})
                 continue
 
-            # -------- LLM --------
-            t0 = time.perf_counter()
-            reply = llm_ollama_chat(user_text=user_text, model_name=args.ollama_model, url=args.ollama_url)
-            t1 = time.perf_counter()
-            write_timing(writer, args, item_name, "llm", int((t1 - t0) * 1000))
-            print(f"[LLM] {reply}")
-
-            # -------- TTS --------
+            # -------- LLM & TTS Streaming --------
+            print(f"[LLM] Starting stream...")
             out_wav = os.path.join(run_dir, f"assistant_{item_index}_{item_name}.wav")
-            t0 = time.perf_counter()
-            if args.tts_engine == "piper":
-                tts_piper(text=reply, piper_exe=args.piper_exe, piper_voice=args.piper_voice, output_file=out_wav)
-            else:
-                tts_coqui(
-                    text=reply,
-                    voice_model=args.coqui_voice,
-                    language=args.coqui_language,
-                    speaker=args.coqui_speaker,
-                    out_wav=out_wav)
-            t1 = time.perf_counter()
-            write_timing(writer, args, item_name, "tts", int((t1 - t0) * 1000))
+            first_chunk_ts = None
+            final_wav = None
+            llm_t0 = time.perf_counter()
+            
+            total_tts_time = 0.0
+            tts_first_chunk_ms = None
+            llm_ttfc_ms = None
+            full_reply = ""
+            ollama_stats = None
+            chunk_count = 0
+            
+            for chunk_data in stream_llm_ollama_chat(user_text, model_name=args.ollama_model, url=args.ollama_url):
+                # Handle dict-based chunk from generator
+                if isinstance(chunk_data, dict):
+                    chunk = chunk_data.get("text", "")
+                    if chunk_data.get("ollama_stats"):
+                        ollama_stats = chunk_data["ollama_stats"]
+                else:
+                    chunk = chunk_data  # fallback for plain string
+                
+                if not chunk:
+                    continue
+                chunk_count += 1
+                
+                # LLM Time to First (synthesizable) Chunk
+                if first_chunk_ts is None:
+                    first_chunk_ts = time.perf_counter()
+                    llm_ttfc_ms = int((first_chunk_ts - llm_t0) * 1000)
+                    write_timing(writer, args, item_name, "llm_ttfc", llm_ttfc_ms)
+                    
+                print(f"[LLM Chunk {chunk_count}] {chunk}")
+                full_reply += chunk + " "
+                
+                tts_t0 = time.perf_counter()
+                if args.tts_engine == "piper":
+                    if _piper_voice is not None:
+                        pcm_bytes, sample_rate = tts_piper_python(chunk)
+                    else:
+                        pcm_bytes, sample_rate = tts_piper_exe(
+                            chunk, args.piper_exe, args.piper_voice, sample_rate=piper_sample_rate
+                        )
+                else:
+                    pcm_bytes, sample_rate = tts_coqui_stream(
+                        chunk, args.coqui_voice, args.coqui_language, args.coqui_speaker
+                    )
+                tts_t1 = time.perf_counter()
+                chunk_tts_ms = int((tts_t1 - tts_t0) * 1000)
+                total_tts_time += (tts_t1 - tts_t0)
+                
+                # Track TTS first chunk time separately
+                if tts_first_chunk_ms is None:
+                    tts_first_chunk_ms = chunk_tts_ms
+                    write_timing(writer, args, item_name, "tts_first_chunk", tts_first_chunk_ms)
+                
+                # Közvetlenül a nyitva tartott fájl pufferébe írunk (valódi streaming)
+                if final_wav is None:
+                    final_wav = wave.open(out_wav, "wb")
+                    final_wav.setnchannels(1)
+                    final_wav.setsampwidth(2) # 16-bit
+                    final_wav.setframerate(sample_rate)
+                
+                final_wav.writeframes(pcm_bytes)
+
+            if final_wav:
+                final_wav.close()
+            
+            # TTFA (Time to First Audio) = STT + LLM TTFC + TTS first chunk
+            if llm_ttfc_ms is not None and tts_first_chunk_ms is not None:
+                ttfa_ms = stt_ms + llm_ttfc_ms + tts_first_chunk_ms
+                write_timing(writer, args, item_name, "ttfa", ttfa_ms)
+            
+            # LLM server-side evaluation metrics (ground truth from Ollama)
+            if ollama_stats:
+                eval_dur_ns = ollama_stats.get("eval_duration_ns", 0)
+                eval_count = ollama_stats.get("eval_count", 0)
+                tokens_per_sec = round(eval_count / (eval_dur_ns / 1e9), 1) if eval_dur_ns > 0 else 0.0
+                write_timing(writer, args, item_name, "llm_eval", int(eval_dur_ns / 1e6), {
+                    "eval_tokens": eval_count,
+                    "tokens_per_sec": tokens_per_sec,
+                    "prompt_tokens": ollama_stats.get("prompt_eval_count", 0),
+                    "prompt_eval_ms": int(ollama_stats.get("prompt_eval_duration_ns", 0) / 1e6),
+                    "total_duration_ms": int(ollama_stats.get("total_duration_ns", 0) / 1e6),
+                })
+            
+            # Log total TTS time
+            write_timing(writer, args, item_name, "tts_total", int(total_tts_time * 1000))
+            
+            # Output audio duration
+            output_duration_ms = wav_duration_ms(out_wav) if os.path.exists(out_wav) else 0
+            
             write_timing(writer, args, item_name, "e2e_response_ready", int((time.perf_counter() - e2e_t0) * 1000),
-                         {"input_duration_ms": input_duration_ms, "output_wav": out_wav})
-            print(f"[TTS] Saved to {out_wav}.")
+                         {"input_duration_ms": input_duration_ms,
+                          "output_duration_ms": output_duration_ms,
+                          "output_wav": out_wav,
+                          "full_text": full_reply.strip(),
+                          "response_word_count": len(full_reply.split()),
+                          "response_char_count": len(full_reply.strip()),
+                          "llm_chunk_count": chunk_count})
+            print(f"[TTS] Stream finished. Saved to {out_wav}.")
 
             if not args.keep_normalized:
                 try:
