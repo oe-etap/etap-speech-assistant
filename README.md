@@ -21,7 +21,7 @@ The script is batch-oriented: it does not record from the microphone. It process
 
 Common:
 
-- Python 3.10+
+- Python 3.10
 - `ffmpeg` on PATH
 - Ollama running locally, for example `ollama serve`
 - A pulled Ollama model, for example `ollama pull phi3:mini`

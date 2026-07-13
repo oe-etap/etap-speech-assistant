@@ -1,9 +1,10 @@
 # Python packages for CPU mode
 # External runtime dependency (install separately): ffmpeg (CLI must be on PATH)
-vosk
-faster-whisper
-soundfile
-numpy
-requests
-scipy
-psutil
+vosk==0.3.44
+faster-whisper==1.2.1
+soundfile==0.14.0
+numpy==2.2.6
+requests==2.34.2
+scipy==1.15.3
+psutil==7.2.2
+piper-tts==1.4.2
