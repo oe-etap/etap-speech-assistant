@@ -582,6 +582,22 @@ def main():
                           "llm_chunk_count": chunk_count})
             print(f"[TTS] Stream finished. Saved to {out_wav}.")
 
+            # --- Transcript Logging ---
+            transcript_record = {
+                "stt_text": user_text,
+                "llm_text": full_reply.strip()
+            }
+
+            # JSONL Logging
+            jsonl_path = os.path.join(run_dir, "transcripts.jsonl")
+            with open(jsonl_path, "a", encoding="utf-8") as f_jsonl:
+                f_jsonl.write(json.dumps(transcript_record, ensure_ascii=False) + "\n")
+
+            # YAML Logging
+            yaml_path = os.path.join(run_dir, "transcripts.yaml")
+            with open(yaml_path, "a", encoding="utf-8") as f_yaml:
+                yaml.dump([transcript_record], f_yaml, sort_keys=False, allow_unicode=True)
+
             if not args.keep_normalized:
                 try:
                     os.remove(wav_path)
