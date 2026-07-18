@@ -14,6 +14,7 @@ CPU/RAM/GPU snapshots.
 
 import argparse
 import csv
+import yaml
 import json
 import os
 import shutil
@@ -297,7 +298,8 @@ def tts_coqui_stream(text, language="en", speaker="Daisy Studious"):
 # ---------- Main ----------
 def main():
     parser = argparse.ArgumentParser(description="Offline Speech Assistant MWE (EN, file input only)")
-    parser.add_argument("--audio", nargs="+", required=True, help="One or more audio files (wav/mp3/flac/etc.)")
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML config file (CLI args override it)")
+    parser.add_argument("--audio", nargs="+", help="One or more audio files (wav/mp3/flac/etc.)")
     parser.add_argument("--mode", choices=["cpu", "gpu"], default="cpu", help="Default compute preset")
     parser.add_argument("--stt-engine", choices=["vosk", "whisper"], default="whisper", help="Speech-to-text engine")
     parser.add_argument("--tts-engine", choices=["piper", "coqui"], default="piper", help="Text-to-speech engine")
@@ -326,8 +328,21 @@ def main():
     parser.add_argument("--ollama-model", default="phi3:mini", help="Ollama model (e.g. phi3:mini)")
     parser.add_argument("--ollama-url", default="http://localhost:11434/api/generate", help="Ollama generate endpoint")
 
-    # ---- parse ----
+    # ---- config file handling & parse ----
+    initial_parser = argparse.ArgumentParser(add_help=False)
+    initial_parser.add_argument("--config", type=str)
+    known_args, _ = initial_parser.parse_known_args()
+
+    if known_args.config:
+        with open(known_args.config, "r", encoding="utf-8") as f:
+            yaml_cfg = yaml.safe_load(f) or {}
+            yaml_cfg = {k.replace("-", "_"): v for k, v in yaml_cfg.items()}
+            parser.set_defaults(**yaml_cfg)
+
     args = parser.parse_args()
+
+    if not args.audio:
+        parser.error("the following arguments are required: --audio (either in CLI or config)")
 
     if args.whisper_device is None:
         args.whisper_device = "cuda" if args.mode == "gpu" else "cpu"
@@ -380,6 +395,29 @@ def main():
 
     run_dir = os.path.join(args.out_dir, timestamp)
     os.makedirs(run_dir, exist_ok=True)
+
+    config_to_save = vars(args).copy()
+    
+    # Filter out settings that are not used by the selected engine
+    if args.stt_engine == "whisper":
+        config_to_save.pop("vosk_model", None)
+    elif args.stt_engine == "vosk":
+        config_to_save.pop("whisper_model", None)
+        config_to_save.pop("whisper_device", None)
+        config_to_save.pop("whisper_compute_type", None)
+
+    if args.tts_engine == "piper":
+        config_to_save.pop("coqui_voice", None)
+        config_to_save.pop("coqui_language", None)
+        config_to_save.pop("coqui_speaker", None)
+    elif args.tts_engine == "coqui":
+        config_to_save.pop("piper_exe", None)
+        config_to_save.pop("piper_voice", None)
+        config_to_save.pop("piper_use_exe", None)
+
+    config_dump_path = os.path.join(run_dir, "config_used.yaml")
+    with open(config_dump_path, "w", encoding="utf-8") as f:
+        yaml.dump(config_to_save, f, sort_keys=False)
 
     if not args.latency_csv:
         args.latency_csv = os.path.join(run_dir, f"latency_log_{timestamp}.csv")
