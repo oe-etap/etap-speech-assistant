@@ -9,7 +9,7 @@ out-dir: outputs
 keep-normalized: false
 
 # STT Options
-vosk-model: "./vosk-model-small-en-us-0.15"
+vosk-model: "./vosk/vosk-model-small-en-us-0.15"
 whisper-model: "small"
 whisper-device: "cpu"
 whisper-compute-type: "int8"
