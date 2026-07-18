@@ -54,6 +54,8 @@ try:
 except ImportError:
     pass
 
+_requests_session = requests.Session()
+
 _vosk_model = None
 _vosk_recognizer = None
 _whisper_model = None
@@ -222,7 +224,7 @@ def stream_llm_ollama_chat(user_text, model_name="phi3:mini", url="http://localh
     )
     prompt = f'{system_prompt}\n\nThe user said: "{user_text}"\n\nAnswer:'
     try:
-        r = requests.post(url, json={"model": model_name, "prompt": prompt, "stream": True, "options": {
+        r = _requests_session.post(url, json={"model": model_name, "prompt": prompt, "stream": True, "options": {
         "num_predict": 150,
         "temperature": 0.7
             }
@@ -349,7 +351,7 @@ def main():
     
     # Ollama Warmup (betöltés VRAM/RAM-ba)
     try:
-        requests.post(args.ollama_url, json={
+        _requests_session.post(args.ollama_url, json={
             "model": args.ollama_model,
             "prompt": "",
             "options": {"num_predict": 1}
