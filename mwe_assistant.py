@@ -34,9 +34,29 @@ try:
 except ImportError:
     _HAS_PSUTIL = False
 
-# Optional lazy singletons
-_vosk = None
-_whisper = None
+try:
+    from vosk import Model, KaldiRecognizer
+except ImportError:
+    pass
+
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    pass
+
+try:
+    from piper.voice import PiperVoice
+except ImportError:
+    pass
+
+try:
+    from TTS.api import TTS
+except ImportError:
+    pass
+
+_vosk_model = None
+_vosk_recognizer = None
+_whisper_model = None
 _coqui_tts = None
 _piper_voice = None  # PiperVoice Python API singleton
 
@@ -160,43 +180,28 @@ def write_timing(writer, args, item, stage, duration_ms, extra=None):
     })
 
 
-def transcribe_with_vosk(wav_path, model_dir):
+def transcribe_with_vosk(wav_path):
     """STT from WAV file using Vosk (expects mono 16 kHz 16-bit PCM)."""
-    global _vosk
-    from vosk import Model, KaldiRecognizer
-
-    if _vosk is None:
-        _vosk = {"model": Model(model_dir)}
-
     wf = wave.open(wav_path, "rb")
     assert wf.getnchannels() == 1 and wf.getframerate() == 16000 and wf.getsampwidth() == 2, \
         "Use mono/16 kHz/16-bit PCM WAV for Vosk"
-    rec = KaldiRecognizer(_vosk["model"], wf.getframerate())
-    rec.SetWords(True)
-
     results = []
     while True:
         data = wf.readframes(4000)
         if len(data) == 0:
             break
-        if rec.AcceptWaveform(data):
-            results.append(json.loads(rec.Result()))
-    results.append(json.loads(rec.FinalResult()))
+        if _vosk_recognizer.AcceptWaveform(data):
+            results.append(json.loads(_vosk_recognizer.Result()))
+    results.append(json.loads(_vosk_recognizer.FinalResult()))
     text = " ".join([r.get("text", "") for r in results]).strip()
     wf.close()
     return text
 
 
-def stt_whisper(wav_path, whisper_model_name="small", device="cpu", compute_type="int8"):
-    global _whisper
-    cache_key = (whisper_model_name, device, compute_type)
-    if _whisper is None or _whisper.get("key") != cache_key:
-        from faster_whisper import WhisperModel
-        _whisper = {
-            "key": cache_key,
-            "model": WhisperModel(whisper_model_name, device=device, compute_type=compute_type),
-        }
-    segments, _ = _whisper["model"].transcribe(wav_path, language="en")
+def stt_whisper(wav_path):
+    """STT from WAV file using faster-whisper.
+    Requires _whisper to be pre-loaded via main()."""
+    segments, _ = _whisper_model.transcribe(wav_path, language="en")
     text = " ".join([s.text.strip() for s in segments]).strip()
     return text
 
@@ -257,9 +262,7 @@ def stream_llm_ollama_chat(user_text, model_name="phi3:mini", url="http://localh
 
 
 def tts_piper_python(text):
-    """Returns raw 16-bit PCM bytes and sample rate from Piper using the Python API.
-    Requires _piper_voice to be pre-loaded. No subprocess overhead per chunk."""
-    global _piper_voice
+    """Returns raw 16-bit PCM bytes and sample rate from Piper using the Python API."""
     pcm_parts = []
     sample_rate = None
     for audio_chunk in _piper_voice.synthesize(text):
@@ -277,13 +280,8 @@ def tts_piper_exe(text, piper_exe, piper_voice, sample_rate=16000):
     return result.stdout, sample_rate
 
 
-def tts_coqui_stream(text, voice_model="xtts_v2", language="en", speaker="Daisy Studious"):
+def tts_coqui_stream(text, language="en", speaker="Daisy Studious"):
     """Returns raw 16-bit PCM bytes and sample rate from Coqui."""
-    global _coqui_tts
-    if _coqui_tts is None:
-        from TTS.api import TTS
-        _coqui_tts = TTS(model_name=f"tts_models/multilingual/multi-dataset/{voice_model}")
-    
     wav = _coqui_tts.tts(text=text, speaker=speaker, language=language)
     
     audio_data = np.array(wav, dtype=np.float32)
@@ -359,20 +357,16 @@ def main():
     except Exception as e:
         print(f"[WARN] Failed to warmup Ollama: {e}")
 
-    global _vosk, _whisper, _coqui_tts, _piper_voice
+    global _vosk_model, _vosk_recognizer, _whisper_model, _coqui_tts, _piper_voice
     if args.stt_engine == "vosk":
-        from vosk import Model
-        _vosk = {"model": Model(args.vosk_model)}
+        _vosk_model = Model(args.vosk_model)
+        _vosk_recognizer = KaldiRecognizer(_vosk_model, 16000)
+        _vosk_recognizer.SetWords(True)
     elif args.stt_engine == "whisper":
-        from faster_whisper import WhisperModel
-        _whisper = {
-            "key": (args.whisper_model, args.whisper_device, args.whisper_compute_type),
-            "model": WhisperModel(args.whisper_model, device=args.whisper_device, compute_type=args.whisper_compute_type),
-        }
+        _whisper_model = WhisperModel(args.whisper_model, device=args.whisper_device, compute_type=args.whisper_compute_type)
 
     if args.tts_engine == "piper" and not args.piper_use_exe:
         try:
-            from piper.voice import PiperVoice
             _piper_voice = PiperVoice.load(args.piper_voice)
             print(f"[INFO] Piper Python API loaded (model: {args.piper_voice})")
         except Exception as e:
@@ -380,7 +374,6 @@ def main():
             args.piper_use_exe = True
 
     if args.tts_engine == "coqui":
-        from TTS.api import TTS
         _coqui_tts = TTS(model_name=f"tts_models/multilingual/multi-dataset/{args.coqui_voice}")
 
     run_dir = os.path.join(args.out_dir, timestamp)
@@ -421,19 +414,18 @@ def main():
 
             wav_path = ensure_wav_mono_16k(audio_path, out_dir=run_dir, prefix=f"input_{item_index}")
             input_duration_ms = wav_duration_ms(wav_path)
+            
+            if args.stt_engine == "vosk":
+                _vosk_recognizer.Reset()
+
             e2e_t0 = time.perf_counter()
 
             # -------- STT --------
             t0 = time.perf_counter()
             if args.stt_engine == "vosk":
-                user_text = transcribe_with_vosk(wav_path, args.vosk_model)
+                user_text = transcribe_with_vosk(wav_path)
             else:
-                user_text = stt_whisper(
-                    wav_path=wav_path,
-                    whisper_model_name=args.whisper_model,
-                    device=args.whisper_device,
-                    compute_type=args.whisper_compute_type
-                )
+                user_text = stt_whisper(wav_path)
             t1 = time.perf_counter()
             stt_ms = int((t1 - t0) * 1000)
             stt_rtf = round(stt_ms / input_duration_ms, 3) if input_duration_ms > 0 else 0.0
@@ -493,7 +485,7 @@ def main():
                         )
                 else:
                     pcm_bytes, sample_rate = tts_coqui_stream(
-                        chunk, args.coqui_voice, args.coqui_language, args.coqui_speaker
+                        chunk, args.coqui_language, args.coqui_speaker
                     )
                 tts_t1 = time.perf_counter()
                 chunk_tts_ms = int((tts_t1 - tts_t0) * 1000)
