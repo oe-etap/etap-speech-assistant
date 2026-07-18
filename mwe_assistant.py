@@ -396,6 +396,9 @@ def main():
     run_dir = os.path.join(args.out_dir, timestamp)
     os.makedirs(run_dir, exist_ok=True)
 
+    if not args.latency_csv:
+        args.latency_csv = os.path.join(run_dir, f"latency_log_{timestamp}.csv")
+
     config_to_save = vars(args).copy()
     
     # Filter out settings that are not used by the selected engine
@@ -418,9 +421,6 @@ def main():
     config_dump_path = os.path.join(run_dir, "config_used.yaml")
     with open(config_dump_path, "w", encoding="utf-8") as f:
         yaml.dump(config_to_save, f, sort_keys=False)
-
-    if not args.latency_csv:
-        args.latency_csv = os.path.join(run_dir, f"latency_log_{timestamp}.csv")
 
     fieldnames = [
         "ts_iso", "mode", "stt_engine", "tts_engine", "item", "stage", "duration_ms",
