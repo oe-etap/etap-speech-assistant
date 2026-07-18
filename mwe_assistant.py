@@ -311,7 +311,7 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # STT options
-    parser.add_argument("--vosk-model", default="./vosk-model-small-en-us-0.15", help="Path to English Vosk model dir")
+    parser.add_argument("--vosk-model", default="./vosk/vosk-model-small-en-us-0.15", help="Path to English Vosk model dir")
     parser.add_argument("--whisper-model", default="small", help="faster-whisper model name")
     parser.add_argument("--whisper-device", choices=["cpu", "cuda"], default=None, help="Device for faster-whisper")
     parser.add_argument("--whisper-compute-type", default=None, help="Compute type (int8, float16, etc.)")
