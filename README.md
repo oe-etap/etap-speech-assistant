@@ -6,6 +6,9 @@ The script is batch-oriented: it does not record from the microphone. It process
 
 ## Features
 
+- Configuration via YAML files (`--config`) or CLI arguments
+- Logs conversation transcripts (STT and LLM text) to `transcripts.jsonl` and `transcripts.yaml`
+- Saves the exact runtime configuration to `config_used.yaml`
 - File-only input via `--audio file1.wav file2.mp3 ...`
 - English-only STT prompt flow and English TTS defaults
 - Selectable STT engine: `--stt-engine vosk` or `--stt-engine whisper`
@@ -96,7 +99,8 @@ python mwe_assistant.py --audio .\a.wav .\b.mp3 .\c.flac --stt-engine whisper --
 
 ## Important Arguments
 
-- `--audio PATH [PATH ...]`: required; one or more input files
+- `--config PATH`: optional; path to a YAML configuration file (CLI arguments override YAML values)
+- `--audio PATH [PATH ...]`: required (unless provided in config); one or more input files
 - `--mode {cpu,gpu}`: default device preset
 - `--stt-engine {vosk,whisper}`: speech-to-text engine
 - `--tts-engine {piper,coqui}`: text-to-speech engine
@@ -119,8 +123,10 @@ python mwe_assistant.py --audio .\a.wav .\b.mp3 .\c.flac --stt-engine whisper --
 
 Each run creates `outputs/<YYYYMMDD_HHMMSS>/` containing:
 
-- Copied input files as `input_<n>_<name>`
+- Copied input files as `user_input_<n>_<name>`
 - Generated assistant responses as `assistant_<n>_<input-stem>.wav`
+- `config_used.yaml`: The exact runtime configuration used for the run
+- `transcripts.jsonl` and `transcripts.yaml`: Conversation logs containing the recognized STT text and the LLM response
 - `latency_log_<timestamp>.csv`
 
 The CSV contains:
