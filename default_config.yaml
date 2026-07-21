@@ -1,6 +1,12 @@
 # Default Configuration for MWE Assistant
 # You can override these values either by modifying this file or via CLI arguments.
 
+audio: 
+  - "./audios/1.mp3"
+  - "./audios/2.mp3"
+  - "./audios/3.mp3"
+  - "./audios/4.mp3"
+
 mode: cpu
 stt-engine: whisper
 tts-engine: piper
