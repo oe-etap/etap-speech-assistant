@@ -344,6 +344,28 @@ def main():
     if not args.audio:
         parser.error("the following arguments are required: --audio (either in CLI or config)")
 
+    expanded_audio = []
+    valid_extensions = {
+        ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".m4b", ".aac", ".wma", 
+        ".amr", ".aiff", ".opus", ".webm", ".mp4", ".mkv", ".avi", ".mov"
+    }
+    for p in args.audio:
+        path_obj = Path(p)
+        if not path_obj.exists():
+            print(f"[WARN] Input path does not exist: {p}")
+            continue
+        if path_obj.is_dir():
+            for child in path_obj.iterdir():
+                if child.is_file() and child.suffix.lower() in valid_extensions:
+                    expanded_audio.append(str(child))
+        else:
+            expanded_audio.append(str(path_obj))
+
+    if not expanded_audio:
+        parser.error("No valid audio files found in the provided --audio paths.")
+
+    args.audio = sorted(expanded_audio)
+
     if args.whisper_device is None:
         args.whisper_device = "cuda" if args.mode == "gpu" else "cpu"
     if args.whisper_compute_type is None:
