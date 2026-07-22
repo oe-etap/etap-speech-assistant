@@ -6,7 +6,17 @@ class OllamaEngine:
         self.model_name = model_name
         self.url = url
         self.session = requests.Session()
+        self._current_response = None
         self.warmup()
+
+    def cancel(self):
+        """Aborts the currently active HTTP generation stream if any."""
+        if self._current_response is not None:
+            try:
+                self._current_response.close()
+            except Exception:
+                pass
+            self._current_response = None
 
     def warmup(self):
         try:
@@ -30,6 +40,7 @@ class OllamaEngine:
             "Answer in English in 1-3 medium length sentences."
         )
         
+        r = None
         try:
             r = self.session.post(self.url, json={
                 "model": self.model_name,
@@ -41,6 +52,7 @@ class OllamaEngine:
                     "temperature": 0.7
                 }
             }, timeout=120)
+            self._current_response = r
             r.raise_for_status()
             
             buffer = ""
@@ -69,5 +81,11 @@ class OllamaEngine:
                 yield {"text": buffer.strip(), "ollama_stats": None}
             if ollama_stats:
                 yield {"text": "", "ollama_stats": ollama_stats}
+        except (requests.exceptions.RequestException, json.JSONDecodeError):
+            # Stream was closed/cancelled or connection dropped mid-stream
+            yield {"text": "", "ollama_stats": None, "cancelled": True}
         except Exception as e:
             yield {"text": f"(LLM call failed: {e})", "ollama_stats": None}
+        finally:
+            if r is not None and self._current_response is r:
+                self._current_response = None

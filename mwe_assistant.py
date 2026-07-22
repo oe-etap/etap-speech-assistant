@@ -176,18 +176,37 @@ def stt_worker(wav_path, stt_engine, llm_queue, stt_metrics):
             stt_metrics["stt_end_t"] = t1
             stt_metrics["full_user_text"] += result["text"] + " "
             print(f"[STT] {result['text']}")
-            llm_queue.put(result["text"])
+            llm_queue.put({"type": "final", "text": result["text"]})
     llm_queue.put(None) # Signal EOF to LLM
 
 def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
     while True:
-        text_chunk = llm_queue.get()
-        if text_chunk is None:
+        msg = llm_queue.get()
+        if msg is None:
             tts_queue.put(None) # Signal EOF to TTS
             break
         
+        if isinstance(msg, str):
+            msg = {"type": "final", "text": msg}
+
+        msg_type = msg.get("type", "final")
+
+        if msg_type == "cancel":
+            llm_engine.cancel()
+            tts_queue.put({"type": "cancel"})
+            continue
+
+        text_chunk = msg.get("text", "")
+        if not text_chunk:
+            continue
+        
         llm_t0 = time.perf_counter()
         for chunk_data in llm_engine.generate_stream(text_chunk):
+            if chunk_data.get("cancelled"):
+                print("[LLM] Generation cancelled mid-stream")
+                tts_queue.put({"type": "cancel"})
+                break
+
             text = chunk_data.get("text", "")
             stats = chunk_data.get("ollama_stats")
             
@@ -200,15 +219,18 @@ def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
                 llm_metrics["full_assistant_text"] += text + " "
                 llm_metrics["llm_chunk_count"] += 1
                 print(f"[LLM Chunk] {text}")
-                tts_queue.put(text)
+                tts_queue.put({"type": "text", "text": text})
 
 def tts_worker(tts_engine, tts_queue, out_wav, e2e_t0, tts_metrics):
     def text_generator():
         while True:
-            text = tts_queue.get()
-            if text is None:
+            item = tts_queue.get()
+            if item is None:
                 break
-            yield text
+            if isinstance(item, dict):
+                yield item.get("text", "")
+            else:
+                yield item
     
     final_wav = None
     for pcm_bytes, sample_rate in tts_engine.synthesize_stream(text_generator()):
