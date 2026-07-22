@@ -227,10 +227,15 @@ def tts_worker(tts_engine, tts_queue, out_wav, e2e_t0, tts_metrics):
             item = tts_queue.get()
             if item is None:
                 break
-            if isinstance(item, dict):
-                yield item.get("text", "")
-            else:
+            if isinstance(item, str):
                 yield item
+            elif isinstance(item, dict):
+                msg_type = item.get("type", "text")
+                if msg_type == "cancel":
+                    print("[TTS] Cancel signal received, resetting TTS generator")
+                    break
+                elif msg_type == "text":
+                    yield item.get("text", "")
     
     final_wav = None
     for pcm_bytes, sample_rate in tts_engine.synthesize_stream(text_generator()):
