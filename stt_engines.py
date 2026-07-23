@@ -3,21 +3,44 @@ import json
 import numpy as np
 
 class BaseSTTEngine(ABC):
+    """Base class for Speech-to-Text engines.
+
+    Subclasses implement a chunk-based streaming interface that accepts raw
+    audio bytes and yields transcription results.  Each engine instance is
+    used by a single ``stt_worker`` thread at a time — implementations do
+    **not** need to be thread-safe, but they must be re-entrant across
+    successive ``reset()`` / ``transcribe_stream()`` cycles for different
+    audio items.
+
+    To add a new engine (e.g., Conformer), subclass ``BaseSTTEngine``,
+    implement ``reset()`` and ``transcribe_stream()``, register the engine
+    name in ``mwe_assistant.py``'s argument parser and initialisation block.
+    """
+
     @abstractmethod
     def reset(self):
+        """Reset engine state for a new audio stream.
+
+        Called before each audio item to clear any internal buffers,
+        decoder state, or accumulated context.  Must be called before
+        starting latency measurements.
         """
-        Reset the engine state (e.g., clear buffers or context) for a new audio stream.
-        This should be called before starting latency measurements.
-        """
-        pass
 
     @abstractmethod
     def transcribe_stream(self, audio_iterator):
+        """Transcribe an audio stream delivered as byte chunks.
+
+        Args:
+            audio_iterator: An iterator of ``bytes`` objects, each containing
+                raw 16 kHz, 16-bit, mono PCM audio data.
+
+        Yields:
+            dict: ``{"is_final": bool, "text": str}``
+                - ``is_final=False``: an intermediate (partial) hypothesis
+                  that may be revised by later chunks.
+                - ``is_final=True``: a stable segment boundary (e.g., after
+                  a speech pause detected by VAD).  The text will not change.
         """
-        Accepts an iterator of raw audio byte chunks (16kHz, 16-bit, Mono PCM).
-        Yields dictionaries: {"is_final": bool, "text": str}
-        """
-        pass
 
 class VoskEngine(BaseSTTEngine):
     def __init__(self, model_path):

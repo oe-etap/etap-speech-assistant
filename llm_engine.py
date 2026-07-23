@@ -1,5 +1,7 @@
-import requests
 import json
+import threading
+
+import requests
 
 class OllamaEngine:
     def __init__(self, model_name="phi3:mini", url="http://localhost:11434/api/generate"):
@@ -7,16 +9,23 @@ class OllamaEngine:
         self.url = url
         self.session = requests.Session()
         self._current_response = None
+        self._cancel_event = threading.Event()
         self.warmup()
 
     def cancel(self):
-        """Aborts the currently active HTTP generation stream if any."""
-        if self._current_response is not None:
+        """Aborts the currently active HTTP generation stream, if any.
+
+        Sets the cooperative cancel event (checked between iterations) and
+        closes the underlying HTTP response socket as a fallback.
+        Thread-safe: may be called from any thread.
+        """
+        self._cancel_event.set()
+        resp = self._current_response
+        if resp is not None:
             try:
-                self._current_response.close()
+                resp.close()
             except Exception:
                 pass
-            self._current_response = None
 
     def warmup(self):
         try:
@@ -41,13 +50,14 @@ class OllamaEngine:
             "Do not roleplay as the user or generate fake user replies."
         )
         
+        self._cancel_event.clear()
         r = None
         try:
             r = self.session.post(self.url, json={
                 "model": self.model_name,
                 "system": system_prompt,
-                "prompt": text_prompt, 
-                "stream": True, 
+                "prompt": text_prompt,
+                "stream": True,
                 "options": {
                     "num_predict": 150,
                     "temperature": 0.7,
@@ -56,16 +66,21 @@ class OllamaEngine:
             }, timeout=120)
             self._current_response = r
             r.raise_for_status()
-            
+
             buffer = ""
             terminators = {".", "?", "!", ":", ";", "\n"}
             ollama_stats = None
             for line in r.iter_lines():
+                # Cooperative cancellation check between iterations
+                if self._cancel_event.is_set():
+                    yield {"text": "", "ollama_stats": None, "cancelled": True}
+                    return
+
                 if line:
                     data = json.loads(line)
                     piece = data.get("response", "")
                     buffer += piece
-                    
+
                     if data.get("done", False):
                         ollama_stats = {
                             "prompt_eval_count": data.get("prompt_eval_count", 0),
@@ -74,7 +89,7 @@ class OllamaEngine:
                             "eval_duration_ns": data.get("eval_duration", 0),
                             "total_duration_ns": data.get("total_duration", 0),
                         }
-                    
+
                     if any(t in piece for t in terminators):
                         if len(buffer.strip()) > 2:
                             yield {"text": buffer.strip(), "ollama_stats": None}
@@ -89,5 +104,4 @@ class OllamaEngine:
         except Exception as e:
             yield {"text": f"(LLM call failed: {e})", "ollama_stats": None}
         finally:
-            if r is not None and self._current_response is r:
-                self._current_response = None
+            self._current_response = None

@@ -192,6 +192,8 @@ def stt_worker(wav_path, stt_engine, llm_queue, stt_metrics, debounce_sec=0.3):
             # Final STT output (speech pause / VAD boundary)
             if stt_metrics["stt_ms"] is None:
                 stt_metrics["stt_ms"] = int((t_now - t0) * 1000)
+            if stt_metrics["stt_first_final_t"] is None:
+                stt_metrics["stt_first_final_t"] = t_now
             stt_metrics["stt_end_t"] = t_now
             stt_metrics["full_user_text"] += text + " "
             print(f"[STT Final] {text}")
@@ -201,21 +203,32 @@ def stt_worker(wav_path, stt_engine, llm_queue, stt_metrics, debounce_sec=0.3):
     llm_queue.put(None) # Signal EOF to LLM
 
 def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
+    generating = False
+    next_msg = None  # Pre-fetched message from mid-stream interruption
+
     while True:
-        msg = llm_queue.get()
+        # Use pre-fetched message if available, otherwise block for next
+        if next_msg is not None:
+            msg = next_msg
+            next_msg = None
+        else:
+            msg = llm_queue.get()
+
         if msg is None:
-            tts_queue.put(None) # Signal EOF to TTS
+            tts_queue.put(None)  # Signal EOF to TTS
             break
-        
-        # Drain older messages from queue if newer partials or final text piled up
-        while not llm_queue.empty():
+
+        # Drain older messages: keep only the newest non-EOF message
+        while True:
             try:
-                peek_item = llm_queue.queue[0]
-                if peek_item is None:
-                    break
-                msg = llm_queue.get_nowait()
-            except (queue.Empty, IndexError, AttributeError):
+                drain_msg = llm_queue.get_nowait()
+            except queue.Empty:
                 break
+            if drain_msg is None:
+                # Put the EOF sentinel back so it is processed on the next iteration
+                llm_queue.put(None)
+                break
+            msg = drain_msg
 
         if isinstance(msg, str):
             msg = {"type": "final", "text": msg}
@@ -225,12 +238,14 @@ def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
         if msg_type == "cancel":
             llm_engine.cancel()
             tts_queue.put({"type": "cancel"})
+            generating = False
             continue
 
         if msg_type in ("partial", "final"):
-            # If starting a new partial/final prompt, cancel any prior LLM stream and reset metrics
-            llm_engine.cancel()
-            tts_queue.put({"type": "cancel"})
+            # Cancel any prior active LLM stream before starting a new one
+            if generating:
+                llm_engine.cancel()
+                tts_queue.put({"type": "cancel"})
             llm_metrics["full_assistant_text"] = ""
             llm_metrics["llm_chunk_count"] = 0
             llm_metrics["llm_ttfc_ms"] = None
@@ -238,7 +253,8 @@ def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
         text_chunk = msg.get("text", "")
         if not text_chunk:
             continue
-        
+
+        generating = True
         llm_t0 = time.perf_counter()
         for chunk_data in llm_engine.generate_stream(text_chunk):
             if chunk_data.get("cancelled"):
@@ -246,21 +262,27 @@ def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
                 tts_queue.put({"type": "cancel"})
                 break
 
-            # If a newer text message (not EOF) arrived in queue while generating, cancel immediately
-            if not llm_queue.empty():
-                try:
-                    peek = llm_queue.queue[0]
-                    if peek is not None:
-                        print("[LLM] Newer STT message arrived in queue, cancelling active stream")
-                        llm_engine.cancel()
-                        tts_queue.put({"type": "cancel"})
-                        break
-                except (IndexError, AttributeError):
-                    pass
+            # Check if a newer STT message arrived while generating
+            try:
+                pending = llm_queue.get_nowait()
+                if pending is None:
+                    # EOF sentinel — re-queue so the outer loop sees it after
+                    # the current generation finishes naturally
+                    llm_queue.put(None)
+                else:
+                    # A non-EOF message arrived — cancel and hand it directly
+                    # to the outer loop via next_msg (avoids re-queue ordering issues)
+                    print("[LLM] Newer STT message arrived, cancelling active stream")
+                    llm_engine.cancel()
+                    tts_queue.put({"type": "cancel"})
+                    next_msg = pending
+                    break
+            except queue.Empty:
+                pass
 
             text = chunk_data.get("text", "")
             stats = chunk_data.get("ollama_stats")
-            
+
             if stats:
                 llm_metrics["ollama_stats"] = stats
 
@@ -271,6 +293,8 @@ def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
                 llm_metrics["llm_chunk_count"] += 1
                 print(f"[LLM Chunk] {text}")
                 tts_queue.put({"type": "text", "text": text})
+
+        generating = False
 
 def tts_worker(tts_engine, tts_queue, out_wav, e2e_t0, tts_metrics):
     while True:
@@ -294,23 +318,25 @@ def tts_worker(tts_engine, tts_queue, out_wav, e2e_t0, tts_metrics):
                         break
                     elif msg_type == "text":
                         yield item.get("text", "")
-        
+
         final_wav = None
         for pcm_bytes, sample_rate in tts_engine.synthesize_stream(text_generator()):
-            tts_t1 = time.perf_counter() # Measure time when chunk is ready
-            
+            tts_t1 = time.perf_counter()
+
             if tts_metrics["tts_t1"] is None:
                 tts_metrics["tts_t1"] = tts_t1
-                    
+
             if final_wav is None:
                 final_wav = wave.open(out_wav, "wb")
                 final_wav.setnchannels(1)
                 final_wav.setsampwidth(2)
                 final_wav.setframerate(sample_rate)
             final_wav.writeframes(pcm_bytes)
-            
-        if final_wav:
+
+        # Close any open WAV handle before deciding what to do next
+        if final_wav is not None:
             final_wav.close()
+            final_wav = None
 
         if is_cancelled:
             if os.path.exists(out_wav):
@@ -487,7 +513,7 @@ def main():
             llm_queue = queue.Queue()
             tts_queue = queue.Queue()
             
-            stt_metrics = {"stt_ms": None, "stt_end_t": None, "full_user_text": ""}
+            stt_metrics = {"stt_ms": None, "stt_first_final_t": None, "stt_end_t": None, "full_user_text": ""}
             llm_metrics = {"llm_ttfc_ms": None, "ollama_stats": None, "full_assistant_text": "", "llm_chunk_count": 0}
             tts_metrics = {"tts_t1": None, "total_tts_time": 0.0}
 
@@ -514,8 +540,8 @@ def main():
             if llm_metrics["llm_ttfc_ms"]:
                 write_timing(writer, args, item_name, "llm_ttfc", llm_metrics["llm_ttfc_ms"])
             
-            if tts_metrics.get("tts_t1") and stt_metrics.get("stt_end_t"):
-                ttfa_ms = int((tts_metrics["tts_t1"] - stt_metrics["stt_end_t"]) * 1000)
+            if tts_metrics.get("tts_t1") and stt_metrics.get("stt_first_final_t"):
+                ttfa_ms = int((tts_metrics["tts_t1"] - stt_metrics["stt_first_final_t"]) * 1000)
                 write_timing(writer, args, item_name, "ttfa", ttfa_ms)
             
             ollama_stats = llm_metrics.get("ollama_stats")
