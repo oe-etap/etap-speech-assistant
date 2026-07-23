@@ -5,7 +5,7 @@ audio:
   - "./audios"
 
 mode: cpu
-stt-engine: whisper
+stt-engine: vosk
 tts-engine: piper
 
 out-dir: outputs
