@@ -155,6 +155,8 @@ def write_timing(writer, args, item, stage, duration_ms, extra=None):
         "gpu_name": stats["gpu_name"],
         "extra_json": json.dumps(extra or {}, ensure_ascii=True),
     })
+    if hasattr(writer, "stream"):
+        writer.stream.flush()
 
 def chunked_audio_reader(wav_path, chunk_size=4000):
     with wave.open(wav_path, "rb") as wf:
@@ -165,18 +167,37 @@ def chunked_audio_reader(wav_path, chunk_size=4000):
             yield data
 
 # ---------- Pipeline Workers ----------
-def stt_worker(wav_path, stt_engine, llm_queue, stt_metrics):
+def stt_worker(wav_path, stt_engine, llm_queue, stt_metrics, debounce_sec=0.3):
     t0 = time.perf_counter()
     audio_iter = chunked_audio_reader(wav_path)
+    last_partial_text = ""
+    last_partial_time = 0.0
+
     for result in stt_engine.transcribe_stream(audio_iter):
-        if result["is_final"] and result["text"]:
-            t1 = time.perf_counter()
+        t_now = time.perf_counter()
+        text = result.get("text", "").strip()
+        if not text:
+            continue
+
+        if not result.get("is_final", True):
+            # Partial STT output
+            word_count = len(text.split())
+            if word_count >= 3 and text != last_partial_text:
+                if (t_now - last_partial_time) >= debounce_sec:
+                    last_partial_text = text
+                    last_partial_time = t_now
+                    print(f"[STT Partial] {text}")
+                    llm_queue.put({"type": "partial", "text": text})
+        else:
+            # Final STT output (speech pause / VAD boundary)
             if stt_metrics["stt_ms"] is None:
-                stt_metrics["stt_ms"] = int((t1 - t0) * 1000)
-            stt_metrics["stt_end_t"] = t1
-            stt_metrics["full_user_text"] += result["text"] + " "
-            print(f"[STT] {result['text']}")
-            llm_queue.put({"type": "final", "text": result["text"]})
+                stt_metrics["stt_ms"] = int((t_now - t0) * 1000)
+            stt_metrics["stt_end_t"] = t_now
+            stt_metrics["full_user_text"] += text + " "
+            print(f"[STT Final] {text}")
+            last_partial_text = ""
+            llm_queue.put({"type": "final", "text": text})
+
     llm_queue.put(None) # Signal EOF to LLM
 
 def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
@@ -186,6 +207,16 @@ def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
             tts_queue.put(None) # Signal EOF to TTS
             break
         
+        # Drain older messages from queue if newer partials or final text piled up
+        while not llm_queue.empty():
+            try:
+                peek_item = llm_queue.queue[0]
+                if peek_item is None:
+                    break
+                msg = llm_queue.get_nowait()
+            except (queue.Empty, IndexError, AttributeError):
+                break
+
         if isinstance(msg, str):
             msg = {"type": "final", "text": msg}
 
@@ -195,6 +226,14 @@ def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
             llm_engine.cancel()
             tts_queue.put({"type": "cancel"})
             continue
+
+        if msg_type in ("partial", "final"):
+            # If starting a new partial/final prompt, cancel any prior LLM stream and reset metrics
+            llm_engine.cancel()
+            tts_queue.put({"type": "cancel"})
+            llm_metrics["full_assistant_text"] = ""
+            llm_metrics["llm_chunk_count"] = 0
+            llm_metrics["llm_ttfc_ms"] = None
 
         text_chunk = msg.get("text", "")
         if not text_chunk:
@@ -206,6 +245,18 @@ def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
                 print("[LLM] Generation cancelled mid-stream")
                 tts_queue.put({"type": "cancel"})
                 break
+
+            # If a newer text message (not EOF) arrived in queue while generating, cancel immediately
+            if not llm_queue.empty():
+                try:
+                    peek = llm_queue.queue[0]
+                    if peek is not None:
+                        print("[LLM] Newer STT message arrived in queue, cancelling active stream")
+                        llm_engine.cancel()
+                        tts_queue.put({"type": "cancel"})
+                        break
+                except (IndexError, AttributeError):
+                    pass
 
             text = chunk_data.get("text", "")
             stats = chunk_data.get("ollama_stats")
@@ -222,37 +273,56 @@ def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
                 tts_queue.put({"type": "text", "text": text})
 
 def tts_worker(tts_engine, tts_queue, out_wav, e2e_t0, tts_metrics):
-    def text_generator():
-        while True:
-            item = tts_queue.get()
-            if item is None:
-                break
-            if isinstance(item, str):
-                yield item
-            elif isinstance(item, dict):
-                msg_type = item.get("type", "text")
-                if msg_type == "cancel":
-                    print("[TTS] Cancel signal received, resetting TTS generator")
+    while True:
+        is_eof = False
+        is_cancelled = False
+
+        def text_generator():
+            nonlocal is_eof, is_cancelled
+            while True:
+                item = tts_queue.get()
+                if item is None:
+                    is_eof = True
                     break
-                elif msg_type == "text":
-                    yield item.get("text", "")
-    
-    final_wav = None
-    for pcm_bytes, sample_rate in tts_engine.synthesize_stream(text_generator()):
-        tts_t1 = time.perf_counter() # Measure time when chunk is ready
+                if isinstance(item, str):
+                    yield item
+                elif isinstance(item, dict):
+                    msg_type = item.get("type", "text")
+                    if msg_type == "cancel":
+                        print("[TTS] Cancel signal received, resetting TTS generator")
+                        is_cancelled = True
+                        break
+                    elif msg_type == "text":
+                        yield item.get("text", "")
         
-        if tts_metrics["tts_t1"] is None:
-            tts_metrics["tts_t1"] = tts_t1
-                
-        if final_wav is None:
-            final_wav = wave.open(out_wav, "wb")
-            final_wav.setnchannels(1)
-            final_wav.setsampwidth(2)
-            final_wav.setframerate(sample_rate)
-        final_wav.writeframes(pcm_bytes)
-        
-    if final_wav:
-        final_wav.close()
+        final_wav = None
+        for pcm_bytes, sample_rate in tts_engine.synthesize_stream(text_generator()):
+            tts_t1 = time.perf_counter() # Measure time when chunk is ready
+            
+            if tts_metrics["tts_t1"] is None:
+                tts_metrics["tts_t1"] = tts_t1
+                    
+            if final_wav is None:
+                final_wav = wave.open(out_wav, "wb")
+                final_wav.setnchannels(1)
+                final_wav.setsampwidth(2)
+                final_wav.setframerate(sample_rate)
+            final_wav.writeframes(pcm_bytes)
+            
+        if final_wav:
+            final_wav.close()
+
+        if is_cancelled:
+            if os.path.exists(out_wav):
+                try:
+                    os.remove(out_wav)
+                except Exception:
+                    pass
+            tts_metrics["tts_t1"] = None
+            continue
+
+        if is_eof:
+            break
 
 # ---------- Main ----------
 def main():
@@ -274,6 +344,7 @@ def main():
     parser.add_argument("--whisper-model", default="small", help="faster-whisper model name")
     parser.add_argument("--whisper-device", choices=["cpu", "cuda"], default=None, help="Device for faster-whisper")
     parser.add_argument("--whisper-compute-type", default=None, help="Compute type (int8, float16, etc.)")
+    parser.add_argument("--stt-debounce-sec", type=float, default=0.5, help="Debounce interval in seconds for partial STT streaming")
 
     # TTS options
     parser.add_argument("--piper-exe", default="./piper/piper.exe", help="Path to Piper executable (piper or piper.exe)")
@@ -421,7 +492,7 @@ def main():
             tts_metrics = {"tts_t1": None, "total_tts_time": 0.0}
 
             # Start threads
-            t_stt = threading.Thread(target=stt_worker, args=(wav_path, stt_engine, llm_queue, stt_metrics))
+            t_stt = threading.Thread(target=stt_worker, args=(wav_path, stt_engine, llm_queue, stt_metrics, args.stt_debounce_sec))
             t_llm = threading.Thread(target=llm_worker, args=(llm_engine, llm_queue, tts_queue, llm_metrics))
             t_tts = threading.Thread(target=tts_worker, args=(tts_engine, tts_queue, out_wav, e2e_t0, tts_metrics))
             

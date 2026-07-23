@@ -37,7 +37,8 @@ class OllamaEngine:
         """
         system_prompt = (
             "You are a concise, factual but friendly voice assistant. "
-            "Answer in English in 1-3 medium length sentences."
+            "Answer in English in 1-3 medium length sentences. "
+            "Do not roleplay as the user or generate fake user replies."
         )
         
         r = None
@@ -49,7 +50,8 @@ class OllamaEngine:
                 "stream": True, 
                 "options": {
                     "num_predict": 150,
-                    "temperature": 0.7
+                    "temperature": 0.7,
+                    "stop": ["\nUser:", "\nHuman:", "\n---", "---", "<|end|>", "<|user|>"]
                 }
             }, timeout=120)
             self._current_response = r
