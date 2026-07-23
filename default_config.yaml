@@ -5,7 +5,7 @@ audio:
   - "./audios"
 
 mode: cpu
-stt-engine: whisper
+stt-engine: vosk
 tts-engine: piper
 
 out-dir: outputs
@@ -16,6 +16,7 @@ vosk-model: "./vosk/vosk-model-small-en-us-0.15"
 whisper-model: "small"
 whisper-device: "cpu"
 whisper-compute-type: "int8"
+stt-debounce-sec: 1.0
 
 # TTS Options
 piper-exe: "./piper/piper.exe"
