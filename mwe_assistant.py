@@ -14,6 +14,8 @@ CPU/RAM/GPU snapshots.
 
 import argparse
 import csv
+import queue
+import threading
 import yaml
 import json
 import os
@@ -155,6 +157,133 @@ def write_timing(writer, args, item, stage, duration_ms, extra=None):
         "gpu_name": stats["gpu_name"],
         "extra_json": json.dumps(extra or {}, ensure_ascii=True),
     })
+
+
+# ---------- Pipeline Workers ----------
+def stt_worker(stt_engine, wav_path, llm_queue, stt_metrics):
+    """Feed audio to STT engine and put final text into llm_queue.
+
+    Uses transcribe_stream() to process audio incrementally. Only final
+    results are forwarded to the LLM queue. Partial results are collected
+    but not sent (future enhancement for partial→LLM streaming).
+    """
+    try:
+        t0 = time.perf_counter()
+        final_texts = []
+        for result in stt_engine.transcribe_stream(wav_path):
+            if result["is_final"] and result["text"]:
+                final_texts.append(result["text"])
+        t1 = time.perf_counter()
+
+        user_text = " ".join(final_texts).strip()
+        stt_metrics["stt_ms"] = int((t1 - t0) * 1000)
+        stt_metrics["user_text"] = user_text
+
+        print(f"[STT] {user_text!r}")
+
+        if user_text:
+            llm_queue.put({"type": "final", "text": user_text})
+    except Exception as e:
+        print(f"[STT] Error: {e}")
+        stt_metrics["error"] = str(e)
+    finally:
+        llm_queue.put(None)  # EOF signal
+
+
+def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
+    """Read text from llm_queue, generate LLM response, send chunks to tts_queue.
+
+    Processes one message at a time. When the final text arrives, generates
+    the full response and streams sentence-level chunks to the TTS queue.
+    EOF (None) is propagated from llm_queue to tts_queue.
+    """
+    try:
+        while True:
+            msg = llm_queue.get()
+            if msg is None:
+                break
+
+            text = msg.get("text", "")
+            if not text:
+                continue
+
+            print("[LLM] Starting stream...")
+            llm_t0 = time.perf_counter()
+            llm_metrics["llm_t0"] = llm_t0
+
+            for chunk_data in llm_engine.generate_stream(text):
+                chunk = chunk_data.get("text", "")
+
+                if chunk_data.get("ollama_stats"):
+                    llm_metrics["ollama_stats"] = chunk_data["ollama_stats"]
+
+                if chunk_data.get("cancelled"):
+                    print("[LLM] Generation was cancelled")
+                    break
+
+                if not chunk:
+                    continue
+
+                llm_metrics["llm_chunk_count"] += 1
+
+                if llm_metrics["llm_ttfc_ms"] is None:
+                    llm_metrics["llm_ttfc_ms"] = int(
+                        (time.perf_counter() - llm_t0) * 1000
+                    )
+
+                print(f"[LLM Chunk {llm_metrics['llm_chunk_count']}] {chunk}")
+                llm_metrics["full_assistant_text"] += chunk + " "
+
+                tts_queue.put({"type": "text", "text": chunk})
+    except Exception as e:
+        print(f"[LLM] Error: {e}")
+        llm_metrics["error"] = str(e)
+    finally:
+        tts_queue.put(None)  # EOF signal
+
+
+def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics):
+    """Read text chunks from tts_queue and synthesize to WAV file.
+
+    Each chunk is synthesized independently and appended to a single
+    output WAV file. The WAV file is opened on the first chunk and
+    closed when EOF (None) is received.
+    """
+    wav_file = None
+    try:
+        while True:
+            msg = tts_queue.get()
+            if msg is None:
+                break
+
+            text = msg.get("text", "")
+            if not text:
+                continue
+
+            tts_t0 = time.perf_counter()
+            pcm_bytes, sample_rate = tts_engine.synthesize(text)
+            tts_t1 = time.perf_counter()
+            tts_metrics["total_tts_time"] += (tts_t1 - tts_t0)
+
+            if tts_metrics["tts_first_chunk_ms"] is None:
+                tts_metrics["tts_first_chunk_ms"] = int(
+                    (tts_t1 - tts_t0) * 1000
+                )
+                tts_metrics["tts_first_chunk_t"] = tts_t1
+
+            if wav_file is None:
+                wav_file = wave.open(out_wav, "wb")
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)  # 16-bit
+                wav_file.setframerate(sample_rate)
+
+            wav_file.writeframes(pcm_bytes)
+    except Exception as e:
+        print(f"[TTS] Error: {e}")
+        tts_metrics["error"] = str(e)
+    finally:
+        if wav_file:
+            wav_file.close()
 
 
 # ---------- Main ----------
@@ -326,92 +455,86 @@ def main():
 
             wav_path = ensure_wav_mono_16k(audio_path, out_dir=run_dir, prefix=f"input_{item_index}")
             input_duration_ms = wav_duration_ms(wav_path)
+            out_wav = os.path.join(run_dir, f"assistant_{item_index}_{item_name}.wav")
+
+            # Shared metrics dicts (single-writer per dict = thread-safe)
+            stt_metrics = {"stt_ms": None, "user_text": None}
+            llm_metrics = {
+                "llm_t0": None, "llm_ttfc_ms": None,
+                "full_assistant_text": "", "llm_chunk_count": 0,
+                "ollama_stats": None,
+            }
+            tts_metrics = {
+                "tts_first_chunk_ms": None, "tts_first_chunk_t": None,
+                "total_tts_time": 0.0,
+            }
+
+            # Create inter-thread queues
+            llm_queue = queue.Queue()
+            tts_queue = queue.Queue()
 
             e2e_t0 = time.perf_counter()
 
-            # -------- STT --------
-            t0 = time.perf_counter()
-            user_text = stt_engine.transcribe(wav_path)
-            t1 = time.perf_counter()
-            stt_ms = int((t1 - t0) * 1000)
+            # Start worker threads
+            stt_t = threading.Thread(
+                target=stt_worker,
+                args=(stt_engine, wav_path, llm_queue, stt_metrics),
+                daemon=True,
+            )
+            llm_t = threading.Thread(
+                target=llm_worker,
+                args=(llm_engine, llm_queue, tts_queue, llm_metrics),
+                daemon=True,
+            )
+            tts_t = threading.Thread(
+                target=tts_worker,
+                args=(tts_engine, tts_queue, out_wav, tts_metrics),
+                daemon=True,
+            )
+
+            stt_t.start()
+            llm_t.start()
+            tts_t.start()
+
+            # Wait for all threads to complete
+            stt_t.join()
+            llm_t.join()
+            tts_t.join()
+
+            # -------- Collect metrics and write to CSV --------
+            user_text = stt_metrics.get("user_text") or ""
+            stt_ms = stt_metrics.get("stt_ms") or 0
+
             stt_rtf = round(stt_ms / input_duration_ms, 3) if input_duration_ms > 0 else 0.0
             write_timing(writer, args, item_name, "stt", stt_ms,
                          {"input_duration_ms": input_duration_ms, "stt_rtf": stt_rtf})
-            print(f"[STT] {user_text!r}")
 
             if not user_text:
                 print("[Warn] No text recognized. Skipping to next file.")
                 write_timing(writer, args, item_name, "e2e_response_ready",
                              int((time.perf_counter() - e2e_t0) * 1000),
                              {"input_duration_ms": input_duration_ms, "skipped": True})
+                fcsv.flush()
                 continue
 
-            # -------- LLM & TTS Streaming --------
-            print("[LLM] Starting stream...")
-            out_wav = os.path.join(run_dir, f"assistant_{item_index}_{item_name}.wav")
-            first_chunk_ts = None
-            final_wav = None
-            llm_t0 = time.perf_counter()
+            # LLM TTFC
+            llm_ttfc_ms = llm_metrics.get("llm_ttfc_ms")
+            if llm_ttfc_ms is not None:
+                write_timing(writer, args, item_name, "llm_ttfc", llm_ttfc_ms)
 
-            total_tts_time = 0.0
-            tts_first_chunk_ms = None
-            llm_ttfc_ms = None
-            full_reply = ""
-            ollama_stats = None
-            chunk_count = 0
+            # TTS first chunk
+            tts_first_chunk_ms = tts_metrics.get("tts_first_chunk_ms")
+            if tts_first_chunk_ms is not None:
+                write_timing(writer, args, item_name, "tts_first_chunk", tts_first_chunk_ms)
 
-            for chunk_data in llm_engine.generate_stream(user_text):
-                chunk = chunk_data.get("text", "")
-
-                if chunk_data.get("ollama_stats"):
-                    ollama_stats = chunk_data["ollama_stats"]
-
-                if chunk_data.get("cancelled"):
-                    print("[LLM] Generation was cancelled")
-                    break
-
-                if not chunk:
-                    continue
-                chunk_count += 1
-
-                # LLM Time to First (synthesizable) Chunk
-                if first_chunk_ts is None:
-                    first_chunk_ts = time.perf_counter()
-                    llm_ttfc_ms = int((first_chunk_ts - llm_t0) * 1000)
-                    write_timing(writer, args, item_name, "llm_ttfc", llm_ttfc_ms)
-
-                print(f"[LLM Chunk {chunk_count}] {chunk}")
-                full_reply += chunk + " "
-
-                tts_t0 = time.perf_counter()
-                pcm_bytes, sample_rate = tts_engine.synthesize(chunk)
-                tts_t1 = time.perf_counter()
-                chunk_tts_ms = int((tts_t1 - tts_t0) * 1000)
-                total_tts_time += (tts_t1 - tts_t0)
-
-                # Track TTS first chunk time separately
-                if tts_first_chunk_ms is None:
-                    tts_first_chunk_ms = chunk_tts_ms
-                    write_timing(writer, args, item_name, "tts_first_chunk", tts_first_chunk_ms)
-
-                # Write directly to an open WAV file (true streaming)
-                if final_wav is None:
-                    final_wav = wave.open(out_wav, "wb")
-                    final_wav.setnchannels(1)
-                    final_wav.setsampwidth(2)  # 16-bit
-                    final_wav.setframerate(sample_rate)
-
-                final_wav.writeframes(pcm_bytes)
-
-            if final_wav:
-                final_wav.close()
-
-            # TTFA (Time to First Audio) = STT + LLM TTFC + TTS first chunk
-            if llm_ttfc_ms is not None and tts_first_chunk_ms is not None:
-                ttfa_ms = stt_ms + llm_ttfc_ms + tts_first_chunk_ms
+            # TTFA (wall-clock time from start to first audio ready)
+            tts_first_t = tts_metrics.get("tts_first_chunk_t")
+            if tts_first_t is not None:
+                ttfa_ms = int((tts_first_t - e2e_t0) * 1000)
                 write_timing(writer, args, item_name, "ttfa", ttfa_ms)
 
             # LLM server-side evaluation metrics (ground truth from Ollama)
+            ollama_stats = llm_metrics.get("ollama_stats")
             if ollama_stats:
                 eval_dur_ns = ollama_stats.get("eval_duration_ns", 0)
                 eval_count = ollama_stats.get("eval_count", 0)
@@ -425,26 +548,31 @@ def main():
                 })
 
             # Log total TTS time
-            write_timing(writer, args, item_name, "tts_total", int(total_tts_time * 1000))
+            write_timing(writer, args, item_name, "tts_total",
+                         int(tts_metrics["total_tts_time"] * 1000))
 
-            # Output audio duration
+            # Output audio duration and E2E summary
             output_duration_ms = wav_duration_ms(out_wav) if os.path.exists(out_wav) else 0
+            full_reply = llm_metrics["full_assistant_text"].strip()
 
             write_timing(writer, args, item_name, "e2e_response_ready",
                          int((time.perf_counter() - e2e_t0) * 1000),
                          {"input_duration_ms": input_duration_ms,
                           "output_duration_ms": output_duration_ms,
                           "output_wav": out_wav,
-                          "full_text": full_reply.strip(),
-                          "response_word_count": len(full_reply.split()),
-                          "response_char_count": len(full_reply.strip()),
-                          "llm_chunk_count": chunk_count})
+                          "full_text": full_reply,
+                          "response_word_count": len(full_reply.split()) if full_reply else 0,
+                          "response_char_count": len(full_reply),
+                          "llm_chunk_count": llm_metrics["llm_chunk_count"]})
             print(f"[TTS] Stream finished. Saved to {out_wav}.")
+
+            # Flush CSV after each item to prevent data loss
+            fcsv.flush()
 
             # --- Transcript Logging ---
             transcript_record = {
                 "stt_text": user_text,
-                "llm_text": full_reply.strip()
+                "llm_text": full_reply,
             }
 
             # JSONL Logging
