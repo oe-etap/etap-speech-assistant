@@ -12,6 +12,7 @@ out-dir: outputs
 keep-normalized: false
 
 # STT Options
+stt-debounce-sec: 3.0  # seconds a partial must be stable before LLM gets it (0 = finals only)
 vosk-model: "./vosk/vosk-model-small-en-us-0.15"
 whisper-model: "small"
 whisper-device: "cpu"
