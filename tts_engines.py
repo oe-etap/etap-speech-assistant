@@ -11,6 +11,19 @@ import os
 import subprocess
 
 import numpy as np
+try:
+    from piper.voice import PiperVoice
+    _HAS_PIPER_API = True
+except ImportError:
+    PiperVoice = None
+    _HAS_PIPER_API = False
+
+try:
+    from TTS.api import TTS
+    _HAS_TTS = True
+except ImportError:
+    TTS = None
+    _HAS_TTS = False
 
 
 class BaseTTSEngine(ABC):
@@ -58,14 +71,16 @@ class PiperEngine(BaseTTSEngine):
         self._sample_rate_val = self._read_sample_rate_from_config()
 
         if not use_exe:
+            if not _HAS_PIPER_API:
+                raise RuntimeError(
+                    "Piper Python API (piper-tts) is not installed, but use_exe is False. "
+                    "Please install it or set piper-use-exe to True in your config."
+                )
             try:
-                from piper.voice import PiperVoice
                 self._piper_voice = PiperVoice.load(voice_path)
                 print(f"[INFO] Piper Python API loaded (model: {voice_path})")
             except Exception as e:
-                print(f"[WARN] Piper Python API failed ({e}), "
-                      f"falling back to CLI executable")
-                self._use_exe = True
+                raise RuntimeError(f"Failed to load Piper Python API model: {e}")
 
     def _read_sample_rate_from_config(self) -> int:
         """Read sample rate from the Piper voice JSON sidecar file.
@@ -121,7 +136,12 @@ class CoquiEngine(BaseTTSEngine):
 
     def __init__(self, model_name: str = "xtts_v2", language: str = "en",
                  speaker: str = "Daisy Studious"):
-        from TTS.api import TTS
+        if not _HAS_TTS:
+            raise RuntimeError(
+                "Coqui TTS is not installed. Please install it (usually with GPU requirements) "
+                "to use the CoquiEngine."
+            )
+        
         self._tts = TTS(
             model_name=f"tts_models/multilingual/multi-dataset/{model_name}"
         )

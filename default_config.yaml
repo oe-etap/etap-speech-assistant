@@ -10,9 +10,11 @@ tts-engine: piper
 
 out-dir: outputs
 keep-normalized: false
+input-mode: file  # 'file' or 'mic'
+playback: false   # Play TTS output on speakers
+idle-timeout: 10.0 # Shutdown after N seconds of silence
 
 # STT Options
-stt-debounce-sec: 3.0  # seconds a partial must be stable before LLM gets it (0 = finals only)
 vosk-model: "./vosk/vosk-model-small-en-us-0.15"
 whisper-model: "small"
 whisper-device: "cpu"

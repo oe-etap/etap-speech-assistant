@@ -23,10 +23,17 @@ import shutil
 import subprocess
 import time
 import wave
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import soundfile as sf
+try:
+    import sounddevice as sd
+    _HAS_SD = True
+except ImportError:
+    sd = None
+    _HAS_SD = False
 
 from stt_engines import VoskEngine, WhisperEngine
 from llm_engine import OllamaEngine
@@ -160,56 +167,30 @@ def write_timing(writer, args, item, stage, duration_ms, extra=None):
 
 
 # ---------- Pipeline Workers ----------
-def stt_worker(stt_engine, wav_path, llm_queue, stt_metrics, debounce_sec=0.0):
+def stt_worker(stt_engine, wav_path, llm_queue, stt_metrics, input_mode="file"):
     """Feed audio to STT engine and stream results to llm_queue.
 
-    Uses transcribe_stream() to process audio incrementally.
-    - Final results are forwarded immediately.
-    - Partial results are forwarded only after they remain stable for
-      ``debounce_sec`` seconds (set to 0 to disable partial forwarding).
-
-    Each message placed on llm_queue is a dict:
-        {"type": "partial"|"final", "text": accumulated_text}
-    where ``text`` is always the FULL accumulated transcription so far
-    (previously finalized segments + current partial/final).
+    - In 'mic' mode: Every finalized utterance triggers the LLM (barge-in).
+    - In 'file' mode: The LLM is only triggered once at the very end of the file.
     """
     try:
         t0 = time.perf_counter()
         accumulated_final = ""
-        last_partial_text = ""
-        last_partial_change_t = 0.0
-        debounce_sent = False
 
         for result in stt_engine.transcribe_stream(wav_path):
-            now = time.perf_counter()
-
             if result["is_final"] and result["text"]:
-                # Final result: always send immediately
                 accumulated_final = (
                     accumulated_final + " " + result["text"]
                 ).strip()
-                llm_queue.put({"type": "final", "text": accumulated_final})
-                last_partial_text = ""
-                debounce_sent = False
+                
+                stt_metrics["last_speech_t"] = time.perf_counter()
+                stt_metrics["user_text"] = accumulated_final
+                
+                if input_mode == "mic":
+                    llm_queue.put({"type": "final", "text": accumulated_final})
 
-            elif not result["is_final"] and result["text"] and debounce_sec > 0:
-                # Partial result: debounce before forwarding
-                current_partial = (
-                    accumulated_final + " " + result["text"]
-                ).strip()
-
-                if current_partial != last_partial_text:
-                    # Text changed – reset debounce timer
-                    last_partial_text = current_partial
-                    last_partial_change_t = now
-                    debounce_sent = False
-                elif (
-                    not debounce_sent
-                    and (now - last_partial_change_t) >= debounce_sec
-                ):
-                    # Stable for debounce_sec – forward to LLM
-                    llm_queue.put({"type": "partial", "text": current_partial})
-                    debounce_sent = True
+        if input_mode == "file" and accumulated_final:
+            llm_queue.put({"type": "final", "text": accumulated_final})
 
         t1 = time.perf_counter()
         stt_metrics["stt_ms"] = int((t1 - t0) * 1000)
@@ -240,7 +221,10 @@ def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
     """
     try:
         while True:
+            llm_metrics["is_busy"] = False
             msg = llm_queue.get()
+            llm_metrics["is_busy"] = True
+            
             if msg is None:
                 break
 
@@ -317,7 +301,7 @@ def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
         tts_queue.put(None)  # EOF signal
 
 
-def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics):
+def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics, playback=False):
     """Read text chunks from tts_queue and synthesize to WAV file.
 
     Handles cancel signals: when {"type": "cancel"} is received, the
@@ -326,9 +310,23 @@ def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics):
     restarted LLM generation.
     """
     wav_file = None
+    stream = None
     try:
+        if playback:
+            if not _HAS_SD:
+                raise ImportError("sounddevice module is required for playback")
+            stream = sd.RawOutputStream(
+                samplerate=tts_engine.sample_rate, 
+                channels=1, 
+                dtype='int16'
+            )
+            stream.start()
+
         while True:
+            tts_metrics["is_busy"] = False
             msg = tts_queue.get()
+            tts_metrics["is_busy"] = True
+            
             if msg is None:
                 break
 
@@ -344,6 +342,12 @@ def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics):
                         os.remove(out_wav)
                     except OSError:
                         pass
+                
+                # Clear audio stream buffer if playing
+                if stream:
+                    stream.stop()
+                    stream.start()
+                    
                 # Reset metrics so they reflect only the final response
                 tts_metrics["tts_first_chunk_ms"] = None
                 tts_metrics["tts_first_chunk_t"] = None
@@ -372,12 +376,24 @@ def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics):
                 wav_file.setframerate(sample_rate)
 
             wav_file.writeframes(pcm_bytes)
+            
+            if stream:
+                stream.write(pcm_bytes)
+                
+            tts_metrics["last_play_t"] = time.perf_counter()
+                
     except Exception as e:
         print(f"[TTS] Error: {e}")
         tts_metrics["error"] = str(e)
     finally:
         if wav_file:
             wav_file.close()
+        if stream:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
 
 
 # ---------- Main ----------
@@ -392,9 +408,9 @@ def main():
     parser.add_argument("--out-dir", type=str, default="outputs", help="Where to save the audiofiles")
     parser.add_argument("--latency-csv", type=str, default=None, help="CSV file to append latency/resource logs")
     parser.add_argument("--keep-normalized", action="store_true", help="Keep ffmpeg-normalized input WAVs")
-    parser.add_argument("--stt-debounce-sec", type=float, default=0.0,
-                        help="Seconds a partial STT result must stay stable before being "
-                             "forwarded to the LLM (0 = disable partial forwarding)")
+    parser.add_argument("--input-mode", choices=["file", "mic"], default="file", help="Input mode: file or live mic")
+    parser.add_argument("--playback", action="store_true", help="Play TTS output on speakers")
+    parser.add_argument("--idle-timeout", type=float, default=10.0, help="Seconds of silence before exiting mic mode")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -429,30 +445,33 @@ def main():
 
     args = parser.parse_args()
 
-    if not args.audio:
-        parser.error("the following arguments are required: --audio (either in CLI or config)")
+    if args.input_mode == "mic":
+        args.audio = ["mic"]
+    else:
+        if not args.audio:
+            parser.error("--audio is required when --input-mode is 'file' (either in CLI or config)")
 
-    expanded_audio = []
-    valid_extensions = {
-        ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".m4b", ".aac", ".wma",
-        ".amr", ".aiff", ".opus", ".webm", ".mp4", ".mkv", ".avi", ".mov"
-    }
-    for p in args.audio:
-        path_obj = Path(p)
-        if not path_obj.exists():
-            print(f"[WARN] Input path does not exist: {p}")
-            continue
-        if path_obj.is_dir():
-            for child in path_obj.iterdir():
-                if child.is_file() and child.suffix.lower() in valid_extensions:
-                    expanded_audio.append(str(child))
-        else:
-            expanded_audio.append(str(path_obj))
+        expanded_audio = []
+        valid_extensions = {
+            ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".m4b", ".aac", ".wma",
+            ".amr", ".aiff", ".opus", ".webm", ".mp4", ".mkv", ".avi", ".mov"
+        }
+        for p in args.audio:
+            path_obj = Path(p)
+            if not path_obj.exists():
+                print(f"[WARN] Input path does not exist: {p}")
+                continue
+            if path_obj.is_dir():
+                for child in path_obj.iterdir():
+                    if child.is_file() and child.suffix.lower() in valid_extensions:
+                        expanded_audio.append(str(child))
+            else:
+                expanded_audio.append(str(path_obj))
 
-    if not expanded_audio:
-        parser.error("No valid audio files found in the provided --audio paths.")
+        if not expanded_audio:
+            parser.error("No valid audio files found in the provided --audio paths.")
 
-    args.audio = sorted(expanded_audio)
+        args.audio = sorted(expanded_audio)
 
     if args.whisper_device is None:
         args.whisper_device = "cuda" if args.mode == "gpu" else "cpu"
@@ -536,22 +555,31 @@ def main():
 
         for item_index, audio_path in enumerate(args.audio, start=1):
             print("=" * 60)
-            audio_file = Path(audio_path)
-            if not audio_file.exists():
-                raise FileNotFoundError(audio_path)
-
-            item_name = audio_file.stem
-            print(f"[INFO] Processing audio file: {audio_file}")
-
-            user_wav = os.path.join(run_dir, f"user_input_{item_index}_{audio_file.name}")
-            try:
-                if os.path.abspath(audio_path) != os.path.abspath(user_wav):
-                    shutil.copyfile(audio_path, user_wav)
-            except Exception as e:
-                print(f"[WARN] Copy failed: {e}")
-
-            wav_path = ensure_wav_mono_16k(audio_path, out_dir=run_dir, prefix=f"input_{item_index}")
-            input_duration_ms = wav_duration_ms(wav_path)
+            
+            if args.input_mode == "mic":
+                item_name = "live_mic"
+                user_wav = os.path.join(run_dir, f"user_input_{item_index}_{item_name}.wav")
+                wav_path = f"mic:{user_wav}"
+                input_duration_ms = 0
+                print(f"[INFO] Processing live microphone input (saving to {user_wav})...")
+            else:
+                audio_file = Path(audio_path)
+                if not audio_file.exists():
+                    raise FileNotFoundError(audio_path)
+    
+                item_name = audio_file.stem
+                print(f"[INFO] Processing audio file: {audio_file}")
+    
+                user_wav = os.path.join(run_dir, f"user_input_{item_index}_{audio_file.name}")
+                try:
+                    if os.path.abspath(audio_path) != os.path.abspath(user_wav):
+                        shutil.copyfile(audio_path, user_wav)
+                except Exception as e:
+                    print(f"[WARN] Copy failed: {e}")
+    
+                wav_path = ensure_wav_mono_16k(audio_path, out_dir=run_dir, prefix=f"input_{item_index}")
+                input_duration_ms = wav_duration_ms(wav_path)
+                
             out_wav = os.path.join(run_dir, f"assistant_{item_index}_{item_name}.wav")
 
             # Shared metrics dicts (single-writer per dict = thread-safe)
@@ -576,7 +604,7 @@ def main():
             stt_t = threading.Thread(
                 target=stt_worker,
                 args=(stt_engine, wav_path, llm_queue, stt_metrics,
-                      args.stt_debounce_sec),
+                      args.input_mode),
                 daemon=True,
             )
             llm_t = threading.Thread(
@@ -586,7 +614,7 @@ def main():
             )
             tts_t = threading.Thread(
                 target=tts_worker,
-                args=(tts_engine, tts_queue, out_wav, tts_metrics),
+                args=(tts_engine, tts_queue, out_wav, tts_metrics, args.playback),
                 daemon=True,
             )
 
@@ -594,12 +622,39 @@ def main():
             llm_t.start()
             tts_t.start()
 
-            # Wait for all threads to complete
-            stt_t.join()
-            llm_t.join()
-            tts_t.join()
+            # Wait for completion or interrupt
+            try:
+                if args.input_mode == "file":
+                    stt_t.join()
+                    llm_t.join()
+                    tts_t.join()
+                else:
+                    last_action_t = time.perf_counter()
+                    while True:
+                        time.sleep(1.0)
+                        now = time.perf_counter()
+                        
+                        if llm_metrics.get("is_busy") or tts_metrics.get("is_busy"):
+                            last_action_t = now
+                        else:
+                            last_action_t = max(
+                                last_action_t,
+                                stt_metrics.get("last_speech_t", e2e_t0),
+                                tts_metrics.get("last_play_t", e2e_t0)
+                            )
+                            
+                        if now - last_action_t > args.idle_timeout:
+                            print(f"\n[INFO] Idle timeout reached ({args.idle_timeout}s). Stopping.")
+                            sys.modules['__main__'].shutdown_event = True
+                            break
+            except KeyboardInterrupt:
+                print("\n[INFO] Graceful shutdown triggered by user (Ctrl+C).")
+                sys.modules['__main__'].shutdown_event = True
 
             # -------- Collect metrics and write to CSV --------
+            if args.input_mode == "mic":
+                e2e_t0 = stt_metrics.get("last_speech_t", e2e_t0)
+                
             user_text = stt_metrics.get("user_text") or ""
             stt_ms = stt_metrics.get("stt_ms") or 0
 
@@ -683,7 +738,7 @@ def main():
             with open(yaml_path, "a", encoding="utf-8") as f_yaml:
                 yaml.dump([transcript_record], f_yaml, sort_keys=False, allow_unicode=True)
 
-            if not args.keep_normalized:
+            if args.input_mode == "file" and not args.keep_normalized:
                 try:
                     os.remove(wav_path)
                 except Exception:

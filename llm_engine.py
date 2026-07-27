@@ -100,16 +100,25 @@ class OllamaEngine:
             r.raise_for_status()
             self._current_response = r
 
-            buffer = ""
+            self._current_response = r
+
+            text_chunk = ""
+            socket_buffer = ""
             terminators = {".", "?", "!", ":", ";", "\n"}
             ollama_stats = None
 
-            for line in r.iter_lines():
-                if line:
+            for chunk in r.iter_content(chunk_size=None):
+                if not chunk: continue
+                # We decode and split manually because chunk_size=None returns raw socket chunks
+                # It might contain partial lines, but we can just accumulate and split.
+                socket_buffer += chunk.decode('utf-8', errors='ignore')
+                while '\n' in socket_buffer:
+                    line, socket_buffer = socket_buffer.split('\n', 1)
+                    if not line.strip(): continue
                     data = json.loads(line)
                     piece = data.get("response", "")
-                    buffer += piece
-
+                    text_chunk += piece
+                    
                     # Capture server-side stats from the final message
                     if data.get("done", False):
                         ollama_stats = {
@@ -121,14 +130,14 @@ class OllamaEngine:
                         }
 
                     if any(t in piece for t in terminators):
-                        if len(buffer.strip()) > 2:
-                            yield {"text": buffer.strip(), "ollama_stats": None,
+                        if len(text_chunk.strip()) > 2:
+                            yield {"text": text_chunk.strip(), "ollama_stats": None,
                                    "cancelled": False}
-                            buffer = ""
+                            text_chunk = ""
 
             # Flush remaining buffer
-            if buffer.strip():
-                yield {"text": buffer.strip(), "ollama_stats": None, "cancelled": False}
+            if text_chunk.strip():
+                yield {"text": text_chunk.strip(), "ollama_stats": None, "cancelled": False}
 
             # Yield final metadata-only entry with server-side stats
             if ollama_stats:
