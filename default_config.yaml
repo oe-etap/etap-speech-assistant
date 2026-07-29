@@ -32,3 +32,9 @@ coqui-speaker: "Daisy Studious"
 # Shared LLM Options
 ollama-model: "phi3:mini"
 ollama-url: "http://localhost:11434/api/generate"
+
+# Safety-net chunk length for the LLM -> TTS handoff. Chunks are normally cut at
+# sentence boundaries; a sentence longer than this is split at a word boundary so
+# the TTS does not have to wait for the whole response.
+# Lower = lower TTFA, higher = better prosody.
+tts-chunk-max-chars: 140

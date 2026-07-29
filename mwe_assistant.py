@@ -36,7 +36,7 @@ except ImportError:
     _HAS_SD = False
 
 from stt_engines import VoskEngine, WhisperEngine
-from llm_engine import OllamaEngine
+from llm_engine import DEFAULT_CHUNK_MAX_CHARS, OllamaEngine
 from tts_engines import PiperEngine, CoquiEngine
 
 # Optional module-level imports
@@ -431,6 +431,10 @@ def main():
     # Shared LLM
     parser.add_argument("--ollama-model", default="phi3:mini", help="Ollama model (e.g. phi3:mini)")
     parser.add_argument("--ollama-url", default="http://localhost:11434/api/generate", help="Ollama generate endpoint")
+    parser.add_argument("--tts-chunk-max-chars", type=int, default=DEFAULT_CHUNK_MAX_CHARS,
+                        help="Safety-net chunk length: a sentence longer than this is split at a "
+                             "word boundary so TTS does not wait for the whole response. "
+                             "Lower means lower TTFA, higher means better prosody.")
 
     # ---- config file handling & parse ----
     initial_parser = argparse.ArgumentParser(add_help=False)
@@ -493,7 +497,11 @@ def main():
         )
 
     # Initialize LLM engine
-    llm_engine = OllamaEngine(model=args.ollama_model, url=args.ollama_url)
+    llm_engine = OllamaEngine(
+        model=args.ollama_model,
+        url=args.ollama_url,
+        chunk_max_chars=args.tts_chunk_max_chars,
+    )
     llm_engine.warmup()
 
     # Initialize TTS engine
@@ -509,6 +517,7 @@ def main():
             language=args.coqui_language,
             speaker=args.coqui_speaker,
         )
+    tts_engine.warmup()
 
     run_dir = os.path.join(args.out_dir, timestamp)
     os.makedirs(run_dir, exist_ok=True)

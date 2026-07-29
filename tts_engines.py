@@ -48,6 +48,17 @@ class BaseTTSEngine(ABC):
         """Return the output sample rate in Hz."""
         ...
 
+    def warmup(self) -> None:
+        """Run a throwaway synthesis so the first real chunk pays no init cost.
+
+        Model loading alone does not initialize the inference session; the first
+        synthesize() call is measurably slower than the steady state.
+        """
+        try:
+            self.synthesize("Ready.")
+        except Exception as e:
+            print(f"[WARN] TTS warmup failed: {e}")
+
 
 class PiperEngine(BaseTTSEngine):
     """Piper TTS engine with Python API and CLI executable fallback."""
