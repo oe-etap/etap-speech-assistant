@@ -38,6 +38,7 @@ from audio_sources import (
     DEFAULT_CHUNK_MS, PACING_FAST, PACING_REALTIME,
     FileAudioSource, MicAudioSource,
 )
+from pipeline_channels import UtteranceMailbox
 from stt_engines import VoskEngine, WhisperEngine
 from llm_engine import DEFAULT_CHUNK_MAX_CHARS, OllamaEngine
 from tts_engines import PiperEngine, CoquiEngine
@@ -52,6 +53,9 @@ except ImportError:
 # nvidia-smi cache (timestamp, stats_dict)
 _gpu_cache = (0.0, None)
 _GPU_CACHE_TTL = 2.0
+
+# How long to wait for the pipeline workers to drain before reading their metrics
+WORKER_SHUTDOWN_TIMEOUT_S = 10.0
 
 
 # ---------- Helpers ----------
@@ -170,11 +174,16 @@ def write_timing(writer, args, item, stage, duration_ms, extra=None):
 
 
 # ---------- Pipeline Workers ----------
-def stt_worker(stt_engine, audio_source, llm_queue, stt_metrics, input_mode="file"):
-    """Feed audio to STT engine and stream results to llm_queue.
+def stt_worker(stt_engine, audio_source, mailbox, stt_metrics, input_mode="file"):
+    """Feed audio to the STT engine and hand finalized utterances to the LLM.
 
-    - In 'mic' mode: Every finalized utterance triggers the LLM (barge-in).
-    - In 'file' mode: The LLM is only triggered once at the very end of the file.
+    - In 'mic' mode: every finalized utterance is handed over immediately, so a
+      new utterance can interrupt an answer that is still being generated.
+    - In 'file' mode: the LLM is triggered once, at the end of the file.
+
+    Partial results are printed for visibility but never trigger generation:
+    starting on a partial costs a full generation whenever the guess is wrong,
+    which is what made the earlier experiments slower rather than faster.
 
     Records speech_end_t on every finalized result: this is the anchor for the
     TTFA metric a user actually perceives, which starts when they stop talking
@@ -185,20 +194,26 @@ def stt_worker(stt_engine, audio_source, llm_queue, stt_metrics, input_mode="fil
         accumulated_final = ""
 
         for result in stt_engine.transcribe_stream(audio_source.chunks()):
-            if result["is_final"] and result["text"]:
-                accumulated_final = (
-                    accumulated_final + " " + result["text"]
-                ).strip()
+            if not result["text"]:
+                continue
 
-                stt_metrics["last_speech_t"] = time.perf_counter()
-                stt_metrics["speech_end_t"] = audio_source.speech_end_t()
-                stt_metrics["user_text"] = accumulated_final
+            if not result["is_final"]:
+                print(f"[STT Partial] {result['text']}", end="\r")
+                continue
 
-                if input_mode == "mic":
-                    llm_queue.put({"type": "final", "text": accumulated_final})
+            accumulated_final = (
+                accumulated_final + " " + result["text"]
+            ).strip()
+
+            stt_metrics["last_speech_t"] = time.perf_counter()
+            stt_metrics["speech_end_t"] = audio_source.speech_end_t()
+            stt_metrics["user_text"] = accumulated_final
+
+            if input_mode == "mic":
+                mailbox.put(accumulated_final)
 
         if input_mode == "file" and accumulated_final:
-            llm_queue.put({"type": "final", "text": accumulated_final})
+            mailbox.put(accumulated_final)
 
         t1 = time.perf_counter()
         stt_metrics["stt_ms"] = int((t1 - t0) * 1000)
@@ -209,50 +224,28 @@ def stt_worker(stt_engine, audio_source, llm_queue, stt_metrics, input_mode="fil
         print(f"[STT] Error: {e}")
         stt_metrics["error"] = str(e)
     finally:
-        llm_queue.put(None)  # EOF signal
+        mailbox.close()
 
 
-def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
-    """Read text from llm_queue, generate LLM response, send chunks to tts_queue.
+def llm_worker(llm_engine, mailbox, tts_queue, llm_metrics):
+    """Answer utterances from the mailbox, streaming chunks to tts_queue.
 
-    Supports cancel/restart: if a newer STT message arrives while the LLM
-    is still generating, the current generation is cancelled, the TTS queue
-    receives a cancel signal, and a fresh generation starts with the
-    updated text.
-
-    Queue protocol:
-        - Drains stale messages before starting each generation (keeps newest).
-        - Peeks the queue during token generation; cancels only when the
-          peeked message is NOT the EOF sentinel (None).
-        - EOF (None) is consumed to break the outer loop; a final None is
-          then placed on tts_queue.
+    Barge-in: if a newer utterance arrives while generation is in flight, the
+    current generation is cancelled, the TTS discards its partial output, and a
+    fresh generation starts from the newer text. Only finalized utterances get
+    here, so a restart always reflects something the user actually finished
+    saying.
     """
     try:
         while True:
             llm_metrics["is_busy"] = False
-            msg = llm_queue.get()
+            text = mailbox.take()
             llm_metrics["is_busy"] = True
-            
-            if msg is None:
+
+            if text is None:
                 break
 
-            # Drain: skip stale messages, keep the newest non-EOF message
-            while not llm_queue.empty():
-                try:
-                    peek = llm_queue.queue[0]
-                    if peek is None:
-                        break  # Do not consume the EOF sentinel
-                    msg = llm_queue.get_nowait()
-                except (queue.Empty, IndexError):
-                    break
-
-            text = msg.get("text", "")
-            if not text:
-                continue
-
-            msg_type = msg.get("type", "final")
-
-            # Cancel any prior generation and reset metrics
+            # Drop any partial audio from a superseded answer and reset metrics
             llm_engine.cancel()
             tts_queue.put({"type": "cancel"})
             llm_metrics["full_assistant_text"] = ""
@@ -260,13 +253,11 @@ def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
             llm_metrics["llm_ttfc_ms"] = None
             llm_metrics["llm_ttft_ms"] = None
 
-            print(f"[LLM] Starting stream ({msg_type})...")
+            print("[LLM] Starting stream...")
             llm_t0 = time.perf_counter()
             llm_metrics["llm_t0"] = llm_t0
 
             for chunk_data in llm_engine.generate_stream(text):
-                chunk = chunk_data.get("text", "")
-
                 if chunk_data.get("ollama_stats"):
                     llm_metrics["ollama_stats"] = chunk_data["ollama_stats"]
 
@@ -278,21 +269,12 @@ def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
                 if chunk_data.get("cancelled"):
                     break
 
-                # Peek queue: cancel if a newer STT message arrived
-                # (but do NOT cancel for the EOF sentinel)
-                if not llm_queue.empty():
-                    try:
-                        peek = llm_queue.queue[0]
-                        if peek is not None:
-                            print(
-                                "[LLM] Newer STT result arrived, "
-                                "restarting generation..."
-                            )
-                            llm_engine.cancel()
-                            break
-                    except (IndexError, AttributeError):
-                        pass
+                if mailbox.has_pending():
+                    print("[LLM] Newer utterance arrived, restarting generation...")
+                    llm_engine.cancel()
+                    break
 
+                chunk = chunk_data.get("text", "")
                 if not chunk:
                     continue
 
@@ -308,6 +290,9 @@ def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
 
                 tts_queue.put({"type": "text", "text": chunk})
 
+            # Let the TTS close this response's WAV before the next one starts
+            tts_queue.put({"type": "end_of_response"})
+
     except Exception as e:
         print(f"[LLM] Error: {e}")
         llm_metrics["error"] = str(e)
@@ -315,16 +300,42 @@ def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
         tts_queue.put(None)  # EOF signal
 
 
-def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics, playback=False):
-    """Read text chunks from tts_queue and synthesize to WAV file.
+def response_wav_path(out_wav, index):
+    """Return the WAV path for the index-th response of this item.
 
-    Handles cancel signals: when {"type": "cancel"} is received, the
-    current partial WAV file is closed and deleted, and all metrics are
-    reset. The worker then waits for fresh text chunks from the
-    restarted LLM generation.
+    The first response keeps the plain name so file mode, which only ever has
+    one, is unaffected. A mic session answers repeatedly and would otherwise
+    overwrite every earlier answer.
+    """
+    if index <= 1:
+        return out_wav
+    stem, ext = os.path.splitext(out_wav)
+    return f"{stem}_r{index}{ext}"
+
+
+def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics, playback=False):
+    """Read text chunks from tts_queue and synthesize them to WAV files.
+
+    Message types:
+        - "text": synthesize and append to the current response WAV.
+        - "cancel": the answer was superseded, so drop the partial WAV, flush
+          any queued audio from the speakers, and reset the metrics.
+        - "end_of_response": the answer is complete; close its WAV so the next
+          one starts a new file.
     """
     wav_file = None
     stream = None
+    response_index = 1
+    tts_metrics["out_wavs"] = []
+
+    def close_response():
+        nonlocal wav_file, response_index
+        if wav_file:
+            wav_file.close()
+            wav_file = None
+            tts_metrics["out_wavs"].append(response_wav_path(out_wav, response_index))
+            response_index += 1
+
     try:
         if playback:
             if not _HAS_SD:
@@ -346,23 +357,30 @@ def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics, playback=False):
 
             msg_type = msg.get("type", "text")
 
+            if msg_type == "end_of_response":
+                close_response()
+                continue
+
             if msg_type == "cancel":
-                # Discard the partial WAV and reset state
+                # Discard the partial WAV of the superseded answer
+                partial_path = response_wav_path(out_wav, response_index)
                 if wav_file:
                     wav_file.close()
                     wav_file = None
-                if os.path.exists(out_wav):
+                if os.path.exists(partial_path):
                     try:
-                        os.remove(out_wav)
+                        os.remove(partial_path)
                     except OSError:
                         pass
-                
-                # Clear audio stream buffer if playing
+
+                # abort() drops audio already queued on the device; stop() would
+                # play it out first, so the old answer would keep talking over
+                # the new one.
                 if stream:
-                    stream.stop()
+                    stream.abort()
                     stream.start()
-                    
-                # Reset metrics so they reflect only the final response
+
+                # Reset metrics so they reflect only the answer that survives
                 tts_metrics["tts_first_chunk_ms"] = None
                 tts_metrics["tts_first_chunk_t"] = None
                 tts_metrics["total_tts_time"] = 0.0
@@ -384,24 +402,23 @@ def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics, playback=False):
                 tts_metrics["tts_first_chunk_t"] = tts_t1
 
             if wav_file is None:
-                wav_file = wave.open(out_wav, "wb")
+                wav_file = wave.open(response_wav_path(out_wav, response_index), "wb")
                 wav_file.setnchannels(1)
                 wav_file.setsampwidth(2)  # 16-bit
                 wav_file.setframerate(sample_rate)
 
             wav_file.writeframes(pcm_bytes)
-            
+
             if stream:
                 stream.write(pcm_bytes)
-                
+
             tts_metrics["last_play_t"] = time.perf_counter()
-                
+
     except Exception as e:
         print(f"[TTS] Error: {e}")
         tts_metrics["error"] = str(e)
     finally:
-        if wav_file:
-            wav_file.close()
+        close_response()
         if stream:
             try:
                 stream.stop()
@@ -635,8 +652,9 @@ def main():
                 "total_tts_time": 0.0,
             }
 
-            # Create inter-thread queues
-            llm_queue = queue.Queue()
+            # STT hands over utterances through a single-slot mailbox (only the
+            # newest one matters); TTS chunks are a FIFO, so they stay a queue.
+            mailbox = UtteranceMailbox()
             tts_queue = queue.Queue()
 
             e2e_t0 = time.perf_counter()
@@ -644,13 +662,13 @@ def main():
             # Start worker threads
             stt_t = threading.Thread(
                 target=stt_worker,
-                args=(stt_engine, audio_source, llm_queue, stt_metrics,
+                args=(stt_engine, audio_source, mailbox, stt_metrics,
                       args.input_mode),
                 daemon=True,
             )
             llm_t = threading.Thread(
                 target=llm_worker,
-                args=(llm_engine, llm_queue, tts_queue, llm_metrics),
+                args=(llm_engine, mailbox, tts_queue, llm_metrics),
                 daemon=True,
             )
             tts_t = threading.Thread(
@@ -691,6 +709,14 @@ def main():
             except KeyboardInterrupt:
                 print("\n[INFO] Graceful shutdown triggered by user (Ctrl+C).")
                 shutdown_event.set()
+
+            # Let the workers drain before their metrics are read, otherwise the
+            # response WAV may still be open while its duration is measured.
+            for worker in (stt_t, llm_t, tts_t):
+                worker.join(timeout=WORKER_SHUTDOWN_TIMEOUT_S)
+                if worker.is_alive():
+                    print(f"[WARN] {worker.name} did not stop within "
+                          f"{WORKER_SHUTDOWN_TIMEOUT_S}s.")
 
             # -------- Collect metrics and write to CSV --------
             if args.input_mode == "mic":
@@ -762,20 +788,23 @@ def main():
             write_timing(writer, args, item_name, "tts_total",
                          int(tts_metrics["total_tts_time"] * 1000))
 
-            # Output audio duration and E2E summary
-            output_duration_ms = wav_duration_ms(out_wav) if os.path.exists(out_wav) else 0
+            # Output audio duration and E2E summary. A mic session answers more
+            # than once, so the reported duration covers every response WAV.
+            response_wavs = [p for p in tts_metrics.get("out_wavs", []) if os.path.exists(p)]
+            output_duration_ms = sum(wav_duration_ms(p) for p in response_wavs)
             full_reply = llm_metrics["full_assistant_text"].strip()
 
             write_timing(writer, args, item_name, "e2e_response_ready",
                          int((time.perf_counter() - e2e_t0) * 1000),
                          {"input_duration_ms": input_duration_ms,
                           "output_duration_ms": output_duration_ms,
-                          "output_wav": out_wav,
+                          "output_wav": response_wavs[0] if response_wavs else "",
+                          "output_wav_count": len(response_wavs),
                           "full_text": full_reply,
                           "response_word_count": len(full_reply.split()) if full_reply else 0,
                           "response_char_count": len(full_reply),
                           "llm_chunk_count": llm_metrics["llm_chunk_count"]})
-            print(f"[TTS] Stream finished. Saved to {out_wav}.")
+            print(f"[TTS] Stream finished. Saved to {', '.join(response_wavs) or '(no audio)'}.")
 
             # Flush CSV after each item to prevent data loss
             fcsv.flush()
