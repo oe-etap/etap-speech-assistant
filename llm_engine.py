@@ -6,6 +6,8 @@ Provides OllamaEngine for streaming text generation via the Ollama API.
 """
 
 import json
+import time
+
 import requests
 
 
@@ -211,6 +213,9 @@ class OllamaEngine:
             - "text" (str): The synthesizable text chunk.
             - "ollama_stats" (dict|None): Server-side metrics (only on last yield).
             - "cancelled" (bool): True if the stream was cancelled mid-generation.
+            - "first_token_t" (float|None): perf_counter timestamp of the first
+              generated token, for measuring time-to-first-token separately from
+              time-to-first-chunk.
 
         The last yielded dict may have empty "text" and non-None "ollama_stats"
         containing Ollama's server-side performance metrics.
@@ -227,6 +232,7 @@ class OllamaEngine:
 
         chunker = TextChunker(max_chars=self._chunk_max_chars)
         ollama_stats = None
+        first_token_t = None
 
         try:
             # Two different "stream" flags are needed here and they mean
@@ -276,26 +282,33 @@ class OllamaEngine:
                                 "total_duration_ns": data.get("total_duration", 0),
                             }
 
-                        for chunk in chunker.feed(data.get("response", "")):
+                        piece = data.get("response", "")
+                        if piece and first_token_t is None:
+                            first_token_t = time.perf_counter()
+
+                        for chunk in chunker.feed(piece):
                             yield {"text": chunk, "ollama_stats": None,
-                                   "cancelled": False}
+                                   "cancelled": False, "first_token_t": first_token_t}
 
             # Flush whatever did not reach a split point
             remainder = chunker.flush()
             if remainder:
-                yield {"text": remainder, "ollama_stats": None, "cancelled": False}
+                yield {"text": remainder, "ollama_stats": None,
+                       "cancelled": False, "first_token_t": first_token_t}
 
             # Yield final metadata-only entry with server-side stats
             if ollama_stats:
-                yield {"text": "", "ollama_stats": ollama_stats, "cancelled": False}
+                yield {"text": "", "ollama_stats": ollama_stats,
+                       "cancelled": False, "first_token_t": first_token_t}
 
         except Exception as e:
             if self._cancel_requested:
                 # Closing the response mid-stream surfaces as a connection or
                 # I/O error; that is the expected outcome of cancel().
-                yield {"text": "", "ollama_stats": None, "cancelled": True}
+                yield {"text": "", "ollama_stats": None, "cancelled": True,
+                       "first_token_t": first_token_t}
             else:
                 yield {"text": f"(LLM call failed: {e})", "ollama_stats": None,
-                       "cancelled": False}
+                       "cancelled": False, "first_token_t": first_token_t}
         finally:
             self._current_response = None

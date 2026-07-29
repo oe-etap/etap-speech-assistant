@@ -3,22 +3,20 @@
 """
 STT engine abstraction layer.
 Provides BaseSTTEngine interface and concrete implementations for Vosk and faster-whisper.
+
+Engines consume an iterator of raw PCM chunks (see audio_sources.py) rather than
+a file path, so file and microphone input share one code path and the caller
+decides how fast the audio arrives.
 """
 
 from abc import ABC, abstractmethod
 import json
-import queue
-import sys
-import wave
-from typing import Iterator
+from typing import Iterable, Iterator
 
-try:
-    import sounddevice as sd
-    _HAS_SD = True
-except ImportError:
-    sd = None
-    _HAS_SD = False
+import numpy as np
 from vosk import KaldiRecognizer, Model
+
+from audio_sources import SAMPLE_RATE
 
 try:
     from faster_whisper import WhisperModel
@@ -32,28 +30,16 @@ class BaseSTTEngine(ABC):
     """Abstract base class for speech-to-text engines."""
 
     @abstractmethod
-    def transcribe(self, wav_path: str) -> str:
-        """Transcribe a WAV file and return the full recognized text.
+    def transcribe_stream(self, chunks: Iterable[bytes]) -> Iterator[dict]:
+        """Transcribe a stream of PCM chunks and yield results incrementally.
 
         Args:
-            wav_path: Path to a mono 16kHz 16-bit PCM WAV file.
-
-        Returns:
-            The full transcription as a single string.
-        """
-        ...
-
-    @abstractmethod
-    def transcribe_stream(self, wav_path: str) -> Iterator[dict]:
-        """Transcribe a WAV file and yield results incrementally.
+            chunks: Iterable of mono 16 kHz 16-bit PCM byte chunks.
 
         Yields dicts with keys:
             - "is_final" (bool): True if this is a finalized recognition result,
                                   False for partial/intermediate results.
             - "text" (str): The recognized text.
-
-        Args:
-            wav_path: Path to a mono 16kHz 16-bit PCM WAV file.
         """
         ...
 
@@ -63,117 +49,38 @@ class VoskEngine(BaseSTTEngine):
 
     def __init__(self, model_path: str):
         self._model = Model(model_path)
-        self._sample_rate = 16000
-        self._chunk_size = 4000  # frames per read
 
-    def transcribe(self, wav_path: str) -> str:
-        """Transcribe by collecting all final results from the streaming interface."""
-        final_texts = []
-        for result in self.transcribe_stream(wav_path):
-            if result["is_final"]:
-                final_texts.append(result["text"])
-        return " ".join(final_texts).strip()
+    def transcribe_stream(self, chunks: Iterable[bytes]) -> Iterator[dict]:
+        """Yield partial and final results as audio chunks arrive.
 
-    def transcribe_stream(self, wav_path: str) -> Iterator[dict]:
-        """Yield partial and final recognition results as audio chunks are processed.
-
-        A fresh KaldiRecognizer is created per call, so no explicit reset is needed
-        between files.
+        A fresh KaldiRecognizer is created per call, so no explicit reset is
+        needed between utterances or files.
         """
-
-
-        rec = KaldiRecognizer(self._model, self._sample_rate)
+        rec = KaldiRecognizer(self._model, SAMPLE_RATE)
         rec.SetWords(True)
 
-        if wav_path.startswith("mic"):
-            
-            q = queue.Queue()
-            save_path = wav_path.split(":", 1)[1] if ":" in wav_path else None
-            mic_wav_file = None
-            if save_path:
-                mic_wav_file = wave.open(save_path, "wb")
-                mic_wav_file.setnchannels(1)
-                mic_wav_file.setsampwidth(2)
-                mic_wav_file.setframerate(self._sample_rate)
-
-            def callback(indata, frames, time_info, status):
-                if status:
-                    print(f"[STT] Audio Callback Status: {status}", file=sys.stderr)
-                q.put(bytes(indata))
-
-            try:
-                if not _HAS_SD:
-                    raise ImportError("sounddevice module not installed")
-                with sd.RawInputStream(samplerate=self._sample_rate, blocksize=8000, 
-                                       device=None, dtype='int16',
-                                       channels=1, callback=callback):
-                    print("[STT] Listening on microphone (speak now, pause to trigger LLM)...")
-                    while True:
-                        if getattr(sys.modules['__main__'], 'shutdown_event', False):
-                            break
-                            
-                        try:
-                            data = q.get(timeout=0.5)
-                        except queue.Empty:
-                            continue
-                            
-                        if mic_wav_file:
-                            mic_wav_file.writeframes(data)
-                            
-                        if rec.AcceptWaveform(data):
-                            result = json.loads(rec.Result())
-                            text = result.get("text", "")
-                            if text:
-                                yield {"is_final": True, "text": text}
-                        else:
-                            result = json.loads(rec.PartialResult())
-                            text = result.get("partial", "")
-                            if text:
-                                yield {"is_final": False, "text": text}
-            except KeyboardInterrupt:
-                print("\n[STT] Microphone listening stopped by user.")
-                result = json.loads(rec.FinalResult())
-                text = result.get("text", "")
+        for data in chunks:
+            if rec.AcceptWaveform(data):
+                text = json.loads(rec.Result()).get("text", "")
                 if text:
                     yield {"is_final": True, "text": text}
-            finally:
-                if mic_wav_file:
-                    mic_wav_file.close()
-            return    
-        else:
-            wf = wave.open(wav_path, "rb")
-            assert (wf.getnchannels() == 1
-                    and wf.getframerate() == self._sample_rate
-                    and wf.getsampwidth() == 2), \
-                "Vosk requires mono 16kHz 16-bit PCM WAV input"
-
-            try:
-                while True:
-                    data = wf.readframes(self._chunk_size)
-                    if len(data) == 0:
-                        break
-                    if rec.AcceptWaveform(data):
-                        result = json.loads(rec.Result())
-                        text = result.get("text", "")
-                        if text:
-                            yield {"is_final": True, "text": text}
-                    else:
-                        result = json.loads(rec.PartialResult())
-                        text = result.get("partial", "")
-                        if text:
-                            yield {"is_final": False, "text": text}
-
-                # Flush any remaining text from the recognizer
-                final = json.loads(rec.FinalResult())
-                text = final.get("text", "")
+            else:
+                text = json.loads(rec.PartialResult()).get("partial", "")
                 if text:
-                    yield {"is_final": True, "text": text}
-            finally:
-                wf.close()
+                    yield {"is_final": False, "text": text}
+
+        # Flush any remaining text from the recognizer
+        text = json.loads(rec.FinalResult()).get("text", "")
+        if text:
+            yield {"is_final": True, "text": text}
 
 
 class WhisperEngine(BaseSTTEngine):
-    """faster-whisper based STT engine. Non-streaming (processes entire file at once)."""
+    """faster-whisper based STT engine.
+
+    Whisper has no incremental decoding, so the whole stream is buffered and
+    transcribed in one pass once the audio ends.
+    """
 
     def __init__(self, model_name: str = "small", device: str = "cpu",
                  compute_type: str = "int8"):
@@ -183,16 +90,14 @@ class WhisperEngine(BaseSTTEngine):
             )
         self._model = WhisperModel(model_name, device=device, compute_type=compute_type)
 
-    def transcribe(self, wav_path: str) -> str:
-        """Transcribe the entire audio file and return the full text."""
-        segments, _ = self._model.transcribe(wav_path, language="en")
-        return " ".join(s.text.strip() for s in segments).strip()
+    def transcribe_stream(self, chunks: Iterable[bytes]) -> Iterator[dict]:
+        """Buffer the whole stream, then yield a single final result."""
+        pcm = b"".join(chunks)
+        if not pcm:
+            return
 
-    def transcribe_stream(self, wav_path: str) -> Iterator[dict]:
-        """Yield a single final result (Whisper does not support incremental streaming)."""
-        if wav_path == "mic":
-            raise NotImplementedError("Live microphone streaming is currently only supported with the Vosk STT engine.")
-        
-        text = self.transcribe(wav_path)
+        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        segments, _ = self._model.transcribe(audio, language="en")
+        text = " ".join(s.text.strip() for s in segments).strip()
         if text:
             yield {"is_final": True, "text": text}

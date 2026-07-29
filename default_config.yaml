@@ -11,6 +11,14 @@ tts-engine: piper
 out-dir: outputs
 keep-normalized: false
 input-mode: file  # 'file' or 'mic'
+
+# How input files are fed to the STT engine.
+#   realtime: simulate a microphone at 1x speed, so STT overlaps with the speech.
+#             Required for TTFA numbers that reflect a live deployment.
+#   fast:     read as quickly as possible (original batch behaviour), kept for
+#             comparability with earlier measurements.
+audio-pacing: fast
+audio-chunk-ms: 250
 playback: false   # Play TTS output on speakers
 idle-timeout: 10.0 # Shutdown after N seconds of silence
 

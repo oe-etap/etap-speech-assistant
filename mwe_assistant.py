@@ -23,7 +23,6 @@ import shutil
 import subprocess
 import time
 import wave
-import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -35,6 +34,10 @@ except ImportError:
     sd = None
     _HAS_SD = False
 
+from audio_sources import (
+    DEFAULT_CHUNK_MS, PACING_FAST, PACING_REALTIME,
+    FileAudioSource, MicAudioSource,
+)
 from stt_engines import VoskEngine, WhisperEngine
 from llm_engine import DEFAULT_CHUNK_MAX_CHARS, OllamaEngine
 from tts_engines import PiperEngine, CoquiEngine
@@ -167,25 +170,30 @@ def write_timing(writer, args, item, stage, duration_ms, extra=None):
 
 
 # ---------- Pipeline Workers ----------
-def stt_worker(stt_engine, wav_path, llm_queue, stt_metrics, input_mode="file"):
+def stt_worker(stt_engine, audio_source, llm_queue, stt_metrics, input_mode="file"):
     """Feed audio to STT engine and stream results to llm_queue.
 
     - In 'mic' mode: Every finalized utterance triggers the LLM (barge-in).
     - In 'file' mode: The LLM is only triggered once at the very end of the file.
+
+    Records speech_end_t on every finalized result: this is the anchor for the
+    TTFA metric a user actually perceives, which starts when they stop talking
+    rather than when processing begins.
     """
     try:
         t0 = time.perf_counter()
         accumulated_final = ""
 
-        for result in stt_engine.transcribe_stream(wav_path):
+        for result in stt_engine.transcribe_stream(audio_source.chunks()):
             if result["is_final"] and result["text"]:
                 accumulated_final = (
                     accumulated_final + " " + result["text"]
                 ).strip()
-                
+
                 stt_metrics["last_speech_t"] = time.perf_counter()
+                stt_metrics["speech_end_t"] = audio_source.speech_end_t()
                 stt_metrics["user_text"] = accumulated_final
-                
+
                 if input_mode == "mic":
                     llm_queue.put({"type": "final", "text": accumulated_final})
 
@@ -250,6 +258,7 @@ def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
             llm_metrics["full_assistant_text"] = ""
             llm_metrics["llm_chunk_count"] = 0
             llm_metrics["llm_ttfc_ms"] = None
+            llm_metrics["llm_ttft_ms"] = None
 
             print(f"[LLM] Starting stream ({msg_type})...")
             llm_t0 = time.perf_counter()
@@ -260,6 +269,11 @@ def llm_worker(llm_engine, llm_queue, tts_queue, llm_metrics):
 
                 if chunk_data.get("ollama_stats"):
                     llm_metrics["ollama_stats"] = chunk_data["ollama_stats"]
+
+                first_token_t = chunk_data.get("first_token_t")
+                if first_token_t is not None and llm_metrics["llm_ttft_ms"] is None:
+                    llm_metrics["llm_ttft_ms"] = int((first_token_t - llm_t0) * 1000)
+                    llm_metrics["first_token_t"] = first_token_t
 
                 if chunk_data.get("cancelled"):
                     break
@@ -409,6 +423,12 @@ def main():
     parser.add_argument("--latency-csv", type=str, default=None, help="CSV file to append latency/resource logs")
     parser.add_argument("--keep-normalized", action="store_true", help="Keep ffmpeg-normalized input WAVs")
     parser.add_argument("--input-mode", choices=["file", "mic"], default="file", help="Input mode: file or live mic")
+    parser.add_argument("--audio-pacing", choices=[PACING_REALTIME, PACING_FAST], default=PACING_REALTIME,
+                        help="How input files are fed to the STT engine. 'realtime' simulates a "
+                             "microphone at 1x speed so STT overlaps with speech (representative "
+                             "latency). 'fast' reads as quickly as possible (original behaviour).")
+    parser.add_argument("--audio-chunk-ms", type=int, default=DEFAULT_CHUNK_MS,
+                        help="Audio chunk length in milliseconds fed to the STT engine")
     parser.add_argument("--playback", action="store_true", help="Play TTS output on speakers")
     parser.add_argument("--idle-timeout", type=float, default=10.0, help="Seconds of silence before exiting mic mode")
 
@@ -555,6 +575,9 @@ def main():
         "extra_json",
     ]
 
+    # Signals the microphone source to stop capturing
+    shutdown_event = threading.Event()
+
     # Prepare CSV
     csv_exists = os.path.exists(args.latency_csv)
     with open(args.latency_csv, "a", newline="", encoding="utf-8") as fcsv:
@@ -565,36 +588,45 @@ def main():
         for item_index, audio_path in enumerate(args.audio, start=1):
             print("=" * 60)
             
+            wav_path = None
             if args.input_mode == "mic":
                 item_name = "live_mic"
                 user_wav = os.path.join(run_dir, f"user_input_{item_index}_{item_name}.wav")
-                wav_path = f"mic:{user_wav}"
-                input_duration_ms = 0
+                audio_source = MicAudioSource(
+                    save_path=user_wav,
+                    chunk_ms=args.audio_chunk_ms,
+                    stop_event=shutdown_event,
+                )
                 print(f"[INFO] Processing live microphone input (saving to {user_wav})...")
             else:
                 audio_file = Path(audio_path)
                 if not audio_file.exists():
                     raise FileNotFoundError(audio_path)
-    
+
                 item_name = audio_file.stem
-                print(f"[INFO] Processing audio file: {audio_file}")
-    
+                print(f"[INFO] Processing audio file: {audio_file} (pacing: {args.audio_pacing})")
+
                 user_wav = os.path.join(run_dir, f"user_input_{item_index}_{audio_file.name}")
                 try:
                     if os.path.abspath(audio_path) != os.path.abspath(user_wav):
                         shutil.copyfile(audio_path, user_wav)
                 except Exception as e:
                     print(f"[WARN] Copy failed: {e}")
-    
+
                 wav_path = ensure_wav_mono_16k(audio_path, out_dir=run_dir, prefix=f"input_{item_index}")
-                input_duration_ms = wav_duration_ms(wav_path)
-                
+                audio_source = FileAudioSource(
+                    wav_path,
+                    pacing=args.audio_pacing,
+                    chunk_ms=args.audio_chunk_ms,
+                    stop_event=shutdown_event,
+                )
+
             out_wav = os.path.join(run_dir, f"assistant_{item_index}_{item_name}.wav")
 
             # Shared metrics dicts (single-writer per dict = thread-safe)
             stt_metrics = {"stt_ms": None, "user_text": None}
             llm_metrics = {
-                "llm_t0": None, "llm_ttfc_ms": None,
+                "llm_t0": None, "llm_ttfc_ms": None, "llm_ttft_ms": None,
                 "full_assistant_text": "", "llm_chunk_count": 0,
                 "ollama_stats": None,
             }
@@ -612,7 +644,7 @@ def main():
             # Start worker threads
             stt_t = threading.Thread(
                 target=stt_worker,
-                args=(stt_engine, wav_path, llm_queue, stt_metrics,
+                args=(stt_engine, audio_source, llm_queue, stt_metrics,
                       args.input_mode),
                 daemon=True,
             )
@@ -654,11 +686,11 @@ def main():
                             
                         if now - last_action_t > args.idle_timeout:
                             print(f"\n[INFO] Idle timeout reached ({args.idle_timeout}s). Stopping.")
-                            sys.modules['__main__'].shutdown_event = True
+                            shutdown_event.set()
                             break
             except KeyboardInterrupt:
                 print("\n[INFO] Graceful shutdown triggered by user (Ctrl+C).")
-                sys.modules['__main__'].shutdown_event = True
+                shutdown_event.set()
 
             # -------- Collect metrics and write to CSV --------
             if args.input_mode == "mic":
@@ -666,6 +698,9 @@ def main():
                 
             user_text = stt_metrics.get("user_text") or ""
             stt_ms = stt_metrics.get("stt_ms") or 0
+            # Read after the workers finish: a mic source only knows how much
+            # audio it captured once capturing has stopped.
+            input_duration_ms = audio_source.duration_ms
 
             stt_rtf = round(stt_ms / input_duration_ms, 3) if input_duration_ms > 0 else 0.0
             write_timing(writer, args, item_name, "stt", stt_ms,
@@ -679,7 +714,12 @@ def main():
                 fcsv.flush()
                 continue
 
-            # LLM TTFC
+            # LLM TTFT (first token) and TTFC (first chunk handed to TTS).
+            # These differ by the time the chunker spends filling a chunk.
+            llm_ttft_ms = llm_metrics.get("llm_ttft_ms")
+            if llm_ttft_ms is not None:
+                write_timing(writer, args, item_name, "llm_ttft", llm_ttft_ms)
+
             llm_ttfc_ms = llm_metrics.get("llm_ttfc_ms")
             if llm_ttfc_ms is not None:
                 write_timing(writer, args, item_name, "llm_ttfc", llm_ttfc_ms)
@@ -689,11 +729,20 @@ def main():
             if tts_first_chunk_ms is not None:
                 write_timing(writer, args, item_name, "tts_first_chunk", tts_first_chunk_ms)
 
-            # TTFA (wall-clock time from start to first audio ready)
+            # TTFA (wall-clock time from start of processing to first audio ready)
             tts_first_t = tts_metrics.get("tts_first_chunk_t")
             if tts_first_t is not None:
                 ttfa_ms = int((tts_first_t - e2e_t0) * 1000)
                 write_timing(writer, args, item_name, "ttfa", ttfa_ms)
+
+                # TTFA anchored at the end of the speech, which is what a user
+                # actually perceives. Only meaningful with realtime pacing; with
+                # 'fast' pacing the audio ends as soon as it is read.
+                speech_end_t = stt_metrics.get("speech_end_t")
+                if speech_end_t is not None:
+                    write_timing(writer, args, item_name, "ttfa_from_speech_end",
+                                 int((tts_first_t - speech_end_t) * 1000),
+                                 {"audio_pacing": args.audio_pacing})
 
             # LLM server-side evaluation metrics (ground truth from Ollama)
             ollama_stats = llm_metrics.get("ollama_stats")
@@ -752,6 +801,13 @@ def main():
                     os.remove(wav_path)
                 except Exception:
                     pass
+
+            # The stop signal is shared by every item, so a Ctrl+C or an idle
+            # timeout ends the whole run instead of feeding empty audio to the
+            # remaining files.
+            if shutdown_event.is_set():
+                print("[INFO] Stop requested, skipping any remaining items.")
+                break
 
     print(f"\nDone. Latency/resource log appended to: {args.latency_csv}")
     return 0
