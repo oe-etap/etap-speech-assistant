@@ -40,7 +40,7 @@ from audio_sources import (
 )
 from pipeline_channels import UtteranceMailbox
 from stt_engines import VoskEngine, WhisperEngine
-from llm_engine import DEFAULT_CHUNK_MAX_CHARS, OllamaEngine
+from llm_engine import DEFAULT_CHUNK_MAX_CHARS, DEFAULT_SYSTEM_PROMPT, OllamaEngine
 from tts_engines import PiperEngine, CoquiEngine
 
 # Optional module-level imports
@@ -90,6 +90,34 @@ def ensure_wav_mono_16k(path, out_dir=None, prefix=None):
     if result.returncode != 0:
         raise RuntimeError(result.stderr.decode("utf-8", errors="replace"))
     return str(out_path)
+
+
+def load_system_prompt(path):
+    """Return (variant_label, prompt_text) for the configured prompt file.
+
+    The label identifies which variant produced a measurement, and it is simply
+    the file name. That is why a prompt file must never be edited in place: a
+    reworded prompt belongs in a new file, so a given label always denotes the
+    same text.
+    """
+    if not path:
+        return "(built-in default)", DEFAULT_SYSTEM_PROMPT
+
+    prompt_file = Path(path)
+    text = prompt_file.read_text(encoding="utf-8").strip()
+    if not text:
+        raise ValueError(f"System prompt file is empty: {path}")
+    return prompt_file.name, text
+
+
+def save_system_prompt(run_dir, label, text):
+    """Record the prompt this run used, headed by its variant name.
+
+    config_used.yaml only stores the path, so the prompt is copied here as well:
+    the run stays reproducible even if the prompts/ directory moves on.
+    """
+    with open(os.path.join(run_dir, "system_prompt.txt"), "w", encoding="utf-8") as f:
+        f.write(f"{label}\n\n{text}\n")
 
 
 def wav_duration_ms(wav_path):
@@ -252,6 +280,7 @@ def llm_worker(llm_engine, mailbox, tts_queue, llm_metrics):
             llm_metrics["llm_chunk_count"] = 0
             llm_metrics["llm_ttfc_ms"] = None
             llm_metrics["llm_ttft_ms"] = None
+            llm_metrics["first_chunk_chars"] = None
 
             print("[LLM] Starting stream...")
             llm_t0 = time.perf_counter()
@@ -284,6 +313,9 @@ def llm_worker(llm_engine, mailbox, tts_queue, llm_metrics):
                     llm_metrics["llm_ttfc_ms"] = int(
                         (time.perf_counter() - llm_t0) * 1000
                     )
+                    # Length of the opening chunk shows whether the model
+                    # honoured a "start with a short sentence" instruction.
+                    llm_metrics["first_chunk_chars"] = len(chunk)
 
                 print(f"[LLM Chunk {llm_metrics['llm_chunk_count']}] {chunk}")
                 llm_metrics["full_assistant_text"] += chunk + " "
@@ -472,6 +504,16 @@ def main():
                         help="Safety-net chunk length: a sentence longer than this is split at a "
                              "word boundary so TTS does not wait for the whole response. "
                              "Lower means lower TTFA, higher means better prosody.")
+    parser.add_argument("--system-prompt-file", type=str, default=None,
+                        help="Path to a .txt file holding the system prompt. Prompt variants live "
+                             "in prompts/ and are identified by filename; a variant is never edited "
+                             "in place, a change means a new file. Falls back to the built-in prompt.")
+    parser.add_argument("--llm-temperature", type=float, default=0.7,
+                        help="Sampling temperature. Use 0 together with --llm-seed for A/B runs.")
+    parser.add_argument("--llm-seed", type=int, default=None,
+                        help="Sampling seed. Leave unset for non-deterministic sampling.")
+    parser.add_argument("--llm-max-tokens", type=int, default=150,
+                        help="Maximum number of tokens the LLM may generate")
 
     # ---- config file handling & parse ----
     initial_parser = argparse.ArgumentParser(add_help=False)
@@ -514,6 +556,13 @@ def main():
 
         args.audio = sorted(expanded_audio)
 
+    # Prompt files are local and not version controlled, so a missing one is a
+    # normal setup mistake rather than a bug: report it like any bad argument.
+    try:
+        prompt_label, system_prompt = load_system_prompt(args.system_prompt_file)
+    except (OSError, ValueError) as e:
+        parser.error(f"--system-prompt-file could not be loaded: {e}")
+
     if args.whisper_device is None:
         args.whisper_device = "cuda" if args.mode == "gpu" else "cpu"
     if args.whisper_compute_type is None:
@@ -534,9 +583,14 @@ def main():
         )
 
     # Initialize LLM engine
+    print(f"[INFO] System prompt: {prompt_label}")
     llm_engine = OllamaEngine(
         model=args.ollama_model,
         url=args.ollama_url,
+        system_prompt=system_prompt,
+        max_tokens=args.llm_max_tokens,
+        temperature=args.llm_temperature,
+        seed=args.llm_seed,
         chunk_max_chars=args.tts_chunk_max_chars,
     )
     llm_engine.warmup()
@@ -584,6 +638,8 @@ def main():
     config_dump_path = os.path.join(run_dir, "config_used.yaml")
     with open(config_dump_path, "w", encoding="utf-8") as f:
         yaml.dump(config_to_save, f, sort_keys=False)
+
+    save_system_prompt(run_dir, prompt_label, system_prompt)
 
     fieldnames = [
         "ts_iso", "mode", "stt_engine", "tts_engine", "item", "stage", "duration_ms",
@@ -644,6 +700,7 @@ def main():
             stt_metrics = {"stt_ms": None, "user_text": None}
             llm_metrics = {
                 "llm_t0": None, "llm_ttfc_ms": None, "llm_ttft_ms": None,
+                "first_chunk_chars": None,
                 "full_assistant_text": "", "llm_chunk_count": 0,
                 "ollama_stats": None,
             }
@@ -749,6 +806,15 @@ def main():
             llm_ttfc_ms = llm_metrics.get("llm_ttfc_ms")
             if llm_ttfc_ms is not None:
                 write_timing(writer, args, item_name, "llm_ttfc", llm_ttfc_ms)
+
+            # How long the chunker spent filling the opening chunk once the model
+            # had started producing tokens. This is the slice a short opening
+            # sentence is meant to remove.
+            if llm_ttfc_ms is not None and llm_ttft_ms is not None:
+                write_timing(writer, args, item_name, "llm_first_chunk_fill",
+                             llm_ttfc_ms - llm_ttft_ms,
+                             {"first_chunk_chars": llm_metrics.get("first_chunk_chars"),
+                              "system_prompt": prompt_label})
 
             # TTS first chunk
             tts_first_chunk_ms = tts_metrics.get("tts_first_chunk_ms")

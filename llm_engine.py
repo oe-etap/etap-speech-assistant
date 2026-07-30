@@ -14,7 +14,10 @@ import requests
 # Stop sequences to prevent the model from generating synthetic multi-turn dialogue
 _DEFAULT_STOP_TOKENS = ["\nUser:", "\nHuman:", "\n---", "---", "<|end|>", "<|user|>"]
 
-_DEFAULT_SYSTEM_PROMPT = (
+# Fallback used when no prompt file is configured. Prompt variants for
+# experiments live in prompts/ instead, see load_system_prompt() in
+# mwe_assistant.py.
+DEFAULT_SYSTEM_PROMPT = (
     "You are a concise, factual but friendly voice assistant. "
     "Answer the user's question in English in 1-3 medium length sentences. "
     "Do not simulate a conversation. Do not generate follow-up questions "
@@ -68,10 +71,14 @@ class TextChunker:
         self._buffer += piece
         chunks = []
         while True:
-            chunk = self._take_chunk()
-            if chunk is None:
+            split_at = self._next_split()
+            if split_at is None:
                 break
-            chunks.append(chunk)
+            # Always consume: a split point that is never consumed would be
+            # rediscovered on every feed() and the buffer would stop advancing.
+            chunk, self._buffer = self._buffer[:split_at].strip(), self._buffer[split_at:]
+            if self._is_speakable(chunk):
+                chunks.append(chunk)
         return chunks
 
     def flush(self) -> str:
@@ -84,20 +91,16 @@ class TextChunker:
         self._buffer = ""
         return remainder if self._is_speakable(remainder) else ""
 
-    def _take_chunk(self):
-        """Pop one chunk off the buffer, or return None if none is ready yet."""
+    def _next_split(self):
+        """Return where to cut the buffer, or None if nothing is ready yet.
+
+        Every returned index is greater than zero, which is what guarantees the
+        buffer keeps shrinking.
+        """
         split_at = self._find_sentence_end()
         if split_at is None and len(self._buffer) > self._max_chars:
             split_at = self._find_word_boundary()
-        if split_at is None:
-            return None
-
-        chunk = self._buffer[:split_at].strip()
-        if len(chunk) < self._min_chars or not self._is_speakable(chunk):
-            return None
-
-        self._buffer = self._buffer[split_at:]
-        return chunk
+        return split_at
 
     @staticmethod
     def _is_speakable(text: str) -> bool:
@@ -105,7 +108,11 @@ class TextChunker:
         return any(char.isalnum() for char in text)
 
     def _find_sentence_end(self):
-        """Return the index just past the first sentence terminator, or None.
+        """Return the index just past the first usable sentence terminator, or None.
+
+        Terminators that would leave too little to pronounce are skipped rather
+        than returned, so a leading newline or a stray "." merges into the next
+        sentence instead of producing an unspeakable chunk.
 
         Splitting is deferred while the terminator is still the last character
         of the buffer and could turn out to be part of a decimal number: at that
@@ -118,7 +125,12 @@ class TextChunker:
                 continue
             if char == "." and self._may_become_decimal(i):
                 return None
-            return self._skip_closing_chars(i + 1)
+
+            end = self._skip_closing_chars(i + 1)
+            candidate = self._buffer[:end].strip()
+            if len(candidate) < self._min_chars or not self._is_speakable(candidate):
+                continue
+            return end
         return None
 
     def _is_decimal_point(self, index: int) -> bool:
@@ -151,7 +163,7 @@ class OllamaEngine:
 
     def __init__(self, model: str, url: str, system_prompt: str = None,
                  stop_tokens: list = None, max_tokens: int = 150,
-                 temperature: float = 0.7,
+                 temperature: float = 0.7, seed: int = None,
                  chunk_max_chars: int = DEFAULT_CHUNK_MAX_CHARS):
         """Initialize the Ollama engine.
 
@@ -162,14 +174,18 @@ class OllamaEngine:
             stop_tokens: Stop sequences to prevent multi-turn hallucination.
             max_tokens: Maximum number of tokens to generate.
             temperature: Sampling temperature.
+            seed: Sampling seed. Combined with temperature 0 this makes runs
+                reproducible, which is what an A/B comparison needs: response
+                length varies enough between runs to hide the effect under test.
             chunk_max_chars: Safety-net chunk length passed to TextChunker.
         """
         self._model = model
         self._url = url
-        self._system_prompt = system_prompt or _DEFAULT_SYSTEM_PROMPT
+        self._system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
         self._stop_tokens = stop_tokens if stop_tokens is not None else _DEFAULT_STOP_TOKENS
         self._max_tokens = max_tokens
         self._temperature = temperature
+        self._seed = seed
         self._chunk_max_chars = chunk_max_chars
         self._session = requests.Session()
         self._current_response = None
@@ -241,15 +257,19 @@ class OllamaEngine:
             #   - stream=True below tells requests NOT to buffer the whole body
             #     before returning. Without it, post() blocks until generation
             #     finishes and no token can reach the TTS early.
+            options = {
+                "num_predict": self._max_tokens,
+                "temperature": self._temperature,
+                "stop": self._stop_tokens,
+            }
+            if self._seed is not None:
+                options["seed"] = self._seed
+
             r = self._session.post(self._url, json={
                 "model": self._model,
                 "prompt": prompt,
                 "stream": True,
-                "options": {
-                    "num_predict": self._max_tokens,
-                    "temperature": self._temperature,
-                    "stop": self._stop_tokens,
-                }
+                "options": options,
             }, stream=True, timeout=120)
             # Assign before raise_for_status() so cancel() can close a response
             # that is still starting up.

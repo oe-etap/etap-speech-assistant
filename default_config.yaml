@@ -41,6 +41,21 @@ coqui-speaker: "Daisy Studious"
 ollama-model: "phi3:mini"
 ollama-url: "http://localhost:11434/api/generate"
 
+# System prompt variant. Variants live in prompts/ and are identified by filename.
+# The prompt actually used is copied to <out-dir>/system_prompt.txt.
+system-prompt-file: "./prompts/short-opener.txt"
+
+llm-max-tokens: 150
+
+# temperature controls how random sampling is; seed controls which random
+# sequence it follows. Response length varies enough between runs to hide the
+# effect under test, so for A/B comparisons pin one of them:
+#   llm-temperature: 0   -> greedy decoding, reproducible on its own
+#   llm-seed: <number>   -> reproducible while sampling stays natural
+# Note: `null` is YAML for "no value"; writing None would be the string "None".
+llm-temperature: 0.7
+llm-seed: null     # no seed -> sampling differs on every run
+
 # Safety-net chunk length for the LLM -> TTS handoff. Chunks are normally cut at
 # sentence boundaries; a sentence longer than this is split at a word boundary so
 # the TTS does not have to wait for the whole response.

@@ -47,6 +47,10 @@ Additional assets:
 - For Piper: an English voice, for example `en_US-lessac-medium.onnx`
 - For Coqui XTTS-v2: the model is loaded through the `TTS` package
 - For GPU stats: `nvidia-smi` must be available
+- System prompts: `prompts/*.txt`, referenced by `system-prompt-file`. These are
+  local and not version controlled, so prompt wording can be iterated on freely.
+  Without a prompt file the built-in default applies. The prompt actually used is copied to `<out-dir>/system_prompt.txt`, headed by its file name, so a
+  measurement stays identifiable.
 
 ## Examples
 

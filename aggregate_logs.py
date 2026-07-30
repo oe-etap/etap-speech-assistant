@@ -185,9 +185,9 @@ def format_summary_table(
     lines.append(divider_thin)
 
     # Preferred order of stages for clear reporting
-    known_stages = ["stt", "llm_ttft", "llm_ttfc", "tts_first_chunk",
-                    "ttfa_from_speech_end", "ttfa", "llm_eval", "tts_total",
-                    "e2e_response_ready"]
+    known_stages = ["stt", "llm_ttft", "llm_first_chunk_fill", "llm_ttfc",
+                    "tts_first_chunk", "ttfa_from_speech_end", "ttfa",
+                    "llm_eval", "tts_total", "e2e_response_ready"]
     all_stages = known_stages + [s for s in stage_latencies.keys() if s not in known_stages]
 
     for stage in all_stages:
@@ -296,9 +296,9 @@ def format_pure_tsv_table(stage_latencies: Dict[str, List[float]]) -> str:
     Format stage latency averages into a simple, pure tab-separated table string.
     """
     lines = ["Stage\tAverage_ms\tMin_ms\tMax_ms\tSamples"]
-    known_stages = ["stt", "llm_ttft", "llm_ttfc", "tts_first_chunk",
-                    "ttfa_from_speech_end", "ttfa", "llm_eval", "tts_total",
-                    "e2e_response_ready"]
+    known_stages = ["stt", "llm_ttft", "llm_first_chunk_fill", "llm_ttfc",
+                    "tts_first_chunk", "ttfa_from_speech_end", "ttfa",
+                    "llm_eval", "tts_total", "e2e_response_ready"]
     all_stages = known_stages + [s for s in stage_latencies.keys() if s not in known_stages]
 
     for stage in all_stages:
