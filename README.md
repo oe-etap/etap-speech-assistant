@@ -135,7 +135,7 @@ Each run creates `outputs/<YYYYMMDD_HHMMSS>/` containing:
 
 The CSV contains:
 
-- `stage`: `stt`, `llm`, `tts`, or `e2e_response_ready`
+- `stage`: one of `stt`, `llm_ttft`, `llm_first_chunk_fill`, `llm_ttfc`, `tts_first_chunk`, `ttfa_from_speech_end`, `ttfa`, `llm_eval`, `tts_total`, `e2e_response_ready`
 - `duration_ms`: stage duration in milliseconds
 - `cpu_percent`: average system-wide CPU load over the stage the row belongs to
 - `ram_percent`, `rss_mb`: system RAM in use and this process's resident set, read at the moment the stage finished
