@@ -49,7 +49,7 @@ Additional assets:
 - For Vosk: an English model, for example `vosk-model-small-en-us-0.15`
 - For Piper: an English voice, for example `en_US-lessac-medium.onnx`
 - For Coqui XTTS-v2: the model is loaded through the `TTS` package
-- For GPU stats: `nvidia-smi` must be available
+- For GPU stats: an NVIDIA driver, read through `nvidia-ml-py` (in both requirements files) or, failing that, an `nvidia-smi` on PATH
 - System prompts: `prompts/*.txt`, referenced by `system-prompt-file`. These are
   local and not version controlled, so prompt wording can be iterated on freely.
   Without a prompt file the built-in default applies. The prompt actually used is copied to `<out-dir>/system_prompt.txt`, headed by its file name, so a
@@ -202,7 +202,8 @@ Under `endpoint`, a second end-of-speech signal within one input carries **every
 - CPU/RAM stats require `psutil`; if unavailable, those fields stay blank.
 - Resource columns are captured by the worker that owns the stage, at the moment that stage finishes. `psutil.cpu_percent(interval=None)` reports load since its own previous call and keeps that state per thread, so each stage opens its own measurement window with a priming call when it starts.
 - A row's CPU window matches its `duration_ms` exactly for `stt`, `llm_ttft`, `llm_first_chunk_fill`, `tts_first_chunk` and `e2e_response_ready`. The rest are approximations: `llm_ttfc` is timed from the start of the request but its CPU window starts at the first token; `ttfa` reuses the `tts_first_chunk` snapshot and `stt_endpoint_delay` the `stt` one; `llm_prompt_eval` reuses the first-token snapshot, the nearest boundary to a phase that had already ended by the time Ollama reported it; `llm_eval` and `tts_total` carry the snapshot taken when their worker finished.
-- GPU stats are read from `nvidia-smi`; if unavailable or no NVIDIA GPU is present, those fields stay blank. A background sampler refreshes them every second, which keeps the subprocess off the measured path. Fields the driver reports as `[N/A]` are stored blank so the numeric columns stay numeric.
+- GPU stats come from NVML (`nvidia-ml-py`), read in process at each stage boundary like the CPU and RAM ones. Where NVML cannot be initialised the code falls back to `nvidia-smi`, refreshed by a background sampler once a second so its subprocess stays off the measured path; that reading can therefore be up to a second old. Individual fields the driver does not support are stored blank, as are all of them when neither source is usable.
+- `gpu_util_percent` is the driver's own rolling average over its internal sampling period (roughly 1/6 s to 1 s depending on the card), so it does not resolve stages shorter than that regardless of how it is read. `gpu_mem_used_mb` is a true point-in-time value.
 - `e2e_response_ready` runs from the start of processing to the complete response, in every mode. On file input it therefore includes the delivery of the audio; on a microphone it covers the whole session. It is a wall-clock span, not a latency — for latency use `ttfa`.
 - `stt_rtf` is `stt` divided by the audio duration. It expresses a real-time factor only under `fast` pacing. Under `realtime` pacing `stt` includes waiting for the audio to arrive, which puts the ratio above 1 and makes it a measure of something else.
 - Response length varies enough between runs to hide whatever is under test: `llm_eval`, `tts_total` and `e2e_response_ready` all scale with it. The default `llm-temperature: 0` removes that variance, so a run repeats exactly; raising it needs an `llm-seed` to stay reproducible. `ttfa` and `stt_endpoint_delay` are unaffected either way, as both conclude before the response length is known.

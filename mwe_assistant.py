@@ -50,17 +50,24 @@ try:
 except ImportError:
     _HAS_PSUTIL = False
 
-# Latest nvidia-smi reading, replaced wholesale by the sampler thread so that
-# readers need no lock.
+try:
+    import pynvml
+    _HAS_PYNVML = True
+except ImportError:
+    _HAS_PYNVML = False
+
 _GPU_BLANK_STATS = {
     "gpu_util_percent": "",
     "gpu_mem_used_mb": "",
     "gpu_mem_total_mb": "",
     "gpu_name": "",
 }
+
+# Latest reading of the nvidia-smi fallback, replaced wholesale by the sampler
+# thread so that readers need no lock. Unused while NVML is active.
 _gpu_stats = _GPU_BLANK_STATS
 
-# How often the GPU reading is refreshed
+# How often the nvidia-smi fallback refreshes its reading
 GPU_SAMPLE_INTERVAL_S = 1.0
 
 # How long to wait for the pipeline workers to drain before reading their metrics
@@ -157,6 +164,45 @@ def _numeric_or_blank(value):
     return value
 
 
+_nvml_handle = None
+
+
+def _nvml_value(read, default=""):
+    """Return read()'s result, or default when the driver will not supply it."""
+    try:
+        return read()
+    except Exception:
+        return default
+
+
+def _read_gpu_stats_nvml():
+    """Read the GPU counters through NVML.
+
+    NVML is an in-process library call rather than a subprocess, so this is
+    cheap enough to run at a stage boundary. Fields the driver does not
+    support are blanked individually.
+    """
+    stats = dict(_GPU_BLANK_STATS)
+    handle = _nvml_handle
+    if handle is None:
+        return stats
+
+    name = _nvml_value(lambda: pynvml.nvmlDeviceGetName(handle))
+    if isinstance(name, bytes):
+        name = name.decode("utf-8", errors="replace")
+    stats["gpu_name"] = name
+
+    stats["gpu_util_percent"] = _nvml_value(
+        lambda: pynvml.nvmlDeviceGetUtilizationRates(handle).gpu)
+
+    mem = _nvml_value(lambda: pynvml.nvmlDeviceGetMemoryInfo(handle), None)
+    if mem is not None:
+        stats["gpu_mem_used_mb"] = round(mem.used / (1024 * 1024))
+        stats["gpu_mem_total_mb"] = round(mem.total / (1024 * 1024))
+
+    return stats
+
+
 def _refresh_gpu_stats():
     """Query nvidia-smi once and publish the reading to _gpu_stats.
 
@@ -189,8 +235,9 @@ def _refresh_gpu_stats():
 class _GpuSampler(threading.Thread):
     """Background thread refreshing _gpu_stats every GPU_SAMPLE_INTERVAL_S.
 
-    Keeps the nvidia-smi subprocess off the measured pipeline: workers read the
-    published dict instead of querying nvidia-smi themselves.
+    Used only on the nvidia-smi fallback path. Keeps the subprocess off the
+    measured pipeline: workers read the published dict instead of running
+    nvidia-smi themselves.
     """
 
     def __init__(self, interval=GPU_SAMPLE_INTERVAL_S):
@@ -210,28 +257,44 @@ class _GpuSampler(threading.Thread):
 _gpu_sampler = None
 
 
-def start_gpu_sampler():
-    """Take an initial GPU reading and start the background refresh.
+def start_gpu_monitor():
+    """Begin collecting GPU statistics, preferring NVML over nvidia-smi.
 
-    Does nothing when nvidia-smi is unavailable, leaving the GPU columns blank.
+    NVML is read in process at each stage boundary. Where it is unavailable the
+    nvidia-smi fallback starts instead, kept fresh by a background thread.
+    Neither being usable leaves the GPU columns blank.
     """
-    global _gpu_sampler
-    if _gpu_sampler is not None:
+    global _nvml_handle, _gpu_sampler
+    if _nvml_handle is not None or _gpu_sampler is not None:
         return
+
+    if _HAS_PYNVML:
+        try:
+            pynvml.nvmlInit()
+            _nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            return
+        except Exception:
+            _nvml_handle = None
+
     if not _refresh_gpu_stats():
         return
     _gpu_sampler = _GpuSampler()
     _gpu_sampler.start()
 
 
-def stop_gpu_sampler():
-    """Stop the background GPU refresh."""
-    global _gpu_sampler
-    if _gpu_sampler is None:
-        return
-    _gpu_sampler.stop()
-    _gpu_sampler.join(timeout=GPU_SAMPLE_INTERVAL_S * 2)
-    _gpu_sampler = None
+def stop_gpu_monitor():
+    """Release NVML and stop the nvidia-smi fallback thread."""
+    global _nvml_handle, _gpu_sampler
+    if _nvml_handle is not None:
+        _nvml_handle = None
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+    if _gpu_sampler is not None:
+        _gpu_sampler.stop()
+        _gpu_sampler.join(timeout=GPU_SAMPLE_INTERVAL_S * 2)
+        _gpu_sampler = None
 
 
 def prime_cpu_percent():
@@ -255,8 +318,9 @@ def collect_resource_snapshot():
 
     Call at a stage boundary, from the thread that ran the stage and opened its
     window with prime_cpu_percent(); cpu_percent then covers that stage alone.
-    ram_percent and rss_mb are read directly, the GPU fields come from the
-    background sampler. Missing psutil/nvidia-smi leaves blanks.
+    ram_percent and rss_mb are read directly, the GPU fields come from NVML or,
+    where that is unavailable, from the background nvidia-smi sampler. Missing
+    psutil/NVML/nvidia-smi leaves blanks.
     """
     stats = {
         "cpu_percent": "",
@@ -273,7 +337,10 @@ def collect_resource_snapshot():
         except Exception:
             pass
 
-    stats.update(_gpu_stats)
+    if _nvml_handle is not None:
+        stats.update(_read_gpu_stats_nvml())
+    else:
+        stats.update(_gpu_stats)
     return stats
 
 
@@ -740,8 +807,8 @@ def main():
     if args.whisper_compute_type is None:
         args.whisper_compute_type = "float16" if args.whisper_device == "cuda" else "int8"
 
-    # The initial, blocking nvidia-smi read happens before any stage is timed.
-    start_gpu_sampler()
+    # Any one-off setup cost happens here, before a stage is ever timed.
+    start_gpu_monitor()
 
     # Pre-load (warmup) models so their initialization time isn't counted
     # in the latency of the first file
@@ -1142,7 +1209,7 @@ def main():
                 print("[INFO] Stop requested, skipping any remaining items.")
                 break
 
-    stop_gpu_sampler()
+    stop_gpu_monitor()
 
     print(f"\nDone. Latency/resource log appended to: {args.latency_csv}")
     return 0
