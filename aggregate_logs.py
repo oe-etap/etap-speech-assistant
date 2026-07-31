@@ -20,6 +20,26 @@ import sys
 from typing import Dict, List, Any, Tuple
 
 
+# Preferred order of stages for clear reporting
+KNOWN_STAGES = ["stt", "llm_ttft", "llm_first_chunk_fill", "llm_ttfc",
+                "tts_first_chunk", "ttfa_from_speech_end", "ttfa",
+                "llm_eval", "tts_total", "e2e_response_ready"]
+
+# Rates, each measured over the stage of the row it sits on. Averaging these
+# across stages says little, since e2e_response_ready spans all the others.
+PER_STAGE_RESOURCES = {
+    "cpu_percent": "CPU (% system)",
+    "gpu_util_percent": "GPU Util (%)",
+}
+
+# Levels that drift slowly over a run, so one pooled figure is informative.
+POOLED_RESOURCES = {
+    "ram_percent": "RAM Usage (%)",
+    "rss_mb": "RAM RSS (MB, process)",
+    "gpu_mem_used_mb": "GPU Mem Used (MB)",
+}
+
+
 def find_latest_csv_logs(outputs_dir: Path, count: int) -> List[Path]:
     """
     Find the latest X CSV log files within the outputs directory.
@@ -73,7 +93,7 @@ def parse_csv_file(file_path: Path) -> List[Dict[str, Any]]:
     return records
 
 
-def aggregate_metrics(csv_files: List[Path]) -> Tuple[Dict[str, List[float]], Dict[str, List[float]], Dict[str, List[float]], List[Dict[str, Any]]]:
+def aggregate_metrics(csv_files: List[Path]) -> Tuple[Dict[str, List[float]], Dict[str, List[float]], Dict[str, Dict[str, List[float]]], Dict[str, List[float]], List[Dict[str, Any]]]:
     """
     Aggregate metrics across multiple CSV log files.
 
@@ -81,17 +101,13 @@ def aggregate_metrics(csv_files: List[Path]) -> Tuple[Dict[str, List[float]], Di
         Tuple containing:
         - stage_latencies: dict mapping stage name to list of duration_ms values
         - resource_metrics: dict mapping metric name to list of float values
+        - stage_resources: dict mapping stage name to metric name to values
         - extra_metrics: dict mapping metric name to list of float values
         - per_run_summaries: list of summary dicts for each individual run
     """
     stage_latencies: Dict[str, List[float]] = {}
-    resource_metrics: Dict[str, List[float]] = {
-        "cpu_percent": [],
-        "ram_percent": [],
-        "rss_mb": [],
-        "gpu_util_percent": [],
-        "gpu_mem_used_mb": [],
-    }
+    resource_metrics: Dict[str, List[float]] = {k: [] for k in POOLED_RESOURCES}
+    stage_resources: Dict[str, Dict[str, List[float]]] = {}
     extra_metrics: Dict[str, List[float]] = {
         "stt_rtf": [],
         "tokens_per_sec": [],
@@ -120,13 +136,18 @@ def aggregate_metrics(csv_files: List[Path]) -> Tuple[Dict[str, List[float]], Di
 
             # Parse resource metrics. Non-numeric values, such as the '[N/A]'
             # markers nvidia-smi can emit, are skipped.
-            for res_key in resource_metrics.keys():
+            for res_key in (*POOLED_RESOURCES, *PER_STAGE_RESOURCES):
                 val_str = row.get(res_key, "").strip()
-                if val_str:
-                    try:
-                        resource_metrics[res_key].append(float(val_str))
-                    except ValueError:
-                        pass
+                if not val_str:
+                    continue
+                try:
+                    value = float(val_str)
+                except ValueError:
+                    continue
+                if res_key in POOLED_RESOURCES:
+                    resource_metrics[res_key].append(value)
+                elif stage:
+                    stage_resources.setdefault(stage, {}).setdefault(res_key, []).append(value)
 
             # Parse extra_json metrics
             extra_raw = row.get("extra_json", "").strip()
@@ -148,7 +169,7 @@ def aggregate_metrics(csv_files: List[Path]) -> Tuple[Dict[str, List[float]], Di
                 run_avg[stg] = statistics.mean(val_list)
         per_run_summaries.append(run_avg)
 
-    return stage_latencies, resource_metrics, extra_metrics, per_run_summaries
+    return stage_latencies, resource_metrics, stage_resources, extra_metrics, per_run_summaries
 
 
 def format_summary_table(
@@ -156,6 +177,7 @@ def format_summary_table(
     requested_count: int,
     stage_latencies: Dict[str, List[float]],
     resource_metrics: Dict[str, List[float]],
+    stage_resources: Dict[str, Dict[str, List[float]]],
     extra_metrics: Dict[str, List[float]],
     per_run_summaries: List[Dict[str, Any]]
 ) -> str:
@@ -185,11 +207,7 @@ def format_summary_table(
     lines.append(f"{'Stage Name':<25}\t{'Average (ms)':>14}\t{'Min (ms)':>12}\t{'Max (ms)':>12}\t{'Samples':>8}")
     lines.append(divider_thin)
 
-    # Preferred order of stages for clear reporting
-    known_stages = ["stt", "llm_ttft", "llm_first_chunk_fill", "llm_ttfc",
-                    "tts_first_chunk", "ttfa_from_speech_end", "ttfa",
-                    "llm_eval", "tts_total", "e2e_response_ready"]
-    all_stages = known_stages + [s for s in stage_latencies.keys() if s not in known_stages]
+    all_stages = KNOWN_STAGES + [s for s in stage_latencies.keys() if s not in KNOWN_STAGES]
 
     for stage in all_stages:
         values = stage_latencies.get(stage, [])
@@ -234,25 +252,48 @@ def format_summary_table(
         lines.append(divider_thick)
         lines.append("")
 
-    # 3. System Resource Metrics Table
+    # 3. Per-Stage Resource Table
+    if stage_resources:
+        lines.append("3. PER-STAGE RESOURCE USAGE")
+        lines.append(divider_thick)
+        lines.append("Each value is measured over the stage of its own row. Both figures are")
+        lines.append("machine-wide, so concurrent stages share the same load and the numbers")
+        lines.append("cannot be added up; e2e_response_ready already spans the whole item.")
+        lines.append(divider_thin)
+        lines.append(
+            f"{'Stage Name':<25}\t{'CPU avg':>10}\t{'CPU min':>10}\t{'CPU max':>10}\t{'GPU avg':>10}\t{'Samples':>8}"
+        )
+        lines.append(divider_thin)
+
+        ordered = KNOWN_STAGES + [s for s in stage_resources if s not in KNOWN_STAGES]
+        for stage in ordered:
+            metrics = stage_resources.get(stage)
+            if not metrics:
+                continue
+            cpu = metrics.get("cpu_percent", [])
+            gpu = metrics.get("gpu_util_percent", [])
+            if not cpu and not gpu:
+                continue
+            cpu_avg = f"{statistics.mean(cpu):>10.2f}" if cpu else f"{'N/A':>10}"
+            cpu_min = f"{min(cpu):>10.2f}" if cpu else f"{'N/A':>10}"
+            cpu_max = f"{max(cpu):>10.2f}" if cpu else f"{'N/A':>10}"
+            gpu_avg = f"{statistics.mean(gpu):>10.2f}" if gpu else f"{'N/A':>10}"
+            samples = len(cpu) or len(gpu)
+            lines.append(
+                f"{stage:<25}\t{cpu_avg}\t{cpu_min}\t{cpu_max}\t{gpu_avg}\t{samples:>8}"
+            )
+        lines.append(divider_thick)
+        lines.append("")
+
+    # 4. Pooled Resource Levels Table
     has_resources = any(len(v) > 0 for v in resource_metrics.values())
     if has_resources:
-        lines.append("3. SYSTEM RESOURCE USAGE")
+        lines.append("4. OVERALL RESOURCE LEVELS")
         lines.append(divider_thick)
         lines.append(f"{'Resource Metric':<25}\t{'Average':>14}\t{'Min':>12}\t{'Max':>12}\t{'Samples':>8}")
         lines.append(divider_thin)
 
-        # cpu_percent is system-wide and averaged over the row's stage, while
-        # rss_mb covers this process only; the labels spell that out.
-        resource_labels = {
-            "cpu_percent": "CPU Usage (% system)",
-            "ram_percent": "RAM Usage (%)",
-            "rss_mb": "RAM RSS (MB, process)",
-            "gpu_util_percent": "GPU Util (%)",
-            "gpu_mem_used_mb": "GPU Mem Used (MB)",
-        }
-
-        for key, label in resource_labels.items():
+        for key, label in POOLED_RESOURCES.items():
             vals = resource_metrics.get(key, [])
             if vals:
                 avg_val = statistics.mean(vals)
@@ -265,10 +306,10 @@ def format_summary_table(
         lines.append(divider_thick)
         lines.append("")
 
-    # 4. Extra Performance Metrics Table
+    # 5. Extra Performance Metrics Table
     has_extra = any(len(v) > 0 for v in extra_metrics.values())
     if has_extra:
-        lines.append("4. EXTRA METRICS (STT RTF & LLM Tokens/sec)")
+        lines.append("5. EXTRA METRICS (STT RTF & LLM Tokens/sec)")
         lines.append(divider_thick)
         lines.append(f"{'Extra Metric':<25}\t{'Average':>14}\t{'Min':>12}\t{'Max':>12}\t{'Samples':>8}")
         lines.append(divider_thin)
@@ -299,10 +340,7 @@ def format_pure_tsv_table(stage_latencies: Dict[str, List[float]]) -> str:
     Format stage latency averages into a simple, pure tab-separated table string.
     """
     lines = ["Stage\tAverage_ms\tMin_ms\tMax_ms\tSamples"]
-    known_stages = ["stt", "llm_ttft", "llm_first_chunk_fill", "llm_ttfc",
-                    "tts_first_chunk", "ttfa_from_speech_end", "ttfa",
-                    "llm_eval", "tts_total", "e2e_response_ready"]
-    all_stages = known_stages + [s for s in stage_latencies.keys() if s not in known_stages]
+    all_stages = KNOWN_STAGES + [s for s in stage_latencies.keys() if s not in KNOWN_STAGES]
 
     for stage in all_stages:
         values = stage_latencies.get(stage, [])
@@ -369,13 +407,14 @@ def main():
 
     print(f"Analyzing the last {len(csv_files)} CSV log file(s) from '{outputs_dir}'...")
 
-    stage_latencies, resource_metrics, extra_metrics, per_run_summaries = aggregate_metrics(csv_files)
+    stage_latencies, resource_metrics, stage_resources, extra_metrics, per_run_summaries = aggregate_metrics(csv_files)
 
     table_text = format_summary_table(
         csv_files=csv_files,
         requested_count=requested_count,
         stage_latencies=stage_latencies,
         resource_metrics=resource_metrics,
+        stage_resources=stage_resources,
         extra_metrics=extra_metrics,
         per_run_summaries=per_run_summaries,
     )
