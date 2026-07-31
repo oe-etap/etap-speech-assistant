@@ -50,9 +50,18 @@ try:
 except ImportError:
     _HAS_PSUTIL = False
 
-# nvidia-smi cache (timestamp, stats_dict)
-_gpu_cache = (0.0, None)
-_GPU_CACHE_TTL = 2.0
+# Latest nvidia-smi reading, replaced wholesale by the sampler thread so that
+# readers need no lock.
+_GPU_BLANK_STATS = {
+    "gpu_util_percent": "",
+    "gpu_mem_used_mb": "",
+    "gpu_mem_total_mb": "",
+    "gpu_name": "",
+}
+_gpu_stats = _GPU_BLANK_STATS
+
+# How often the GPU reading is refreshed
+GPU_SAMPLE_INTERVAL_S = 1.0
 
 # How long to wait for the pipeline workers to drain before reading their metrics
 WORKER_SHUTDOWN_TIMEOUT_S = 10.0
@@ -125,19 +134,26 @@ def wav_duration_ms(wav_path):
         return int((len(wav) / wav.samplerate) * 1000)
 
 
-def _query_gpu_stats():
-    """Query nvidia-smi with caching to avoid subprocess overhead on every call."""
-    global _gpu_cache
-    now = time.monotonic()
-    if _gpu_cache[1] is not None and (now - _gpu_cache[0]) < _GPU_CACHE_TTL:
-        return _gpu_cache[1]
+def _numeric_or_blank(value):
+    """Return the value unchanged if it parses as a number, otherwise "".
 
-    gpu_stats = {
-        "gpu_util_percent": "",
-        "gpu_mem_used_mb": "",
-        "gpu_mem_total_mb": "",
-        "gpu_name": "",
-    }
+    nvidia-smi reports fields the driver cannot supply as markers such as
+    '[N/A]' or '[Not Supported]'. Blanking them keeps the CSV column numeric.
+    """
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return ""
+    return value
+
+
+def _refresh_gpu_stats():
+    """Query nvidia-smi once and publish the reading to _gpu_stats.
+
+    Returns True on success, False if nvidia-smi is unavailable or returned
+    nothing usable.
+    """
+    global _gpu_stats
     try:
         cmd = [
             "nvidia-smi",
@@ -145,22 +161,93 @@ def _query_gpu_stats():
             "--format=csv,noheader,nounits",
         ]
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-        if result.returncode == 0 and result.stdout.strip():
-            first_gpu = result.stdout.strip().splitlines()[0]
-            name, util, mem_used, mem_total = [part.strip() for part in first_gpu.split(",", 3)]
-            gpu_stats["gpu_name"] = name
-            gpu_stats["gpu_util_percent"] = util
-            gpu_stats["gpu_mem_used_mb"] = mem_used
-            gpu_stats["gpu_mem_total_mb"] = mem_total
+        if result.returncode != 0 or not result.stdout.strip():
+            return False
+        first_gpu = result.stdout.strip().splitlines()[0]
+        name, util, mem_used, mem_total = [part.strip() for part in first_gpu.split(",", 3)]
+        _gpu_stats = {
+            "gpu_name": name,
+            "gpu_util_percent": _numeric_or_blank(util),
+            "gpu_mem_used_mb": _numeric_or_blank(mem_used),
+            "gpu_mem_total_mb": _numeric_or_blank(mem_total),
+        }
+        return True
+    except Exception:
+        return False
+
+
+class _GpuSampler(threading.Thread):
+    """Background thread refreshing _gpu_stats every GPU_SAMPLE_INTERVAL_S.
+
+    Keeps the nvidia-smi subprocess off the measured pipeline: workers read the
+    published dict instead of querying nvidia-smi themselves.
+    """
+
+    def __init__(self, interval=GPU_SAMPLE_INTERVAL_S):
+        super().__init__(daemon=True, name="gpu-sampler")
+        self._interval = interval
+        self._stop_event = threading.Event()
+
+    def run(self):
+        while not self._stop_event.wait(self._interval):
+            # A failed refresh keeps the previous reading.
+            _refresh_gpu_stats()
+
+    def stop(self):
+        self._stop_event.set()
+
+
+_gpu_sampler = None
+
+
+def start_gpu_sampler():
+    """Take an initial GPU reading and start the background refresh.
+
+    Does nothing when nvidia-smi is unavailable, leaving the GPU columns blank.
+    """
+    global _gpu_sampler
+    if _gpu_sampler is not None:
+        return
+    if not _refresh_gpu_stats():
+        return
+    _gpu_sampler = _GpuSampler()
+    _gpu_sampler.start()
+
+
+def stop_gpu_sampler():
+    """Stop the background GPU refresh."""
+    global _gpu_sampler
+    if _gpu_sampler is None:
+        return
+    _gpu_sampler.stop()
+    _gpu_sampler.join(timeout=GPU_SAMPLE_INTERVAL_S * 2)
+    _gpu_sampler = None
+
+
+def prime_cpu_percent():
+    """Open a CPU measurement window on the calling thread.
+
+    psutil.cpu_percent(interval=None) reports load since the calling thread's
+    own previous call, its state being keyed by thread id. Call this when a
+    stage starts; the snapshot taken when that stage ends then covers exactly
+    that stage.
+    """
+    if not _HAS_PSUTIL:
+        return
+    try:
+        psutil.cpu_percent(interval=None)
     except Exception:
         pass
 
-    _gpu_cache = (now, gpu_stats)
-    return gpu_stats
-
 
 def collect_resource_snapshot():
-    """Best-effort resource snapshot. Missing psutil/nvidia-smi leaves blanks."""
+    """Return the resource snapshot for the stage that has just finished.
+
+    Call at a stage boundary, from the thread that ran the stage and opened its
+    window with prime_cpu_percent(); cpu_percent then covers that stage alone.
+    ram_percent and rss_mb are read directly, the GPU fields come from the
+    background sampler. Missing psutil/nvidia-smi leaves blanks.
+    """
     stats = {
         "cpu_percent": "",
         "ram_percent": "",
@@ -176,12 +263,17 @@ def collect_resource_snapshot():
         except Exception:
             pass
 
-    stats.update(_query_gpu_stats())
+    stats.update(_gpu_stats)
     return stats
 
 
-def write_timing(writer, args, item, stage, duration_ms, extra=None):
-    stats = collect_resource_snapshot()
+def write_timing(writer, args, item, stage, duration_ms, stats=None, extra=None):
+    """Append one CSV row for a stage.
+
+    stats is the snapshot collect_resource_snapshot() took at that stage's
+    boundary; None leaves the resource columns blank.
+    """
+    stats = stats or {}
     writer.writerow({
         "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "mode": args.mode,
@@ -190,13 +282,13 @@ def write_timing(writer, args, item, stage, duration_ms, extra=None):
         "item": item,
         "stage": stage,
         "duration_ms": int(duration_ms),
-        "cpu_percent": stats["cpu_percent"],
-        "ram_percent": stats["ram_percent"],
-        "rss_mb": stats["rss_mb"],
-        "gpu_util_percent": stats["gpu_util_percent"],
-        "gpu_mem_used_mb": stats["gpu_mem_used_mb"],
-        "gpu_mem_total_mb": stats["gpu_mem_total_mb"],
-        "gpu_name": stats["gpu_name"],
+        "cpu_percent": stats.get("cpu_percent", ""),
+        "ram_percent": stats.get("ram_percent", ""),
+        "rss_mb": stats.get("rss_mb", ""),
+        "gpu_util_percent": stats.get("gpu_util_percent", ""),
+        "gpu_mem_used_mb": stats.get("gpu_mem_used_mb", ""),
+        "gpu_mem_total_mb": stats.get("gpu_mem_total_mb", ""),
+        "gpu_name": stats.get("gpu_name", ""),
         "extra_json": json.dumps(extra or {}, ensure_ascii=True),
     })
 
@@ -218,6 +310,8 @@ def stt_worker(stt_engine, audio_source, mailbox, stt_metrics, input_mode="file"
     rather than when processing begins.
     """
     try:
+        # Opens this thread's CPU window for the span reported as stt_ms.
+        prime_cpu_percent()
         t0 = time.perf_counter()
         accumulated_final = ""
 
@@ -246,6 +340,8 @@ def stt_worker(stt_engine, audio_source, mailbox, stt_metrics, input_mode="file"
         t1 = time.perf_counter()
         stt_metrics["stt_ms"] = int((t1 - t0) * 1000)
         stt_metrics["user_text"] = accumulated_final
+        # Covers the STT stage.
+        stt_metrics["stats"] = collect_resource_snapshot()
         print(f"[STT] {accumulated_final!r}")
 
     except Exception as e:
@@ -281,8 +377,14 @@ def llm_worker(llm_engine, mailbox, tts_queue, llm_metrics):
             llm_metrics["llm_ttfc_ms"] = None
             llm_metrics["llm_ttft_ms"] = None
             llm_metrics["first_chunk_chars"] = None
+            llm_metrics["ttft_stats"] = None
+            llm_metrics["ttfc_stats"] = None
+            llm_metrics["end_stats"] = None
 
             print("[LLM] Starting stream...")
+            # Opens this thread's CPU window; the wait on the mailbox that
+            # precedes the request stays outside it.
+            prime_cpu_percent()
             llm_t0 = time.perf_counter()
             llm_metrics["llm_t0"] = llm_t0
 
@@ -294,6 +396,7 @@ def llm_worker(llm_engine, mailbox, tts_queue, llm_metrics):
                 if first_token_t is not None and llm_metrics["llm_ttft_ms"] is None:
                     llm_metrics["llm_ttft_ms"] = int((first_token_t - llm_t0) * 1000)
                     llm_metrics["first_token_t"] = first_token_t
+                    llm_metrics["ttft_stats"] = collect_resource_snapshot()
 
                 if chunk_data.get("cancelled"):
                     break
@@ -316,11 +419,14 @@ def llm_worker(llm_engine, mailbox, tts_queue, llm_metrics):
                     # Length of the opening chunk shows whether the model
                     # honoured a "start with a short sentence" instruction.
                     llm_metrics["first_chunk_chars"] = len(chunk)
+                    llm_metrics["ttfc_stats"] = collect_resource_snapshot()
 
                 print(f"[LLM Chunk {llm_metrics['llm_chunk_count']}] {chunk}")
                 llm_metrics["full_assistant_text"] += chunk + " "
 
                 tts_queue.put({"type": "text", "text": chunk})
+
+            llm_metrics["end_stats"] = collect_resource_snapshot()
 
             # Let the TTS close this response's WAV before the next one starts
             tts_queue.put({"type": "end_of_response"})
@@ -415,12 +521,18 @@ def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics, playback=False):
                 # Reset metrics so they reflect only the answer that survives
                 tts_metrics["tts_first_chunk_ms"] = None
                 tts_metrics["tts_first_chunk_t"] = None
+                tts_metrics["first_chunk_stats"] = None
                 tts_metrics["total_tts_time"] = 0.0
                 continue
 
             text = msg.get("text", "")
             if not text:
                 continue
+
+            if tts_metrics["tts_first_chunk_ms"] is None:
+                # Opens this thread's CPU window so it covers the first
+                # synthesis alone; later chunks extend it towards end_stats.
+                prime_cpu_percent()
 
             tts_t0 = time.perf_counter()
             pcm_bytes, sample_rate = tts_engine.synthesize(text)
@@ -432,6 +544,7 @@ def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics, playback=False):
                     (tts_t1 - tts_t0) * 1000
                 )
                 tts_metrics["tts_first_chunk_t"] = tts_t1
+                tts_metrics["first_chunk_stats"] = collect_resource_snapshot()
 
             if wav_file is None:
                 wav_file = wave.open(response_wav_path(out_wav, response_index), "wb")
@@ -450,6 +563,8 @@ def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics, playback=False):
         print(f"[TTS] Error: {e}")
         tts_metrics["error"] = str(e)
     finally:
+        # Taken before the WAV is closed, so it covers synthesis not teardown.
+        tts_metrics["end_stats"] = collect_resource_snapshot()
         close_response()
         if stream:
             try:
@@ -567,6 +682,9 @@ def main():
         args.whisper_device = "cuda" if args.mode == "gpu" else "cpu"
     if args.whisper_compute_type is None:
         args.whisper_compute_type = "float16" if args.whisper_device == "cuda" else "int8"
+
+    # The initial, blocking nvidia-smi read happens before any stage is timed.
+    start_gpu_sampler()
 
     # Pre-load (warmup) models so their initialization time isn't counted
     # in the latency of the first file
@@ -696,23 +814,29 @@ def main():
 
             out_wav = os.path.join(run_dir, f"assistant_{item_index}_{item_name}.wav")
 
-            # Shared metrics dicts (single-writer per dict = thread-safe)
-            stt_metrics = {"stt_ms": None, "user_text": None}
+            # Shared metrics dicts (single-writer per dict = thread-safe).
+            # The *_stats entries hold the snapshot taken at that milestone.
+            stt_metrics = {"stt_ms": None, "user_text": None, "stats": None}
             llm_metrics = {
                 "llm_t0": None, "llm_ttfc_ms": None, "llm_ttft_ms": None,
                 "first_chunk_chars": None,
                 "full_assistant_text": "", "llm_chunk_count": 0,
                 "ollama_stats": None,
+                "ttft_stats": None, "ttfc_stats": None, "end_stats": None,
             }
             tts_metrics = {
                 "tts_first_chunk_ms": None, "tts_first_chunk_t": None,
                 "total_tts_time": 0.0,
+                "first_chunk_stats": None, "end_stats": None,
             }
 
             # STT hands over utterances through a single-slot mailbox (only the
             # newest one matters); TTS chunks are a FIFO, so they stay a queue.
             mailbox = UtteranceMailbox()
             tts_queue = queue.Queue()
+
+            # Opens the main thread's window, which spans the whole item.
+            prime_cpu_percent()
 
             e2e_t0 = time.perf_counter()
 
@@ -776,9 +900,12 @@ def main():
                           f"{WORKER_SHUTDOWN_TIMEOUT_S}s.")
 
             # -------- Collect metrics and write to CSV --------
+            # Covers the item as a whole rather than a single stage.
+            e2e_stats = collect_resource_snapshot()
+
             if args.input_mode == "mic":
                 e2e_t0 = stt_metrics.get("last_speech_t", e2e_t0)
-                
+
             user_text = stt_metrics.get("user_text") or ""
             stt_ms = stt_metrics.get("stt_ms") or 0
             # Read after the workers finish: a mic source only knows how much
@@ -787,12 +914,14 @@ def main():
 
             stt_rtf = round(stt_ms / input_duration_ms, 3) if input_duration_ms > 0 else 0.0
             write_timing(writer, args, item_name, "stt", stt_ms,
+                         stt_metrics.get("stats"),
                          {"input_duration_ms": input_duration_ms, "stt_rtf": stt_rtf})
 
             if not user_text:
                 print("[Warn] No text recognized. Skipping to next file.")
                 write_timing(writer, args, item_name, "e2e_response_ready",
                              int((time.perf_counter() - e2e_t0) * 1000),
+                             e2e_stats,
                              {"input_duration_ms": input_duration_ms, "skipped": True})
                 fcsv.flush()
                 continue
@@ -801,31 +930,39 @@ def main():
             # These differ by the time the chunker spends filling a chunk.
             llm_ttft_ms = llm_metrics.get("llm_ttft_ms")
             if llm_ttft_ms is not None:
-                write_timing(writer, args, item_name, "llm_ttft", llm_ttft_ms)
+                write_timing(writer, args, item_name, "llm_ttft", llm_ttft_ms,
+                             llm_metrics.get("ttft_stats"))
 
             llm_ttfc_ms = llm_metrics.get("llm_ttfc_ms")
             if llm_ttfc_ms is not None:
-                write_timing(writer, args, item_name, "llm_ttfc", llm_ttfc_ms)
+                write_timing(writer, args, item_name, "llm_ttfc", llm_ttfc_ms,
+                             llm_metrics.get("ttfc_stats"))
 
             # How long the chunker spent filling the opening chunk once the model
             # had started producing tokens. This is the slice a short opening
             # sentence is meant to remove.
+            # The ttfc snapshot's CPU window is exactly this interval.
             if llm_ttfc_ms is not None and llm_ttft_ms is not None:
                 write_timing(writer, args, item_name, "llm_first_chunk_fill",
                              llm_ttfc_ms - llm_ttft_ms,
+                             llm_metrics.get("ttfc_stats"),
                              {"first_chunk_chars": llm_metrics.get("first_chunk_chars"),
                               "system_prompt": prompt_label})
 
             # TTS first chunk
             tts_first_chunk_ms = tts_metrics.get("tts_first_chunk_ms")
             if tts_first_chunk_ms is not None:
-                write_timing(writer, args, item_name, "tts_first_chunk", tts_first_chunk_ms)
+                write_timing(writer, args, item_name, "tts_first_chunk", tts_first_chunk_ms,
+                             tts_metrics.get("first_chunk_stats"))
 
             # TTFA (wall-clock time from start of processing to first audio ready)
             tts_first_t = tts_metrics.get("tts_first_chunk_t")
             if tts_first_t is not None:
                 ttfa_ms = int((tts_first_t - e2e_t0) * 1000)
-                write_timing(writer, args, item_name, "ttfa", ttfa_ms)
+                # Both TTFA rows end at the same instant as tts_first_chunk and
+                # share its snapshot.
+                write_timing(writer, args, item_name, "ttfa", ttfa_ms,
+                             tts_metrics.get("first_chunk_stats"))
 
                 # TTFA anchored at the end of the speech, which is what a user
                 # actually perceives. Only meaningful with realtime pacing; with
@@ -834,6 +971,7 @@ def main():
                 if speech_end_t is not None:
                     write_timing(writer, args, item_name, "ttfa_from_speech_end",
                                  int((tts_first_t - speech_end_t) * 1000),
+                                 tts_metrics.get("first_chunk_stats"),
                                  {"audio_pacing": args.audio_pacing})
 
             # LLM server-side evaluation metrics (ground truth from Ollama)
@@ -842,17 +980,19 @@ def main():
                 eval_dur_ns = ollama_stats.get("eval_duration_ns", 0)
                 eval_count = ollama_stats.get("eval_count", 0)
                 tokens_per_sec = round(eval_count / (eval_dur_ns / 1e9), 1) if eval_dur_ns > 0 else 0.0
-                write_timing(writer, args, item_name, "llm_eval", int(eval_dur_ns / 1e6), {
-                    "eval_tokens": eval_count,
-                    "tokens_per_sec": tokens_per_sec,
-                    "prompt_tokens": ollama_stats.get("prompt_eval_count", 0),
-                    "prompt_eval_ms": int(ollama_stats.get("prompt_eval_duration_ns", 0) / 1e6),
-                    "total_duration_ms": int(ollama_stats.get("total_duration_ns", 0) / 1e6),
-                })
+                write_timing(writer, args, item_name, "llm_eval", int(eval_dur_ns / 1e6),
+                             llm_metrics.get("end_stats"),
+                             {"eval_tokens": eval_count,
+                              "tokens_per_sec": tokens_per_sec,
+                              "prompt_tokens": ollama_stats.get("prompt_eval_count", 0),
+                              "prompt_eval_ms": int(ollama_stats.get("prompt_eval_duration_ns", 0) / 1e6),
+                              "total_duration_ms": int(ollama_stats.get("total_duration_ns", 0) / 1e6)})
 
-            # Log total TTS time
+            # Log total TTS time. A response that synthesized nothing left this
+            # worker's CPU window unopened, so its snapshot would read 0.0.
             write_timing(writer, args, item_name, "tts_total",
-                         int(tts_metrics["total_tts_time"] * 1000))
+                         int(tts_metrics["total_tts_time"] * 1000),
+                         tts_metrics.get("end_stats") if tts_metrics["total_tts_time"] > 0 else None)
 
             # Output audio duration and E2E summary. A mic session answers more
             # than once, so the reported duration covers every response WAV.
@@ -862,6 +1002,7 @@ def main():
 
             write_timing(writer, args, item_name, "e2e_response_ready",
                          int((time.perf_counter() - e2e_t0) * 1000),
+                         e2e_stats,
                          {"input_duration_ms": input_duration_ms,
                           "output_duration_ms": output_duration_ms,
                           "output_wav": response_wavs[0] if response_wavs else "",
@@ -903,6 +1044,8 @@ def main():
             if shutdown_event.is_set():
                 print("[INFO] Stop requested, skipping any remaining items.")
                 break
+
+    stop_gpu_sampler()
 
     print(f"\nDone. Latency/resource log appended to: {args.latency_csv}")
     return 0

@@ -118,7 +118,8 @@ def aggregate_metrics(csv_files: List[Path]) -> Tuple[Dict[str, List[float]], Di
                 except ValueError:
                     pass
 
-            # Parse resource metrics
+            # Parse resource metrics. Non-numeric values, such as the '[N/A]'
+            # markers nvidia-smi can emit, are skipped.
             for res_key in resource_metrics.keys():
                 val_str = row.get(res_key, "").strip()
                 if val_str:
@@ -241,10 +242,12 @@ def format_summary_table(
         lines.append(f"{'Resource Metric':<25}\t{'Average':>14}\t{'Min':>12}\t{'Max':>12}\t{'Samples':>8}")
         lines.append(divider_thin)
 
+        # cpu_percent is system-wide and averaged over the row's stage, while
+        # rss_mb covers this process only; the labels spell that out.
         resource_labels = {
-            "cpu_percent": "CPU Usage (%)",
+            "cpu_percent": "CPU Usage (% system)",
             "ram_percent": "RAM Usage (%)",
-            "rss_mb": "RAM RSS (MB)",
+            "rss_mb": "RAM RSS (MB, process)",
             "gpu_util_percent": "GPU Util (%)",
             "gpu_mem_used_mb": "GPU Mem Used (MB)",
         }
