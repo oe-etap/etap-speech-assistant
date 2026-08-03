@@ -39,11 +39,18 @@ PACING_FAST = "fast"
 class AudioSource(ABC):
     """Base class for producers of 16-bit mono 16 kHz PCM chunks."""
 
+    #: Whether one second of stream time takes one second of wall-clock time.
+    #: Only then can an offset within the audio be converted to a timestamp,
+    #: which is what the speech-end anchored metrics need.
+    wall_clock_aligned = True
+
     def __init__(self, chunk_ms: int = DEFAULT_CHUNK_MS, stop_event=None):
         self.chunk_ms = chunk_ms
         self.duration_ms = 0
         # perf_counter timestamp of the most recently delivered chunk
         self.last_chunk_t = None
+        # perf_counter timestamp of stream position 0, set when delivery starts
+        self.stream_start_t = None
         # A never-set event keeps the delivery loops uniform when no stop
         # signal was supplied by the caller.
         self._stop_event = stop_event if stop_event is not None else threading.Event()
@@ -57,15 +64,24 @@ class AudioSource(ABC):
         """Yield raw PCM chunks until the audio ends or the source is stopped."""
         ...
 
-    def speech_end_t(self):
-        """Return a perf_counter estimate of when the speech ended.
+    def speech_end_t(self, speech_end_s):
+        """Convert an offset within the audio into a perf_counter timestamp.
 
-        This is the anchor for the TTFA metric that matters to a user: latency is
-        perceived from the moment they stop talking, not from the moment
-        processing starts. The last delivered chunk is the best available proxy
-        in both file and microphone mode.
+        speech_end_s comes from the STT engine and marks where the speaker
+        stopped. That instant is the anchor for TTFA: latency is perceived from
+        the moment the user stops talking, not from the moment processing starts
+        and not from the moment the engine gets around to finalizing.
+
+        Returns None when the conversion would be meaningless: when the engine
+        reported no word timings, before delivery started, or under a pacing
+        that does not advance the audio at wall-clock speed. Callers leave the
+        dependent metrics blank rather than substituting a different quantity.
         """
-        return self.last_chunk_t
+        if speech_end_s is None or self.stream_start_t is None:
+            return None
+        if not self.wall_clock_aligned:
+            return None
+        return self.stream_start_t + speech_end_s
 
 
 class FileAudioSource(AudioSource):
@@ -101,9 +117,15 @@ class FileAudioSource(AudioSource):
                 )
             self.duration_ms = int(wf.getnframes() / wf.getframerate() * 1000)
 
+    @property
+    def wall_clock_aligned(self) -> bool:
+        """Only realtime pacing keeps stream time and wall-clock time in step."""
+        return self._pacing == PACING_REALTIME
+
     def chunks(self) -> Iterator[bytes]:
         with wave.open(self._path, "rb") as wf:
             start_t = time.perf_counter()
+            self.stream_start_t = start_t
             frames_read = 0
             while not self._stop_event.is_set():
                 data = wf.readframes(self.frames_per_chunk)
@@ -176,6 +198,13 @@ class MicAudioSource(AudioSource):
                         data = pending.get(timeout=0.5)
                     except queue.Empty:
                         continue
+                    if self.stream_start_t is None:
+                        # Stream position 0 is the start of the first block, not
+                        # the moment the device opened: the STT engine times its
+                        # words from the audio it was given.
+                        self.stream_start_t = time.perf_counter() - (
+                            len(data) / SAMPLE_WIDTH / SAMPLE_RATE
+                        )
                     if save_file:
                         save_file.writeframes(data)
                     self.duration_ms += int(

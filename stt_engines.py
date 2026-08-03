@@ -40,6 +40,13 @@ class BaseSTTEngine(ABC):
             - "is_final" (bool): True if this is a finalized recognition result,
                                   False for partial/intermediate results.
             - "text" (str): The recognized text.
+            - "speech_end_s" (float, final results only): offset in seconds from
+              the start of the stream to the end of the last recognized word.
+              This is where the speaker actually stopped, which is earlier than
+              the point the engine finalizes: an endpointer has to observe
+              trailing silence first, and a file may carry silence past its last
+              word. Omitted or None when the engine cannot report it, which
+              leaves the metrics anchored on it blank rather than guessed.
         """
         ...
 
@@ -55,24 +62,44 @@ class VoskEngine(BaseSTTEngine):
 
         A fresh KaldiRecognizer is created per call, so no explicit reset is
         needed between utterances or files.
+
+        AcceptWaveform returning True is Vosk's endpointer firing: it has seen
+        enough trailing silence to call the utterance over. That happens mid
+        stream and is what drives turn-taking on a live microphone.
         """
         rec = KaldiRecognizer(self._model, SAMPLE_RATE)
         rec.SetWords(True)
 
         for data in chunks:
             if rec.AcceptWaveform(data):
-                text = json.loads(rec.Result()).get("text", "")
-                if text:
-                    yield {"is_final": True, "text": text}
+                result = json.loads(rec.Result())
+                if result.get("text"):
+                    yield self._final(result)
             else:
                 text = json.loads(rec.PartialResult()).get("partial", "")
                 if text:
                     yield {"is_final": False, "text": text}
 
-        # Flush any remaining text from the recognizer
-        text = json.loads(rec.FinalResult()).get("text", "")
-        if text:
-            yield {"is_final": True, "text": text}
+        # Flush any remaining text from the recognizer. Reached when the stream
+        # ends before the endpointer fires, which only happens on file input.
+        result = json.loads(rec.FinalResult())
+        if result.get("text"):
+            yield self._final(result)
+
+    @staticmethod
+    def _final(result: dict) -> dict:
+        """Build a final result, carrying the word-level end time if present.
+
+        SetWords(True) puts a per-word list in "result", each entry timed in
+        seconds from the start of the stream. The last word's end is the moment
+        the speaker stopped.
+        """
+        words = result.get("result") or []
+        return {
+            "is_final": True,
+            "text": result["text"],
+            "speech_end_s": words[-1].get("end") if words else None,
+        }
 
 
 class WhisperEngine(BaseSTTEngine):
@@ -91,13 +118,23 @@ class WhisperEngine(BaseSTTEngine):
         self._model = WhisperModel(model_name, device=device, compute_type=compute_type)
 
     def transcribe_stream(self, chunks: Iterable[bytes]) -> Iterator[dict]:
-        """Buffer the whole stream, then yield a single final result."""
+        """Buffer the whole stream, then yield a single final result.
+
+        Having no endpointer, this engine cannot tell that an utterance is over
+        until the stream itself ends, so it never yields mid-stream. The segment
+        timestamps still locate the end of the speech within the audio.
+        """
         pcm = b"".join(chunks)
         if not pcm:
             return
 
         audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
         segments, _ = self._model.transcribe(audio, language="en")
+        segments = list(segments)
         text = " ".join(s.text.strip() for s in segments).strip()
         if text:
-            yield {"is_final": True, "text": text}
+            yield {
+                "is_final": True,
+                "text": text,
+                "speech_end_s": segments[-1].end if segments else None,
+            }
