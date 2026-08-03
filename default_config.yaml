@@ -14,9 +14,13 @@ input-mode: file  # 'file' or 'mic'
 
 # How input files are fed to the STT engine.
 #   realtime: simulate a microphone at 1x speed, so STT overlaps with the speech.
-#             Required for TTFA numbers that reflect a live deployment.
+#             Required for ttfa and stt_endpoint_delay, which are blank without
+#             it: only here does a point inside the audio map to an instant.
+#             Input files need ~1.2-1.5 s of silence after the last word, or the
+#             endpointer never fires and the run measures a path live input
+#             never takes. A warning is printed when there is too little.
 #   fast:     read as quickly as possible (original batch behaviour), kept for
-#             comparability with earlier measurements.
+#             comparability with earlier measurements and for throughput.
 audio-pacing: fast
 audio-chunk-ms: 250
 playback: false   # Play TTS output on speakers

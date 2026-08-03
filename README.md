@@ -135,20 +135,42 @@ Each run creates `outputs/<YYYYMMDD_HHMMSS>/` containing:
 
 The CSV contains:
 
-- `stage`: one of `stt`, `llm_ttft`, `llm_first_chunk_fill`, `llm_ttfc`, `tts_first_chunk`, `ttfa_from_speech_end`, `ttfa`, `llm_eval`, `tts_total`, `e2e_response_ready`
+- `stage`: one of `stt`, `stt_endpoint_delay`, `llm_ttft`, `llm_first_chunk_fill`, `llm_ttfc`, `tts_first_chunk`, `ttfa`, `llm_eval`, `tts_total`, `e2e_response_ready`
 - `duration_ms`: stage duration in milliseconds
+- `input_mode`, `audio_pacing`: how the audio reached the pipeline. Which stages carry a value depends on these, so runs that differ in them must not be pooled.
 - `cpu_percent`: average system-wide CPU load over the stage the row belongs to
 - `ram_percent`, `rss_mb`: system RAM in use and this process's resident set, read at the moment the stage finished
 - `gpu_util_percent`, `gpu_mem_used_mb`, `gpu_mem_total_mb`, `gpu_name`
 - `extra_json`: additional metadata, including input duration and output path where relevant
 
+### TTFA and the end of speech
+
+`ttfa` is the headline latency figure: from the moment the speaker stopped to the first audio out. Everything hangs on locating that moment, which is neither the end of the file nor the point the STT finalizes:
+
+- A recording carries silence past its last word.
+- An endpointer has to hear that silence before it can decide the utterance is over, so a microphone keeps delivering audio the whole time it deliberates.
+
+The anchor therefore comes from the STT's own word timings, which both engines report. `extra_json` on the `stt` row carries `trailing_silence_ms`, the gap between the last word and the end of the audio.
+
+`stt_endpoint_delay` measures from the end of speech to the finished transcript. On file input that is the flush once the stream ends; on a microphone it is the endpointer waiting out the silence, which is usually the largest single component of what a user perceives.
+
+Both stages are **blank under `fast` pacing**: the audio does not advance at wall-clock speed there, so no offset within it corresponds to an instant. Use `realtime` for any latency claim; `fast` remains useful for throughput and for the per-stage costs (`stt`, `llm_ttfc`, `tts_first_chunk`, `e2e_response_ready`), which stay valid.
+
+### Trailing silence in input files
+
+For `realtime` pacing to stand in for a microphone, input files need enough silence after the last word for the endpointer to fire — measured at roughly 1100 ms with `vosk-model-small-en-us-0.15`. Below that the engine only finalizes because the file ran out, a signal live input never gets, and the run reports an optimistic TTFA. A warning is printed when this happens.
+
+Aim for about 1.2–1.5 s of trailing silence, and no more. File mode currently hands the transcript to the LLM once the whole file has been read, not when the endpointer fires, so any silence beyond the endpoint is added to `ttfa` in full. `stt_endpoint_delay` is unaffected and stays around 1100 ms however long the tail runs.
+
 ## Notes
 
 - CPU/RAM stats require `psutil`; if unavailable, those fields stay blank.
 - Resource columns are captured by the worker that owns the stage, at the moment that stage finishes. `psutil.cpu_percent(interval=None)` reports load since its own previous call and keeps that state per thread, so each stage opens its own measurement window with a priming call when it starts.
-- A row's CPU window matches its `duration_ms` exactly for `stt`, `llm_ttft`, `llm_first_chunk_fill`, `tts_first_chunk` and `e2e_response_ready`. The rest are approximations: `llm_ttfc` is timed from the start of the request but its CPU window starts at the first token; `ttfa` and `ttfa_from_speech_end` reuse the `tts_first_chunk` snapshot; `llm_eval` and `tts_total` carry the snapshot taken when their worker finished.
+- A row's CPU window matches its `duration_ms` exactly for `stt`, `llm_ttft`, `llm_first_chunk_fill`, `tts_first_chunk` and `e2e_response_ready`. The rest are approximations: `llm_ttfc` is timed from the start of the request but its CPU window starts at the first token; `ttfa` reuses the `tts_first_chunk` snapshot and `stt_endpoint_delay` the `stt` one; `llm_eval` and `tts_total` carry the snapshot taken when their worker finished.
 - GPU stats are read from `nvidia-smi`; if unavailable or no NVIDIA GPU is present, those fields stay blank. A background sampler refreshes them every second, which keeps the subprocess off the measured path. Fields the driver reports as `[N/A]` are stored blank so the numeric columns stay numeric.
-- The end-to-end metric is measured in batch mode after the full input audio file is available, so it represents processing latency from input-audio end to response-audio readiness.
+- `e2e_response_ready` runs from the start of processing to the complete response, in every mode. On file input it therefore includes the delivery of the audio; on a microphone it covers the whole session. It is a wall-clock span, not a latency — for latency use `ttfa`.
+- `stt_rtf` is `stt` divided by the audio duration. Under `realtime` pacing `stt` includes waiting for the audio to arrive, so the ratio exceeds 1 and no longer expresses a real-time factor. Only the `fast` figures do.
+- Response length varies enough between runs to hide the effect under test: `llm_eval`, `tts_total` and `e2e_response_ready` scale with it. Pin `llm-temperature: 0` or an `llm-seed` before comparing configurations. `ttfa` and `stt_endpoint_delay` are unaffected, as both conclude before the response length is known.
 
 
 # Metric Descriptions
