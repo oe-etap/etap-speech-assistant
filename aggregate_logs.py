@@ -21,9 +21,14 @@ from typing import Dict, List, Any, Tuple
 
 
 # Preferred order of stages for clear reporting
-KNOWN_STAGES = ["stt", "llm_ttft", "llm_first_chunk_fill", "llm_ttfc",
-                "tts_first_chunk", "ttfa_from_speech_end", "ttfa",
+KNOWN_STAGES = ["stt", "stt_endpoint_delay", "llm_ttft", "llm_first_chunk_fill",
+                "llm_ttfc", "tts_first_chunk", "ttfa",
                 "llm_eval", "tts_total", "e2e_response_ready"]
+
+# Columns whose value decides how a row is to be read. Runs that disagree on
+# them are not the same experiment, and averaging over the difference produces
+# a number describing nothing.
+RUN_CONTEXT_COLUMNS = ["input_mode", "audio_pacing", "stt_engine", "tts_engine", "mode"]
 
 # Rates, each measured over the stage of the row it sits on. Averaging these
 # across stages says little, since e2e_response_ready spans all the others.
@@ -172,6 +177,53 @@ def aggregate_metrics(csv_files: List[Path]) -> Tuple[Dict[str, List[float]], Di
     return stage_latencies, resource_metrics, stage_resources, extra_metrics, per_run_summaries
 
 
+def collect_run_context(csv_files: List[Path]) -> Dict[str, List[str]]:
+    """Return the distinct value each context column takes across the runs.
+
+    More than one value in a column means the selected runs are not a single
+    experiment. Older logs predate these columns and report as "(unset)".
+    """
+    seen: Dict[str, set] = {col: set() for col in RUN_CONTEXT_COLUMNS}
+    for file_path in csv_files:
+        for row in parse_csv_file(file_path):
+            for col in RUN_CONTEXT_COLUMNS:
+                value = (row.get(col) or "").strip()
+                seen[col].add(value or "(unset)")
+    return {col: sorted(values) for col, values in seen.items() if values}
+
+
+def warn_on_mixed_context(context: Dict[str, List[str]]) -> List[str]:
+    """Report context columns that disagree across the selected runs.
+
+    Also flags logs written before input_mode/audio_pacing existed. Those
+    predate the TTFA re-anchoring too, so their 'ttfa' column holds the older
+    quantity, measured from the start of processing, and is not comparable
+    with anything this version produces.
+    """
+    warning = []
+
+    mixed = {col: values for col, values in context.items() if len(values) > 1}
+    if mixed:
+        warning += ["!" * 90,
+                    "WARNING: these runs are not the same experiment. Averaging over them",
+                    "produces numbers that describe no actual configuration:"]
+        warning += [f"  {col}: {', '.join(values)}" for col, values in mixed.items()]
+        warning.append("Narrow the selection with --outputs-dir, or lower --log-count.")
+        warning.append("!" * 90)
+
+    if "(unset)" in context.get("input_mode", []):
+        warning += ["!" * 90,
+                    "WARNING: some runs predate the input_mode/audio_pacing columns. Their",
+                    "'ttfa' was measured from the start of processing and therefore includes",
+                    "however long the speaker talked. It is not the speech-end anchored TTFA",
+                    "reported here, and the two must not be pooled. Re-run to compare.",
+                    "!" * 90]
+
+    for line in warning:
+        print(line, file=sys.stderr)
+    return [""] + warning if warning else []
+
+
 def format_summary_table(
     csv_files: List[Path],
     requested_count: int,
@@ -179,7 +231,8 @@ def format_summary_table(
     resource_metrics: Dict[str, List[float]],
     stage_resources: Dict[str, Dict[str, List[float]]],
     extra_metrics: Dict[str, List[float]],
-    per_run_summaries: List[Dict[str, Any]]
+    per_run_summaries: List[Dict[str, Any]],
+    context: Dict[str, List[str]]
 ) -> str:
     """
     Format aggregated metrics into an aesthetic, Notepad-friendly tab-separated table text string.
@@ -194,6 +247,13 @@ def format_summary_table(
     lines.append(f"Generated On         : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"Requested Log Count  : {requested_count}")
     lines.append(f"Analyzed Log Count   : {len(csv_files)}")
+    lines.append("")
+    lines.append("Configuration:")
+    for col in RUN_CONTEXT_COLUMNS:
+        values = context.get(col)
+        if values:
+            lines.append(f"  {col:<14}: {', '.join(values)}")
+    lines.extend(warn_on_mixed_context(context))
     lines.append("")
     lines.append("Included Log Files:")
     for idx, path in enumerate(csv_files, 1):
@@ -229,27 +289,28 @@ def format_summary_table(
     if per_run_summaries:
         lines.append("2. PER-RUN BREAKDOWN (Averages per run in ms)")
         lines.append(divider_thick)
-        run_headers = f"{'Run Directory':<25}\t{'stt (ms)':>12}\t{'llm_ttfc':>12}\t{'ttfa (ms)':>12}\t{'e2e_ready':>12}"
+        run_headers = (f"{'Run Directory':<25}\t{'stt (ms)':>12}\t{'endpoint':>12}"
+                       f"\t{'llm_ttfc':>12}\t{'TTFA (ms)':>12}\t{'e2e_ready':>12}")
         lines.append(run_headers)
         lines.append(divider_thin)
 
+        summary_stages = ["stt", "stt_endpoint_delay", "llm_ttfc", "ttfa",
+                          "e2e_response_ready"]
+
+        def cell(source, stage):
+            return f"{source[stage]:>12.2f}" if source.get(stage) else f"{'N/A':>12}"
+
         for run in per_run_summaries:
-            folder_name = run["folder"]
-            stt_str = f"{run.get('stt', 0.0):>12.2f}" if "stt" in run else f"{'N/A':>12}"
-            ttfc_str = f"{run.get('llm_ttfc', 0.0):>12.2f}" if "llm_ttfc" in run else f"{'N/A':>12}"
-            ttfa_str = f"{run.get('ttfa', 0.0):>12.2f}" if "ttfa" in run else f"{'N/A':>12}"
-            e2e_str = f"{run.get('e2e_response_ready', 0.0):>12.2f}" if "e2e_response_ready" in run else f"{'N/A':>12}"
-            lines.append(f"{folder_name:<25}\t{stt_str}\t{ttfc_str}\t{ttfa_str}\t{e2e_str}")
+            cells = "\t".join(cell(run, s) for s in summary_stages)
+            lines.append(f"{run['folder']:<25}\t{cells}")
 
         lines.append(divider_thin)
-        # Add Overall Average Row
-        overall_stt = f"{statistics.mean(stage_latencies['stt']):>12.2f}" if "stt" in stage_latencies and stage_latencies["stt"] else f"{'N/A':>12}"
-        overall_ttfc = f"{statistics.mean(stage_latencies['llm_ttfc']):>12.2f}" if "llm_ttfc" in stage_latencies and stage_latencies["llm_ttfc"] else f"{'N/A':>12}"
-        overall_ttfa = f"{statistics.mean(stage_latencies['ttfa']):>12.2f}" if "ttfa" in stage_latencies and stage_latencies["ttfa"] else f"{'N/A':>12}"
-        overall_e2e = f"{statistics.mean(stage_latencies['e2e_response_ready']):>12.2f}" if "e2e_response_ready" in stage_latencies and stage_latencies["e2e_response_ready"] else f"{'N/A':>12}"
-        
-        lines.append(f"{'OVERALL AVERAGE':<25}\t{overall_stt}\t{overall_ttfc}\t{overall_ttfa}\t{overall_e2e}")
+        overall = {s: statistics.mean(v) for s, v in stage_latencies.items() if v}
+        cells = "\t".join(cell(overall, s) for s in summary_stages)
+        lines.append(f"{'OVERALL AVERAGE':<25}\t{cells}")
         lines.append(divider_thick)
+        lines.append("TTFA is measured from the end of the speech. It is blank under 'fast'")
+        lines.append("pacing, where no point inside the audio maps to a wall-clock instant.")
         lines.append("")
 
     # 3. Per-Stage Resource Table
@@ -417,6 +478,7 @@ def main():
         stage_resources=stage_resources,
         extra_metrics=extra_metrics,
         per_run_summaries=per_run_summaries,
+        context=collect_run_context(csv_files),
     )
 
     tsv_text = format_pure_tsv_table(stage_latencies)
