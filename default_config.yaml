@@ -22,6 +22,16 @@ input-mode: file  # 'file' or 'mic'
 #   fast:     read as quickly as possible (original batch behaviour), kept for
 #             comparability with earlier measurements and for throughput.
 audio-pacing: fast
+
+# What starts the LLM under file input with realtime pacing.
+#   endpoint:    answer as soon as the STT calls the utterance over, which is
+#                the only thing a microphone can do. Silence past the endpoint
+#                costs nothing, so the trailing-silence upper bound drops away.
+#   end-of-file: wait for the whole file. Any silence beyond the endpoint is
+#                added to the latency in full.
+# Ignored under 'fast' pacing and in mic mode. No effect with Whisper, which
+# has no endpointer and finalizes only when the stream ends.
+file-realtime-trigger: end-of-file
 audio-chunk-ms: 250
 playback: false   # Play TTS output on speakers
 idle-timeout: 10.0 # Shutdown after N seconds of silence

@@ -72,6 +72,10 @@ WORKER_SHUTDOWN_TIMEOUT_S = 10.0
 # endpointer, so their latency figures do not carry over to live input.
 MIN_TRAILING_SILENCE_MS = 1200
 
+# What hands an utterance to the LLM.
+TRIGGER_ENDPOINT = "endpoint"        # the STT calling the utterance over
+TRIGGER_END_OF_FILE = "end-of-file"  # the input running out
+
 
 # ---------- Helpers ----------
 def is_mono_16k_pcm(path):
@@ -273,6 +277,21 @@ def collect_resource_snapshot():
     return stats
 
 
+def triggers_on_endpoint(args):
+    """Whether an utterance is released as soon as the STT calls it over.
+
+    A microphone has no other option, its stream never ends. File input can
+    wait for the file instead, and under 'fast' pacing it always does: the
+    audio is consumed faster than real time, so waiting costs nothing and the
+    stages that would show a difference are not measured there anyway.
+    """
+    if args.input_mode == "mic":
+        return True
+    if args.audio_pacing != PACING_REALTIME:
+        return False
+    return args.file_realtime_trigger == TRIGGER_ENDPOINT
+
+
 def write_timing(writer, args, item, stage, duration_ms, stats=None, extra=None):
     """Append one CSV row for a stage.
 
@@ -287,6 +306,10 @@ def write_timing(writer, args, item, stage, duration_ms, stats=None, extra=None)
         "tts_engine": args.tts_engine,
         "input_mode": args.input_mode,
         "audio_pacing": args.audio_pacing if args.input_mode == "file" else "",
+        # The behaviour that applied, not the setting that was asked for: the
+        # setting only takes effect under file input with realtime pacing.
+        "utterance_trigger": (TRIGGER_ENDPOINT if triggers_on_endpoint(args)
+                              else TRIGGER_END_OF_FILE),
         "item": item,
         "stage": stage,
         "duration_ms": int(duration_ms),
@@ -302,12 +325,18 @@ def write_timing(writer, args, item, stage, duration_ms, stats=None, extra=None)
 
 
 # ---------- Pipeline Workers ----------
-def stt_worker(stt_engine, audio_source, mailbox, stt_metrics, input_mode="file"):
+def stt_worker(stt_engine, audio_source, mailbox, stt_metrics,
+               trigger_on_endpoint=False):
     """Feed audio to the STT engine and hand finalized utterances to the LLM.
 
-    - In 'mic' mode: every finalized utterance is handed over immediately, so a
-      new utterance can interrupt an answer that is still being generated.
-    - In 'file' mode: the LLM is triggered once, at the end of the file.
+    trigger_on_endpoint decides what releases an utterance:
+
+    - True: every finalized result goes over immediately, so the answer starts
+      as soon as the STT calls the utterance over. A later utterance can then
+      interrupt an answer still being generated. This is the only option a live
+      microphone has, since its stream never ends.
+    - False: nothing is handed over until the input runs out, and the LLM is
+      triggered once with everything that was recognized.
 
     Partial results are printed for visibility but never trigger generation:
     starting on a partial costs a full generation whenever the guess is wrong,
@@ -341,10 +370,15 @@ def stt_worker(stt_engine, audio_source, mailbox, stt_metrics, input_mode="file"
             stt_metrics["speech_end_s"] = speech_end_s
             stt_metrics["user_text"] = accumulated_final
 
-            if input_mode == "mic":
+            if trigger_on_endpoint:
+                # Carries everything recognized so far, not just this result:
+                # an endpointer that fires while the speaker is only drawing
+                # breath would otherwise have the LLM answer half a sentence.
+                # The mailbox supersedes the earlier text and the generation
+                # started on it is cancelled.
                 mailbox.put(accumulated_final)
 
-        if input_mode == "file" and accumulated_final:
+        if not trigger_on_endpoint and accumulated_final:
             mailbox.put(accumulated_final)
 
         t1 = time.perf_counter()
@@ -601,6 +635,16 @@ def main():
                         help="How input files are fed to the STT engine. 'realtime' simulates a "
                              "microphone at 1x speed so STT overlaps with speech (representative "
                              "latency). 'fast' reads as quickly as possible (original behaviour).")
+    parser.add_argument("--file-realtime-trigger",
+                        choices=[TRIGGER_ENDPOINT, TRIGGER_END_OF_FILE],
+                        default=TRIGGER_END_OF_FILE,
+                        help="What starts the LLM under file input with realtime pacing. "
+                             "'endpoint' answers as soon as the STT calls the utterance "
+                             "over, the only thing a microphone can do. 'end-of-file' "
+                             "waits for the whole file, so any silence past the endpoint "
+                             "is added to the latency. Ignored under 'fast' pacing and in "
+                             "mic mode, and has no effect with Whisper, which has no "
+                             "endpointer.")
     parser.add_argument("--audio-chunk-ms", type=int, default=DEFAULT_CHUNK_MS,
                         help="Audio chunk length in milliseconds fed to the STT engine")
     parser.add_argument("--playback", action="store_true", help="Play TTS output on speakers")
@@ -769,16 +813,19 @@ def main():
 
     save_system_prompt(run_dir, prompt_label, system_prompt)
 
-    # input_mode and audio_pacing ride along on every row so a stage is always
-    # interpretable on its own: which stages carry a value depends on them, and
-    # averaging across a mix of them is meaningless.
+    # These ride along on every row so a stage is always interpretable on its
+    # own: which stages carry a value, and what they include, depends on them.
+    # Averaging across a mix of them is meaningless.
     fieldnames = [
-        "ts_iso", "mode", "stt_engine", "tts_engine", "input_mode", "audio_pacing",
+        "ts_iso", "mode", "stt_engine", "tts_engine",
+        "input_mode", "audio_pacing", "utterance_trigger",
         "item", "stage", "duration_ms",
         "cpu_percent", "ram_percent", "rss_mb",
         "gpu_util_percent", "gpu_mem_used_mb", "gpu_mem_total_mb", "gpu_name",
         "extra_json",
     ]
+
+    trigger_on_endpoint = triggers_on_endpoint(args)
 
     # Signals the microphone source to stop capturing
     shutdown_event = threading.Event()
@@ -858,7 +905,7 @@ def main():
             stt_t = threading.Thread(
                 target=stt_worker,
                 args=(stt_engine, audio_source, mailbox, stt_metrics,
-                      args.input_mode),
+                      trigger_on_endpoint),
                 daemon=True,
             )
             llm_t = threading.Thread(

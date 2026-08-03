@@ -28,7 +28,8 @@ KNOWN_STAGES = ["stt", "stt_endpoint_delay", "llm_ttft", "llm_first_chunk_fill",
 # Columns whose value decides how a row is to be read. Runs that disagree on
 # them are not the same experiment, and averaging over the difference produces
 # a number describing nothing.
-RUN_CONTEXT_COLUMNS = ["input_mode", "audio_pacing", "stt_engine", "tts_engine", "mode"]
+RUN_CONTEXT_COLUMNS = ["input_mode", "audio_pacing", "utterance_trigger",
+                       "stt_engine", "tts_engine", "mode"]
 
 # Rates, each measured over the stage of the row it sits on. Averaging these
 # across stages says little, since e2e_response_ready spans all the others.

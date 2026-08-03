@@ -137,7 +137,7 @@ The CSV contains:
 
 - `stage`: one of `stt`, `stt_endpoint_delay`, `llm_ttft`, `llm_first_chunk_fill`, `llm_ttfc`, `tts_first_chunk`, `ttfa`, `llm_eval`, `tts_total`, `e2e_response_ready`
 - `duration_ms`: stage duration in milliseconds
-- `input_mode`, `audio_pacing`: how the audio reached the pipeline. Which stages carry a value depends on these, so runs that differ in them must not be pooled.
+- `input_mode`, `audio_pacing`, `utterance_trigger`: how the audio reached the pipeline and what released it to the LLM. Which stages carry a value, and what they include, depends on these, so runs that differ in them must not be pooled. `utterance_trigger` records the behaviour that applied, not the setting that was requested.
 - `cpu_percent`: average system-wide CPU load over the stage the row belongs to
 - `ram_percent`, `rss_mb`: system RAM in use and this process's resident set, read at the moment the stage finished
 - `gpu_util_percent`, `gpu_mem_used_mb`, `gpu_mem_total_mb`, `gpu_name`
@@ -160,7 +160,18 @@ Both stages are **blank under `fast` pacing**: the audio does not advance at wal
 
 For `realtime` pacing to stand in for a microphone, input files need enough silence after the last word for the endpointer to fire — measured at roughly 1100 ms with `vosk-model-small-en-us-0.15`. Below that the engine only finalizes because the file ran out, a signal live input never gets, and the run reports an optimistic TTFA. A warning is printed when this happens.
 
-Aim for about 1.2–1.5 s of trailing silence, and no more. File mode currently hands the transcript to the LLM once the whole file has been read, not when the endpointer fires, so any silence beyond the endpoint is added to `ttfa` in full. `stt_endpoint_delay` is unaffected and stays around 1100 ms however long the tail runs.
+How much more than that to allow depends on `file-realtime-trigger`:
+
+| `file-realtime-trigger` | what starts the LLM | trailing silence to aim for |
+|---|---|---|
+| `end-of-file` (default) | the whole file has been read | 1.2–1.5 s, and no more — silence past the endpoint is added to `ttfa` in full |
+| `endpoint` | the STT calls the utterance over, as a microphone would | at least 1.2 s, with no upper bound |
+
+`stt_endpoint_delay` is unaffected either way and stays around 1100 ms however long the tail runs.
+
+The setting applies only to file input with realtime pacing. Mic mode always triggers on the endpoint, having no stream end to wait for; `fast` pacing always waits for the file, where doing so costs nothing. It has no effect with Whisper, which has no endpointer and finalizes only when the stream ends.
+
+Under `endpoint`, a second end-of-speech signal within one input carries **everything recognized so far**, not just the new sentence, and supersedes the answer already in flight. An endpointer that fires while the speaker is only drawing breath would otherwise have the LLM answer half a sentence. Note that this is not conversation memory: each request to Ollama is independent, carries no `context` and no message history, and the assistant's own previous replies are never fed back.
 
 ## Notes
 
