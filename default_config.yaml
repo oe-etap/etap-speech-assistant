@@ -1,0 +1,31 @@
+# Default Configuration for MWE Assistant
+# You can override these values either by modifying this file or via CLI arguments.
+
+audio: 
+  - "./audios"
+
+mode: cpu
+stt-engine: whisper
+tts-engine: piper
+
+out-dir: outputs
+keep-normalized: false
+
+# STT Options
+vosk-model: "./vosk/vosk-model-small-en-us-0.15"
+whisper-model: "small"
+whisper-device: "cpu"
+whisper-compute-type: "int8"
+
+# TTS Options
+piper-exe: "./piper/piper.exe"
+piper-voice: "./piper/en_US-lessac-medium.onnx"
+piper-use-exe: false
+
+coqui-voice: "xtts_v2"
+coqui-language: "en"
+coqui-speaker: "Daisy Studious"
+
+# Shared LLM Options
+ollama-model: "phi3:mini"
+ollama-url: "http://localhost:11434/api/generate"

@@ -14,6 +14,7 @@ CPU/RAM/GPU snapshots.
 
 import argparse
 import csv
+import yaml
 import json
 import os
 import shutil
@@ -297,7 +298,8 @@ def tts_coqui_stream(text, language="en", speaker="Daisy Studious"):
 # ---------- Main ----------
 def main():
     parser = argparse.ArgumentParser(description="Offline Speech Assistant MWE (EN, file input only)")
-    parser.add_argument("--audio", nargs="+", required=True, help="One or more audio files (wav/mp3/flac/etc.)")
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML config file (CLI args override it)")
+    parser.add_argument("--audio", nargs="+", help="One or more audio files (wav/mp3/flac/etc.)")
     parser.add_argument("--mode", choices=["cpu", "gpu"], default="cpu", help="Default compute preset")
     parser.add_argument("--stt-engine", choices=["vosk", "whisper"], default="whisper", help="Speech-to-text engine")
     parser.add_argument("--tts-engine", choices=["piper", "coqui"], default="piper", help="Text-to-speech engine")
@@ -309,7 +311,7 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # STT options
-    parser.add_argument("--vosk-model", default="./vosk-model-small-en-us-0.15", help="Path to English Vosk model dir")
+    parser.add_argument("--vosk-model", default="./vosk/vosk-model-small-en-us-0.15", help="Path to English Vosk model dir")
     parser.add_argument("--whisper-model", default="small", help="faster-whisper model name")
     parser.add_argument("--whisper-device", choices=["cpu", "cuda"], default=None, help="Device for faster-whisper")
     parser.add_argument("--whisper-compute-type", default=None, help="Compute type (int8, float16, etc.)")
@@ -326,8 +328,43 @@ def main():
     parser.add_argument("--ollama-model", default="phi3:mini", help="Ollama model (e.g. phi3:mini)")
     parser.add_argument("--ollama-url", default="http://localhost:11434/api/generate", help="Ollama generate endpoint")
 
-    # ---- parse ----
+    # ---- config file handling & parse ----
+    initial_parser = argparse.ArgumentParser(add_help=False)
+    initial_parser.add_argument("--config", type=str)
+    known_args, _ = initial_parser.parse_known_args()
+
+    if known_args.config:
+        with open(known_args.config, "r", encoding="utf-8") as f:
+            yaml_cfg = yaml.safe_load(f) or {}
+            yaml_cfg = {k.replace("-", "_"): v for k, v in yaml_cfg.items()}
+            parser.set_defaults(**yaml_cfg)
+
     args = parser.parse_args()
+
+    if not args.audio:
+        parser.error("the following arguments are required: --audio (either in CLI or config)")
+
+    expanded_audio = []
+    valid_extensions = {
+        ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".m4b", ".aac", ".wma", 
+        ".amr", ".aiff", ".opus", ".webm", ".mp4", ".mkv", ".avi", ".mov"
+    }
+    for p in args.audio:
+        path_obj = Path(p)
+        if not path_obj.exists():
+            print(f"[WARN] Input path does not exist: {p}")
+            continue
+        if path_obj.is_dir():
+            for child in path_obj.iterdir():
+                if child.is_file() and child.suffix.lower() in valid_extensions:
+                    expanded_audio.append(str(child))
+        else:
+            expanded_audio.append(str(path_obj))
+
+    if not expanded_audio:
+        parser.error("No valid audio files found in the provided --audio paths.")
+
+    args.audio = sorted(expanded_audio)
 
     if args.whisper_device is None:
         args.whisper_device = "cuda" if args.mode == "gpu" else "cpu"
@@ -383,6 +420,29 @@ def main():
 
     if not args.latency_csv:
         args.latency_csv = os.path.join(run_dir, f"latency_log_{timestamp}.csv")
+
+    config_to_save = vars(args).copy()
+    
+    # Filter out settings that are not used by the selected engine
+    if args.stt_engine == "whisper":
+        config_to_save.pop("vosk_model", None)
+    elif args.stt_engine == "vosk":
+        config_to_save.pop("whisper_model", None)
+        config_to_save.pop("whisper_device", None)
+        config_to_save.pop("whisper_compute_type", None)
+
+    if args.tts_engine == "piper":
+        config_to_save.pop("coqui_voice", None)
+        config_to_save.pop("coqui_language", None)
+        config_to_save.pop("coqui_speaker", None)
+    elif args.tts_engine == "coqui":
+        config_to_save.pop("piper_exe", None)
+        config_to_save.pop("piper_voice", None)
+        config_to_save.pop("piper_use_exe", None)
+
+    config_dump_path = os.path.join(run_dir, "config_used.yaml")
+    with open(config_dump_path, "w", encoding="utf-8") as f:
+        yaml.dump(config_to_save, f, sort_keys=False)
 
     fieldnames = [
         "ts_iso", "mode", "stt_engine", "tts_engine", "item", "stage", "duration_ms",
@@ -543,6 +603,22 @@ def main():
                           "response_char_count": len(full_reply.strip()),
                           "llm_chunk_count": chunk_count})
             print(f"[TTS] Stream finished. Saved to {out_wav}.")
+
+            # --- Transcript Logging ---
+            transcript_record = {
+                "stt_text": user_text,
+                "llm_text": full_reply.strip()
+            }
+
+            # JSONL Logging
+            jsonl_path = os.path.join(run_dir, "transcripts.jsonl")
+            with open(jsonl_path, "a", encoding="utf-8") as f_jsonl:
+                f_jsonl.write(json.dumps(transcript_record, ensure_ascii=False) + "\n")
+
+            # YAML Logging
+            yaml_path = os.path.join(run_dir, "transcripts.yaml")
+            with open(yaml_path, "a", encoding="utf-8") as f_yaml:
+                yaml.dump([transcript_record], f_yaml, sort_keys=False, allow_unicode=True)
 
             if not args.keep_normalized:
                 try:
