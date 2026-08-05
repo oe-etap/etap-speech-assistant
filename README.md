@@ -47,6 +47,10 @@ Additional assets:
 - For Piper: an English voice, for example `en_US-lessac-medium.onnx`
 - For Coqui XTTS-v2: the model is loaded through the `TTS` package
 - For GPU stats: `nvidia-smi` must be available
+- System prompts: `prompts/*.txt`, referenced by `system-prompt-file`. These are
+  local and not version controlled, so prompt wording can be iterated on freely.
+  Without a prompt file the built-in default applies. The prompt actually used is copied to `<out-dir>/system_prompt.txt`, headed by its file name, so a
+  measurement stays identifiable.
 
 ## Examples
 
@@ -131,16 +135,19 @@ Each run creates `outputs/<YYYYMMDD_HHMMSS>/` containing:
 
 The CSV contains:
 
-- `stage`: `stt`, `llm`, `tts`, or `e2e_response_ready`
+- `stage`: one of `stt`, `llm_ttft`, `llm_first_chunk_fill`, `llm_ttfc`, `tts_first_chunk`, `ttfa_from_speech_end`, `ttfa`, `llm_eval`, `tts_total`, `e2e_response_ready`
 - `duration_ms`: stage duration in milliseconds
-- `cpu_percent`, `ram_percent`, `rss_mb`
+- `cpu_percent`: average system-wide CPU load over the stage the row belongs to
+- `ram_percent`, `rss_mb`: system RAM in use and this process's resident set, read at the moment the stage finished
 - `gpu_util_percent`, `gpu_mem_used_mb`, `gpu_mem_total_mb`, `gpu_name`
 - `extra_json`: additional metadata, including input duration and output path where relevant
 
 ## Notes
 
 - CPU/RAM stats require `psutil`; if unavailable, those fields stay blank.
-- GPU stats are read from `nvidia-smi`; if unavailable or no NVIDIA GPU is present, those fields stay blank.
+- Resource columns are captured by the worker that owns the stage, at the moment that stage finishes. `psutil.cpu_percent(interval=None)` reports load since its own previous call and keeps that state per thread, so each stage opens its own measurement window with a priming call when it starts.
+- A row's CPU window matches its `duration_ms` exactly for `stt`, `llm_ttft`, `llm_first_chunk_fill`, `tts_first_chunk` and `e2e_response_ready`. The rest are approximations: `llm_ttfc` is timed from the start of the request but its CPU window starts at the first token; `ttfa` and `ttfa_from_speech_end` reuse the `tts_first_chunk` snapshot; `llm_eval` and `tts_total` carry the snapshot taken when their worker finished.
+- GPU stats are read from `nvidia-smi`; if unavailable or no NVIDIA GPU is present, those fields stay blank. A background sampler refreshes them every second, which keeps the subprocess off the measured path. Fields the driver reports as `[N/A]` are stored blank so the numeric columns stay numeric.
 - The end-to-end metric is measured in batch mode after the full input audio file is available, so it represents processing latency from input-audio end to response-audio readiness.
 
 

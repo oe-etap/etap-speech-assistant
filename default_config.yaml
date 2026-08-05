@@ -5,11 +5,22 @@ audio:
   - "./audios"
 
 mode: cpu
-stt-engine: whisper
+stt-engine: vosk
 tts-engine: piper
 
 out-dir: outputs
 keep-normalized: false
+input-mode: file  # 'file' or 'mic'
+
+# How input files are fed to the STT engine.
+#   realtime: simulate a microphone at 1x speed, so STT overlaps with the speech.
+#             Required for TTFA numbers that reflect a live deployment.
+#   fast:     read as quickly as possible (original batch behaviour), kept for
+#             comparability with earlier measurements.
+audio-pacing: fast
+audio-chunk-ms: 250
+playback: false   # Play TTS output on speakers
+idle-timeout: 10.0 # Shutdown after N seconds of silence
 
 # STT Options
 vosk-model: "./vosk/vosk-model-small-en-us-0.15"
@@ -29,3 +40,24 @@ coqui-speaker: "Daisy Studious"
 # Shared LLM Options
 ollama-model: "phi3:mini"
 ollama-url: "http://localhost:11434/api/generate"
+
+# System prompt variant. Variants live in prompts/ and are identified by filename.
+# The prompt actually used is copied to <out-dir>/system_prompt.txt.
+system-prompt-file: "./prompts/short-opener.txt"
+
+llm-max-tokens: 150
+
+# temperature controls how random sampling is; seed controls which random
+# sequence it follows. Response length varies enough between runs to hide the
+# effect under test, so for A/B comparisons pin one of them:
+#   llm-temperature: 0   -> greedy decoding, reproducible on its own
+#   llm-seed: <number>   -> reproducible while sampling stays natural
+# Note: `null` is YAML for "no value"; writing None would be the string "None".
+llm-temperature: 0.7
+llm-seed: null     # no seed -> sampling differs on every run
+
+# Safety-net chunk length for the LLM -> TTS handoff. Chunks are normally cut at
+# sentence boundaries; a sentence longer than this is split at a word boundary so
+# the TTS does not have to wait for the whole response.
+# Lower = lower TTFA, higher = better prosody.
+tts-chunk-max-chars: 140

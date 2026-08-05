@@ -14,6 +14,8 @@ CPU/RAM/GPU snapshots.
 
 import argparse
 import csv
+import queue
+import threading
 import yaml
 import json
 import os
@@ -24,9 +26,22 @@ import wave
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
-import requests
 import soundfile as sf
+try:
+    import sounddevice as sd
+    _HAS_SD = True
+except ImportError:
+    sd = None
+    _HAS_SD = False
+
+from audio_sources import (
+    DEFAULT_CHUNK_MS, PACING_FAST, PACING_REALTIME,
+    FileAudioSource, MicAudioSource,
+)
+from pipeline_channels import UtteranceMailbox
+from stt_engines import VoskEngine, WhisperEngine
+from llm_engine import DEFAULT_CHUNK_MAX_CHARS, DEFAULT_SYSTEM_PROMPT, OllamaEngine
+from tts_engines import PiperEngine, CoquiEngine
 
 # Optional module-level imports
 try:
@@ -35,37 +50,21 @@ try:
 except ImportError:
     _HAS_PSUTIL = False
 
-try:
-    from vosk import Model, KaldiRecognizer
-except ImportError:
-    pass
+# Latest nvidia-smi reading, replaced wholesale by the sampler thread so that
+# readers need no lock.
+_GPU_BLANK_STATS = {
+    "gpu_util_percent": "",
+    "gpu_mem_used_mb": "",
+    "gpu_mem_total_mb": "",
+    "gpu_name": "",
+}
+_gpu_stats = _GPU_BLANK_STATS
 
-try:
-    from faster_whisper import WhisperModel
-except ImportError:
-    pass
+# How often the GPU reading is refreshed
+GPU_SAMPLE_INTERVAL_S = 1.0
 
-try:
-    from piper.voice import PiperVoice
-except ImportError:
-    pass
-
-try:
-    from TTS.api import TTS
-except ImportError:
-    pass
-
-_requests_session = requests.Session()
-
-_vosk_model = None
-_vosk_recognizer = None
-_whisper_model = None
-_coqui_tts = None
-_piper_voice = None  # PiperVoice Python API singleton
-
-# nvidia-smi cache (timestamp, stats_dict)
-_gpu_cache = (0.0, None)
-_GPU_CACHE_TTL = 2.0
+# How long to wait for the pipeline workers to drain before reading their metrics
+WORKER_SHUTDOWN_TIMEOUT_S = 10.0
 
 
 # ---------- Helpers ----------
@@ -102,24 +101,59 @@ def ensure_wav_mono_16k(path, out_dir=None, prefix=None):
     return str(out_path)
 
 
+def load_system_prompt(path):
+    """Return (variant_label, prompt_text) for the configured prompt file.
+
+    The label identifies which variant produced a measurement, and it is simply
+    the file name. That is why a prompt file must never be edited in place: a
+    reworded prompt belongs in a new file, so a given label always denotes the
+    same text.
+    """
+    if not path:
+        return "(built-in default)", DEFAULT_SYSTEM_PROMPT
+
+    prompt_file = Path(path)
+    text = prompt_file.read_text(encoding="utf-8").strip()
+    if not text:
+        raise ValueError(f"System prompt file is empty: {path}")
+    return prompt_file.name, text
+
+
+def save_system_prompt(run_dir, label, text):
+    """Record the prompt this run used, headed by its variant name.
+
+    config_used.yaml only stores the path, so the prompt is copied here as well:
+    the run stays reproducible even if the prompts/ directory moves on.
+    """
+    with open(os.path.join(run_dir, "system_prompt.txt"), "w", encoding="utf-8") as f:
+        f.write(f"{label}\n\n{text}\n")
+
+
 def wav_duration_ms(wav_path):
     with sf.SoundFile(wav_path) as wav:
         return int((len(wav) / wav.samplerate) * 1000)
 
 
-def _query_gpu_stats():
-    """Query nvidia-smi with caching to avoid subprocess overhead on every call."""
-    global _gpu_cache
-    now = time.monotonic()
-    if _gpu_cache[1] is not None and (now - _gpu_cache[0]) < _GPU_CACHE_TTL:
-        return _gpu_cache[1]
+def _numeric_or_blank(value):
+    """Return the value unchanged if it parses as a number, otherwise "".
 
-    gpu_stats = {
-        "gpu_util_percent": "",
-        "gpu_mem_used_mb": "",
-        "gpu_mem_total_mb": "",
-        "gpu_name": "",
-    }
+    nvidia-smi reports fields the driver cannot supply as markers such as
+    '[N/A]' or '[Not Supported]'. Blanking them keeps the CSV column numeric.
+    """
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return ""
+    return value
+
+
+def _refresh_gpu_stats():
+    """Query nvidia-smi once and publish the reading to _gpu_stats.
+
+    Returns True on success, False if nvidia-smi is unavailable or returned
+    nothing usable.
+    """
+    global _gpu_stats
     try:
         cmd = [
             "nvidia-smi",
@@ -127,22 +161,93 @@ def _query_gpu_stats():
             "--format=csv,noheader,nounits",
         ]
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-        if result.returncode == 0 and result.stdout.strip():
-            first_gpu = result.stdout.strip().splitlines()[0]
-            name, util, mem_used, mem_total = [part.strip() for part in first_gpu.split(",", 3)]
-            gpu_stats["gpu_name"] = name
-            gpu_stats["gpu_util_percent"] = util
-            gpu_stats["gpu_mem_used_mb"] = mem_used
-            gpu_stats["gpu_mem_total_mb"] = mem_total
+        if result.returncode != 0 or not result.stdout.strip():
+            return False
+        first_gpu = result.stdout.strip().splitlines()[0]
+        name, util, mem_used, mem_total = [part.strip() for part in first_gpu.split(",", 3)]
+        _gpu_stats = {
+            "gpu_name": name,
+            "gpu_util_percent": _numeric_or_blank(util),
+            "gpu_mem_used_mb": _numeric_or_blank(mem_used),
+            "gpu_mem_total_mb": _numeric_or_blank(mem_total),
+        }
+        return True
+    except Exception:
+        return False
+
+
+class _GpuSampler(threading.Thread):
+    """Background thread refreshing _gpu_stats every GPU_SAMPLE_INTERVAL_S.
+
+    Keeps the nvidia-smi subprocess off the measured pipeline: workers read the
+    published dict instead of querying nvidia-smi themselves.
+    """
+
+    def __init__(self, interval=GPU_SAMPLE_INTERVAL_S):
+        super().__init__(daemon=True, name="gpu-sampler")
+        self._interval = interval
+        self._stop_event = threading.Event()
+
+    def run(self):
+        while not self._stop_event.wait(self._interval):
+            # A failed refresh keeps the previous reading.
+            _refresh_gpu_stats()
+
+    def stop(self):
+        self._stop_event.set()
+
+
+_gpu_sampler = None
+
+
+def start_gpu_sampler():
+    """Take an initial GPU reading and start the background refresh.
+
+    Does nothing when nvidia-smi is unavailable, leaving the GPU columns blank.
+    """
+    global _gpu_sampler
+    if _gpu_sampler is not None:
+        return
+    if not _refresh_gpu_stats():
+        return
+    _gpu_sampler = _GpuSampler()
+    _gpu_sampler.start()
+
+
+def stop_gpu_sampler():
+    """Stop the background GPU refresh."""
+    global _gpu_sampler
+    if _gpu_sampler is None:
+        return
+    _gpu_sampler.stop()
+    _gpu_sampler.join(timeout=GPU_SAMPLE_INTERVAL_S * 2)
+    _gpu_sampler = None
+
+
+def prime_cpu_percent():
+    """Open a CPU measurement window on the calling thread.
+
+    psutil.cpu_percent(interval=None) reports load since the calling thread's
+    own previous call, its state being keyed by thread id. Call this when a
+    stage starts; the snapshot taken when that stage ends then covers exactly
+    that stage.
+    """
+    if not _HAS_PSUTIL:
+        return
+    try:
+        psutil.cpu_percent(interval=None)
     except Exception:
         pass
 
-    _gpu_cache = (now, gpu_stats)
-    return gpu_stats
-
 
 def collect_resource_snapshot():
-    """Best-effort resource snapshot. Missing psutil/nvidia-smi leaves blanks."""
+    """Return the resource snapshot for the stage that has just finished.
+
+    Call at a stage boundary, from the thread that ran the stage and opened its
+    window with prime_cpu_percent(); cpu_percent then covers that stage alone.
+    ram_percent and rss_mb are read directly, the GPU fields come from the
+    background sampler. Missing psutil/nvidia-smi leaves blanks.
+    """
     stats = {
         "cpu_percent": "",
         "ram_percent": "",
@@ -158,12 +263,17 @@ def collect_resource_snapshot():
         except Exception:
             pass
 
-    stats.update(_query_gpu_stats())
+    stats.update(_gpu_stats)
     return stats
 
 
-def write_timing(writer, args, item, stage, duration_ms, extra=None):
-    stats = collect_resource_snapshot()
+def write_timing(writer, args, item, stage, duration_ms, stats=None, extra=None):
+    """Append one CSV row for a stage.
+
+    stats is the snapshot collect_resource_snapshot() took at that stage's
+    boundary; None leaves the resource columns blank.
+    """
+    stats = stats or {}
     writer.writerow({
         "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "mode": args.mode,
@@ -172,127 +282,296 @@ def write_timing(writer, args, item, stage, duration_ms, extra=None):
         "item": item,
         "stage": stage,
         "duration_ms": int(duration_ms),
-        "cpu_percent": stats["cpu_percent"],
-        "ram_percent": stats["ram_percent"],
-        "rss_mb": stats["rss_mb"],
-        "gpu_util_percent": stats["gpu_util_percent"],
-        "gpu_mem_used_mb": stats["gpu_mem_used_mb"],
-        "gpu_mem_total_mb": stats["gpu_mem_total_mb"],
-        "gpu_name": stats["gpu_name"],
+        "cpu_percent": stats.get("cpu_percent", ""),
+        "ram_percent": stats.get("ram_percent", ""),
+        "rss_mb": stats.get("rss_mb", ""),
+        "gpu_util_percent": stats.get("gpu_util_percent", ""),
+        "gpu_mem_used_mb": stats.get("gpu_mem_used_mb", ""),
+        "gpu_mem_total_mb": stats.get("gpu_mem_total_mb", ""),
+        "gpu_name": stats.get("gpu_name", ""),
         "extra_json": json.dumps(extra or {}, ensure_ascii=True),
     })
 
 
-def transcribe_with_vosk(wav_path):
-    """STT from WAV file using Vosk (expects mono 16 kHz 16-bit PCM)."""
-    wf = wave.open(wav_path, "rb")
-    assert wf.getnchannels() == 1 and wf.getframerate() == 16000 and wf.getsampwidth() == 2, \
-        "Use mono/16 kHz/16-bit PCM WAV for Vosk"
-    results = []
-    while True:
-        data = wf.readframes(4000)
-        if len(data) == 0:
-            break
-        if _vosk_recognizer.AcceptWaveform(data):
-            results.append(json.loads(_vosk_recognizer.Result()))
-    results.append(json.loads(_vosk_recognizer.FinalResult()))
-    text = " ".join([r.get("text", "") for r in results]).strip()
-    wf.close()
-    return text
+# ---------- Pipeline Workers ----------
+def stt_worker(stt_engine, audio_source, mailbox, stt_metrics, input_mode="file"):
+    """Feed audio to the STT engine and hand finalized utterances to the LLM.
 
+    - In 'mic' mode: every finalized utterance is handed over immediately, so a
+      new utterance can interrupt an answer that is still being generated.
+    - In 'file' mode: the LLM is triggered once, at the end of the file.
 
-def stt_whisper(wav_path):
-    """STT from WAV file using faster-whisper.
-    Requires _whisper to be pre-loaded via main()."""
-    segments, _ = _whisper_model.transcribe(wav_path, language="en")
-    text = " ".join([s.text.strip() for s in segments]).strip()
-    return text
+    Partial results are printed for visibility but never trigger generation:
+    starting on a partial costs a full generation whenever the guess is wrong,
+    which is what made the earlier experiments slower rather than faster.
 
-
-def stream_llm_ollama_chat(user_text, model_name="phi3:mini", url="http://localhost:11434/api/generate"):
-    """Stream LLM response from Ollama, yielding sentence-level chunks as dicts.
-    
-    Yields dicts with keys:
-      - 'text': the synthesizable text chunk (str)
-      - 'ollama_stats': None for text chunks; dict with server-side timing for the final metadata chunk
-    
-    The last yielded dict may have empty 'text' and non-None 'ollama_stats' containing
-    Ollama's server-side performance metrics (eval_count, eval_duration, etc.).
+    Records speech_end_t on every finalized result: this is the anchor for the
+    TTFA metric a user actually perceives, which starts when they stop talking
+    rather than when processing begins.
     """
-    system_prompt = (
-        "You are a concise, factual but friendly voice assistant. "
-        "Answer in English in 1-3 medium length sentences."
-    )
-    prompt = f'{system_prompt}\n\nThe user said: "{user_text}"\n\nAnswer:'
     try:
-        r = _requests_session.post(url, json={"model": model_name, "prompt": prompt, "stream": True, "options": {
-        "num_predict": 150,
-        "temperature": 0.7
-            }
-        }, timeout=120)
-        r.raise_for_status()
-        
-        buffer = ""
-        terminators = {".", "?", "!", ":", ";", "\n"}
-        ollama_stats = None
-        for line in r.iter_lines():
-            if line:
-                data = json.loads(line)
-                piece = data.get("response", "")
-                buffer += piece
-                
-                # Capture Ollama server-side stats from the final message
-                if data.get("done", False):
-                    ollama_stats = {
-                        "prompt_eval_count": data.get("prompt_eval_count", 0),
-                        "prompt_eval_duration_ns": data.get("prompt_eval_duration", 0),
-                        "eval_count": data.get("eval_count", 0),
-                        "eval_duration_ns": data.get("eval_duration", 0),
-                        "total_duration_ns": data.get("total_duration", 0),
-                    }
-                
-                if any(t in piece for t in terminators):
-                    if len(buffer.strip()) > 2:
-                        yield {"text": buffer.strip(), "ollama_stats": None}
-                        buffer = ""
-        if buffer.strip():
-            yield {"text": buffer.strip(), "ollama_stats": None}
-        # Yield final metadata-only entry with Ollama server-side stats
-        if ollama_stats:
-            yield {"text": "", "ollama_stats": ollama_stats}
+        # Opens this thread's CPU window for the span reported as stt_ms.
+        prime_cpu_percent()
+        t0 = time.perf_counter()
+        accumulated_final = ""
+
+        for result in stt_engine.transcribe_stream(audio_source.chunks()):
+            if not result["text"]:
+                continue
+
+            if not result["is_final"]:
+                print(f"[STT Partial] {result['text']}", end="\r")
+                continue
+
+            accumulated_final = (
+                accumulated_final + " " + result["text"]
+            ).strip()
+
+            stt_metrics["last_speech_t"] = time.perf_counter()
+            stt_metrics["speech_end_t"] = audio_source.speech_end_t()
+            stt_metrics["user_text"] = accumulated_final
+
+            if input_mode == "mic":
+                mailbox.put(accumulated_final)
+
+        if input_mode == "file" and accumulated_final:
+            mailbox.put(accumulated_final)
+
+        t1 = time.perf_counter()
+        stt_metrics["stt_ms"] = int((t1 - t0) * 1000)
+        stt_metrics["user_text"] = accumulated_final
+        # Covers the STT stage.
+        stt_metrics["stats"] = collect_resource_snapshot()
+        print(f"[STT] {accumulated_final!r}")
+
     except Exception as e:
-        yield {"text": f"(LLM call failed: {e})", "ollama_stats": None}
+        print(f"[STT] Error: {e}")
+        stt_metrics["error"] = str(e)
+    finally:
+        mailbox.close()
 
 
-def tts_piper_python(text):
-    """Returns raw 16-bit PCM bytes and sample rate from Piper using the Python API."""
-    pcm_parts = []
-    sample_rate = None
-    for audio_chunk in _piper_voice.synthesize(text):
-        pcm_parts.append(audio_chunk.audio_int16_bytes)
-        if sample_rate is None:
-            sample_rate = audio_chunk.sample_rate
-    return b"".join(pcm_parts), sample_rate or 22050
+def llm_worker(llm_engine, mailbox, tts_queue, llm_metrics):
+    """Answer utterances from the mailbox, streaming chunks to tts_queue.
+
+    Barge-in: if a newer utterance arrives while generation is in flight, the
+    current generation is cancelled, the TTS discards its partial output, and a
+    fresh generation starts from the newer text. Only finalized utterances get
+    here, so a restart always reflects something the user actually finished
+    saying.
+    """
+    try:
+        while True:
+            llm_metrics["is_busy"] = False
+            text = mailbox.take()
+            llm_metrics["is_busy"] = True
+
+            if text is None:
+                break
+
+            # Drop any partial audio from a superseded answer and reset metrics
+            llm_engine.cancel()
+            tts_queue.put({"type": "cancel"})
+            llm_metrics["full_assistant_text"] = ""
+            llm_metrics["llm_chunk_count"] = 0
+            llm_metrics["llm_ttfc_ms"] = None
+            llm_metrics["llm_ttft_ms"] = None
+            llm_metrics["first_chunk_chars"] = None
+            llm_metrics["ttft_stats"] = None
+            llm_metrics["ttfc_stats"] = None
+            llm_metrics["end_stats"] = None
+
+            print("[LLM] Starting stream...")
+            # Opens this thread's CPU window; the wait on the mailbox that
+            # precedes the request stays outside it.
+            prime_cpu_percent()
+            llm_t0 = time.perf_counter()
+            llm_metrics["llm_t0"] = llm_t0
+
+            for chunk_data in llm_engine.generate_stream(text):
+                if chunk_data.get("ollama_stats"):
+                    llm_metrics["ollama_stats"] = chunk_data["ollama_stats"]
+
+                first_token_t = chunk_data.get("first_token_t")
+                if first_token_t is not None and llm_metrics["llm_ttft_ms"] is None:
+                    llm_metrics["llm_ttft_ms"] = int((first_token_t - llm_t0) * 1000)
+                    llm_metrics["first_token_t"] = first_token_t
+                    llm_metrics["ttft_stats"] = collect_resource_snapshot()
+
+                if chunk_data.get("cancelled"):
+                    break
+
+                if mailbox.has_pending():
+                    print("[LLM] Newer utterance arrived, restarting generation...")
+                    llm_engine.cancel()
+                    break
+
+                chunk = chunk_data.get("text", "")
+                if not chunk:
+                    continue
+
+                llm_metrics["llm_chunk_count"] += 1
+
+                if llm_metrics["llm_ttfc_ms"] is None:
+                    llm_metrics["llm_ttfc_ms"] = int(
+                        (time.perf_counter() - llm_t0) * 1000
+                    )
+                    # Length of the opening chunk shows whether the model
+                    # honoured a "start with a short sentence" instruction.
+                    llm_metrics["first_chunk_chars"] = len(chunk)
+                    llm_metrics["ttfc_stats"] = collect_resource_snapshot()
+
+                print(f"[LLM Chunk {llm_metrics['llm_chunk_count']}] {chunk}")
+                llm_metrics["full_assistant_text"] += chunk + " "
+
+                tts_queue.put({"type": "text", "text": chunk})
+
+            llm_metrics["end_stats"] = collect_resource_snapshot()
+
+            # Let the TTS close this response's WAV before the next one starts
+            tts_queue.put({"type": "end_of_response"})
+
+    except Exception as e:
+        print(f"[LLM] Error: {e}")
+        llm_metrics["error"] = str(e)
+    finally:
+        tts_queue.put(None)  # EOF signal
 
 
-def tts_piper_exe(text, piper_exe, piper_voice, sample_rate=16000):
-    """Returns raw 16-bit PCM bytes and sample rate from Piper CLI executable.
-    Fallback for when the Python API is not available."""
-    cmd = [piper_exe, "-m", piper_voice, "--output_raw"]
-    result = subprocess.run(cmd, input=text.encode("utf-8"), stdout=subprocess.PIPE, check=True)
-    return result.stdout, sample_rate
+def response_wav_path(out_wav, index):
+    """Return the WAV path for the index-th response of this item.
+
+    The first response keeps the plain name so file mode, which only ever has
+    one, is unaffected. A mic session answers repeatedly and would otherwise
+    overwrite every earlier answer.
+    """
+    if index <= 1:
+        return out_wav
+    stem, ext = os.path.splitext(out_wav)
+    return f"{stem}_r{index}{ext}"
 
 
-def tts_coqui_stream(text, language="en", speaker="Daisy Studious"):
-    """Returns raw 16-bit PCM bytes and sample rate from Coqui."""
-    wav = _coqui_tts.tts(text=text, speaker=speaker, language=language)
-    
-    audio_data = np.array(wav, dtype=np.float32)
-    audio_data = np.clip(audio_data, -1.0, 1.0)
-    audio_data = (audio_data * 32767.0).astype(np.int16)
-    
-    sample_rate = _coqui_tts.synthesizer.output_sample_rate
-    return audio_data.tobytes(), sample_rate
+def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics, playback=False):
+    """Read text chunks from tts_queue and synthesize them to WAV files.
+
+    Message types:
+        - "text": synthesize and append to the current response WAV.
+        - "cancel": the answer was superseded, so drop the partial WAV, flush
+          any queued audio from the speakers, and reset the metrics.
+        - "end_of_response": the answer is complete; close its WAV so the next
+          one starts a new file.
+    """
+    wav_file = None
+    stream = None
+    response_index = 1
+    tts_metrics["out_wavs"] = []
+
+    def close_response():
+        nonlocal wav_file, response_index
+        if wav_file:
+            wav_file.close()
+            wav_file = None
+            tts_metrics["out_wavs"].append(response_wav_path(out_wav, response_index))
+            response_index += 1
+
+    try:
+        if playback:
+            if not _HAS_SD:
+                raise ImportError("sounddevice module is required for playback")
+            stream = sd.RawOutputStream(
+                samplerate=tts_engine.sample_rate, 
+                channels=1, 
+                dtype='int16'
+            )
+            stream.start()
+
+        while True:
+            tts_metrics["is_busy"] = False
+            msg = tts_queue.get()
+            tts_metrics["is_busy"] = True
+            
+            if msg is None:
+                break
+
+            msg_type = msg.get("type", "text")
+
+            if msg_type == "end_of_response":
+                close_response()
+                continue
+
+            if msg_type == "cancel":
+                # Discard the partial WAV of the superseded answer
+                partial_path = response_wav_path(out_wav, response_index)
+                if wav_file:
+                    wav_file.close()
+                    wav_file = None
+                if os.path.exists(partial_path):
+                    try:
+                        os.remove(partial_path)
+                    except OSError:
+                        pass
+
+                # abort() drops audio already queued on the device; stop() would
+                # play it out first, so the old answer would keep talking over
+                # the new one.
+                if stream:
+                    stream.abort()
+                    stream.start()
+
+                # Reset metrics so they reflect only the answer that survives
+                tts_metrics["tts_first_chunk_ms"] = None
+                tts_metrics["tts_first_chunk_t"] = None
+                tts_metrics["first_chunk_stats"] = None
+                tts_metrics["total_tts_time"] = 0.0
+                continue
+
+            text = msg.get("text", "")
+            if not text:
+                continue
+
+            if tts_metrics["tts_first_chunk_ms"] is None:
+                # Opens this thread's CPU window so it covers the first
+                # synthesis alone; later chunks extend it towards end_stats.
+                prime_cpu_percent()
+
+            tts_t0 = time.perf_counter()
+            pcm_bytes, sample_rate = tts_engine.synthesize(text)
+            tts_t1 = time.perf_counter()
+            tts_metrics["total_tts_time"] += (tts_t1 - tts_t0)
+
+            if tts_metrics["tts_first_chunk_ms"] is None:
+                tts_metrics["tts_first_chunk_ms"] = int(
+                    (tts_t1 - tts_t0) * 1000
+                )
+                tts_metrics["tts_first_chunk_t"] = tts_t1
+                tts_metrics["first_chunk_stats"] = collect_resource_snapshot()
+
+            if wav_file is None:
+                wav_file = wave.open(response_wav_path(out_wav, response_index), "wb")
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)  # 16-bit
+                wav_file.setframerate(sample_rate)
+
+            wav_file.writeframes(pcm_bytes)
+
+            if stream:
+                stream.write(pcm_bytes)
+
+            tts_metrics["last_play_t"] = time.perf_counter()
+
+    except Exception as e:
+        print(f"[TTS] Error: {e}")
+        tts_metrics["error"] = str(e)
+    finally:
+        # Taken before the WAV is closed, so it covers synthesis not teardown.
+        tts_metrics["end_stats"] = collect_resource_snapshot()
+        close_response()
+        if stream:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
 
 
 # ---------- Main ----------
@@ -307,6 +586,15 @@ def main():
     parser.add_argument("--out-dir", type=str, default="outputs", help="Where to save the audiofiles")
     parser.add_argument("--latency-csv", type=str, default=None, help="CSV file to append latency/resource logs")
     parser.add_argument("--keep-normalized", action="store_true", help="Keep ffmpeg-normalized input WAVs")
+    parser.add_argument("--input-mode", choices=["file", "mic"], default="file", help="Input mode: file or live mic")
+    parser.add_argument("--audio-pacing", choices=[PACING_REALTIME, PACING_FAST], default=PACING_REALTIME,
+                        help="How input files are fed to the STT engine. 'realtime' simulates a "
+                             "microphone at 1x speed so STT overlaps with speech (representative "
+                             "latency). 'fast' reads as quickly as possible (original behaviour).")
+    parser.add_argument("--audio-chunk-ms", type=int, default=DEFAULT_CHUNK_MS,
+                        help="Audio chunk length in milliseconds fed to the STT engine")
+    parser.add_argument("--playback", action="store_true", help="Play TTS output on speakers")
+    parser.add_argument("--idle-timeout", type=float, default=10.0, help="Seconds of silence before exiting mic mode")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -327,6 +615,20 @@ def main():
     # Shared LLM
     parser.add_argument("--ollama-model", default="phi3:mini", help="Ollama model (e.g. phi3:mini)")
     parser.add_argument("--ollama-url", default="http://localhost:11434/api/generate", help="Ollama generate endpoint")
+    parser.add_argument("--tts-chunk-max-chars", type=int, default=DEFAULT_CHUNK_MAX_CHARS,
+                        help="Safety-net chunk length: a sentence longer than this is split at a "
+                             "word boundary so TTS does not wait for the whole response. "
+                             "Lower means lower TTFA, higher means better prosody.")
+    parser.add_argument("--system-prompt-file", type=str, default=None,
+                        help="Path to a .txt file holding the system prompt. Prompt variants live "
+                             "in prompts/ and are identified by filename; a variant is never edited "
+                             "in place, a change means a new file. Falls back to the built-in prompt.")
+    parser.add_argument("--llm-temperature", type=float, default=0.7,
+                        help="Sampling temperature. Use 0 together with --llm-seed for A/B runs.")
+    parser.add_argument("--llm-seed", type=int, default=None,
+                        help="Sampling seed. Leave unset for non-deterministic sampling.")
+    parser.add_argument("--llm-max-tokens", type=int, default=150,
+                        help="Maximum number of tokens the LLM may generate")
 
     # ---- config file handling & parse ----
     initial_parser = argparse.ArgumentParser(add_help=False)
@@ -341,79 +643,90 @@ def main():
 
     args = parser.parse_args()
 
-    if not args.audio:
-        parser.error("the following arguments are required: --audio (either in CLI or config)")
+    if args.input_mode == "mic":
+        args.audio = ["mic"]
+    else:
+        if not args.audio:
+            parser.error("--audio is required when --input-mode is 'file' (either in CLI or config)")
 
-    expanded_audio = []
-    valid_extensions = {
-        ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".m4b", ".aac", ".wma", 
-        ".amr", ".aiff", ".opus", ".webm", ".mp4", ".mkv", ".avi", ".mov"
-    }
-    for p in args.audio:
-        path_obj = Path(p)
-        if not path_obj.exists():
-            print(f"[WARN] Input path does not exist: {p}")
-            continue
-        if path_obj.is_dir():
-            for child in path_obj.iterdir():
-                if child.is_file() and child.suffix.lower() in valid_extensions:
-                    expanded_audio.append(str(child))
-        else:
-            expanded_audio.append(str(path_obj))
+        expanded_audio = []
+        valid_extensions = {
+            ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".m4b", ".aac", ".wma",
+            ".amr", ".aiff", ".opus", ".webm", ".mp4", ".mkv", ".avi", ".mov"
+        }
+        for p in args.audio:
+            path_obj = Path(p)
+            if not path_obj.exists():
+                print(f"[WARN] Input path does not exist: {p}")
+                continue
+            if path_obj.is_dir():
+                for child in path_obj.iterdir():
+                    if child.is_file() and child.suffix.lower() in valid_extensions:
+                        expanded_audio.append(str(child))
+            else:
+                expanded_audio.append(str(path_obj))
 
-    if not expanded_audio:
-        parser.error("No valid audio files found in the provided --audio paths.")
+        if not expanded_audio:
+            parser.error("No valid audio files found in the provided --audio paths.")
 
-    args.audio = sorted(expanded_audio)
+        args.audio = sorted(expanded_audio)
+
+    # Prompt files are local and not version controlled, so a missing one is a
+    # normal setup mistake rather than a bug: report it like any bad argument.
+    try:
+        prompt_label, system_prompt = load_system_prompt(args.system_prompt_file)
+    except (OSError, ValueError) as e:
+        parser.error(f"--system-prompt-file could not be loaded: {e}")
 
     if args.whisper_device is None:
         args.whisper_device = "cuda" if args.mode == "gpu" else "cpu"
     if args.whisper_compute_type is None:
         args.whisper_compute_type = "float16" if args.whisper_device == "cuda" else "int8"
 
-    # Pre-load Piper sample rate to avoid disk I/O on every chunk (only needed for --piper-use-exe fallback)
-    piper_sample_rate = 16000
-    if args.tts_engine == "piper":
-        json_path = args.piper_voice + ".json"
-        if os.path.exists(json_path):
-            try:
-                with open(json_path, 'r', encoding='utf-8') as f:
-                    vdata = json.load(f)
-                    piper_sample_rate = vdata.get("audio", {}).get("sample_rate", 16000)
-            except Exception:
-                pass
+    # The initial, blocking nvidia-smi read happens before any stage is timed.
+    start_gpu_sampler()
 
-    # Pre-load (warmup) models so their initialization time isn't counted in the latency of the first file
+    # Pre-load (warmup) models so their initialization time isn't counted
+    # in the latency of the first file
     print("[INFO] Pre-loading AI models (STT, LLM, TTS)...")
-    
-    # Ollama Warmup (betöltés VRAM/RAM-ba)
-    try:
-        _requests_session.post(args.ollama_url, json={
-            "model": args.ollama_model,
-            "prompt": "",
-            "options": {"num_predict": 1}
-        }, timeout=120)
-    except Exception as e:
-        print(f"[WARN] Failed to warmup Ollama: {e}")
 
-    global _vosk_model, _vosk_recognizer, _whisper_model, _coqui_tts, _piper_voice
+    # Initialize STT engine
     if args.stt_engine == "vosk":
-        _vosk_model = Model(args.vosk_model)
-        _vosk_recognizer = KaldiRecognizer(_vosk_model, 16000)
-        _vosk_recognizer.SetWords(True)
+        stt_engine = VoskEngine(args.vosk_model)
     elif args.stt_engine == "whisper":
-        _whisper_model = WhisperModel(args.whisper_model, device=args.whisper_device, compute_type=args.whisper_compute_type)
+        stt_engine = WhisperEngine(
+            args.whisper_model,
+            device=args.whisper_device,
+            compute_type=args.whisper_compute_type,
+        )
 
-    if args.tts_engine == "piper" and not args.piper_use_exe:
-        try:
-            _piper_voice = PiperVoice.load(args.piper_voice)
-            print(f"[INFO] Piper Python API loaded (model: {args.piper_voice})")
-        except Exception as e:
-            print(f"[WARN] Piper Python API failed ({e}), falling back to CLI executable")
-            args.piper_use_exe = True
+    # Initialize LLM engine
+    print(f"[INFO] System prompt: {prompt_label}")
+    llm_engine = OllamaEngine(
+        model=args.ollama_model,
+        url=args.ollama_url,
+        system_prompt=system_prompt,
+        max_tokens=args.llm_max_tokens,
+        temperature=args.llm_temperature,
+        seed=args.llm_seed,
+        chunk_max_chars=args.tts_chunk_max_chars,
+    )
+    llm_engine.warmup()
 
-    if args.tts_engine == "coqui":
-        _coqui_tts = TTS(model_name=f"tts_models/multilingual/multi-dataset/{args.coqui_voice}")
+    # Initialize TTS engine
+    if args.tts_engine == "piper":
+        tts_engine = PiperEngine(
+            voice_path=args.piper_voice,
+            exe_path=args.piper_exe,
+            use_exe=args.piper_use_exe,
+        )
+    elif args.tts_engine == "coqui":
+        tts_engine = CoquiEngine(
+            model_name=args.coqui_voice,
+            language=args.coqui_language,
+            speaker=args.coqui_speaker,
+        )
+    tts_engine.warmup()
 
     run_dir = os.path.join(args.out_dir, timestamp)
     os.makedirs(run_dir, exist_ok=True)
@@ -422,7 +735,7 @@ def main():
         args.latency_csv = os.path.join(run_dir, f"latency_log_{timestamp}.csv")
 
     config_to_save = vars(args).copy()
-    
+
     # Filter out settings that are not used by the selected engine
     if args.stt_engine == "whisper":
         config_to_save.pop("vosk_model", None)
@@ -444,12 +757,17 @@ def main():
     with open(config_dump_path, "w", encoding="utf-8") as f:
         yaml.dump(config_to_save, f, sort_keys=False)
 
+    save_system_prompt(run_dir, prompt_label, system_prompt)
+
     fieldnames = [
         "ts_iso", "mode", "stt_engine", "tts_engine", "item", "stage", "duration_ms",
         "cpu_percent", "ram_percent", "rss_mb",
         "gpu_util_percent", "gpu_mem_used_mb", "gpu_mem_total_mb", "gpu_name",
         "extra_json",
     ]
+
+    # Signals the microphone source to stop capturing
+    shutdown_event = threading.Event()
 
     # Prepare CSV
     csv_exists = os.path.exists(args.latency_csv)
@@ -460,154 +778,248 @@ def main():
 
         for item_index, audio_path in enumerate(args.audio, start=1):
             print("=" * 60)
-            audio_file = Path(audio_path)
-            if not audio_file.exists():
-                raise FileNotFoundError(audio_path)
-
-            item_name = audio_file.stem
-            print(f"[INFO] Processing audio file: {audio_file}")
-
-            user_wav = os.path.join(run_dir, f"user_input_{item_index}_{audio_file.name}")
-            try:
-                if os.path.abspath(audio_path) != os.path.abspath(user_wav):
-                    shutil.copyfile(audio_path, user_wav)
-            except Exception as e:
-                print(f"[WARN] Copy failed: {e}")
-
-            wav_path = ensure_wav_mono_16k(audio_path, out_dir=run_dir, prefix=f"input_{item_index}")
-            input_duration_ms = wav_duration_ms(wav_path)
             
-            if args.stt_engine == "vosk":
-                _vosk_recognizer.Reset()
+            wav_path = None
+            if args.input_mode == "mic":
+                item_name = "live_mic"
+                user_wav = os.path.join(run_dir, f"user_input_{item_index}_{item_name}.wav")
+                audio_source = MicAudioSource(
+                    save_path=user_wav,
+                    chunk_ms=args.audio_chunk_ms,
+                    stop_event=shutdown_event,
+                )
+                print(f"[INFO] Processing live microphone input (saving to {user_wav})...")
+            else:
+                audio_file = Path(audio_path)
+                if not audio_file.exists():
+                    raise FileNotFoundError(audio_path)
+
+                item_name = audio_file.stem
+                print(f"[INFO] Processing audio file: {audio_file} (pacing: {args.audio_pacing})")
+
+                user_wav = os.path.join(run_dir, f"user_input_{item_index}_{audio_file.name}")
+                try:
+                    if os.path.abspath(audio_path) != os.path.abspath(user_wav):
+                        shutil.copyfile(audio_path, user_wav)
+                except Exception as e:
+                    print(f"[WARN] Copy failed: {e}")
+
+                wav_path = ensure_wav_mono_16k(audio_path, out_dir=run_dir, prefix=f"input_{item_index}")
+                audio_source = FileAudioSource(
+                    wav_path,
+                    pacing=args.audio_pacing,
+                    chunk_ms=args.audio_chunk_ms,
+                    stop_event=shutdown_event,
+                )
+
+            out_wav = os.path.join(run_dir, f"assistant_{item_index}_{item_name}.wav")
+
+            # Shared metrics dicts (single-writer per dict = thread-safe).
+            # The *_stats entries hold the snapshot taken at that milestone.
+            stt_metrics = {"stt_ms": None, "user_text": None, "stats": None}
+            llm_metrics = {
+                "llm_t0": None, "llm_ttfc_ms": None, "llm_ttft_ms": None,
+                "first_chunk_chars": None,
+                "full_assistant_text": "", "llm_chunk_count": 0,
+                "ollama_stats": None,
+                "ttft_stats": None, "ttfc_stats": None, "end_stats": None,
+            }
+            tts_metrics = {
+                "tts_first_chunk_ms": None, "tts_first_chunk_t": None,
+                "total_tts_time": 0.0,
+                "first_chunk_stats": None, "end_stats": None,
+            }
+
+            # STT hands over utterances through a single-slot mailbox (only the
+            # newest one matters); TTS chunks are a FIFO, so they stay a queue.
+            mailbox = UtteranceMailbox()
+            tts_queue = queue.Queue()
+
+            # Opens the main thread's window, which spans the whole item.
+            prime_cpu_percent()
 
             e2e_t0 = time.perf_counter()
 
-            # -------- STT --------
-            t0 = time.perf_counter()
-            if args.stt_engine == "vosk":
-                user_text = transcribe_with_vosk(wav_path)
-            else:
-                user_text = stt_whisper(wav_path)
-            t1 = time.perf_counter()
-            stt_ms = int((t1 - t0) * 1000)
+            # Start worker threads
+            stt_t = threading.Thread(
+                target=stt_worker,
+                args=(stt_engine, audio_source, mailbox, stt_metrics,
+                      args.input_mode),
+                daemon=True,
+            )
+            llm_t = threading.Thread(
+                target=llm_worker,
+                args=(llm_engine, mailbox, tts_queue, llm_metrics),
+                daemon=True,
+            )
+            tts_t = threading.Thread(
+                target=tts_worker,
+                args=(tts_engine, tts_queue, out_wav, tts_metrics, args.playback),
+                daemon=True,
+            )
+
+            stt_t.start()
+            llm_t.start()
+            tts_t.start()
+
+            # Wait for completion or interrupt
+            try:
+                if args.input_mode == "file":
+                    stt_t.join()
+                    llm_t.join()
+                    tts_t.join()
+                else:
+                    last_action_t = time.perf_counter()
+                    while True:
+                        time.sleep(1.0)
+                        now = time.perf_counter()
+                        
+                        if llm_metrics.get("is_busy") or tts_metrics.get("is_busy"):
+                            last_action_t = now
+                        else:
+                            last_action_t = max(
+                                last_action_t,
+                                stt_metrics.get("last_speech_t", e2e_t0),
+                                tts_metrics.get("last_play_t", e2e_t0)
+                            )
+                            
+                        if now - last_action_t > args.idle_timeout:
+                            print(f"\n[INFO] Idle timeout reached ({args.idle_timeout}s). Stopping.")
+                            shutdown_event.set()
+                            break
+            except KeyboardInterrupt:
+                print("\n[INFO] Graceful shutdown triggered by user (Ctrl+C).")
+                shutdown_event.set()
+
+            # Let the workers drain before their metrics are read, otherwise the
+            # response WAV may still be open while its duration is measured.
+            for worker in (stt_t, llm_t, tts_t):
+                worker.join(timeout=WORKER_SHUTDOWN_TIMEOUT_S)
+                if worker.is_alive():
+                    print(f"[WARN] {worker.name} did not stop within "
+                          f"{WORKER_SHUTDOWN_TIMEOUT_S}s.")
+
+            # -------- Collect metrics and write to CSV --------
+            # Covers the item as a whole rather than a single stage.
+            e2e_stats = collect_resource_snapshot()
+
+            if args.input_mode == "mic":
+                e2e_t0 = stt_metrics.get("last_speech_t", e2e_t0)
+
+            user_text = stt_metrics.get("user_text") or ""
+            stt_ms = stt_metrics.get("stt_ms") or 0
+            # Read after the workers finish: a mic source only knows how much
+            # audio it captured once capturing has stopped.
+            input_duration_ms = audio_source.duration_ms
+
             stt_rtf = round(stt_ms / input_duration_ms, 3) if input_duration_ms > 0 else 0.0
             write_timing(writer, args, item_name, "stt", stt_ms,
+                         stt_metrics.get("stats"),
                          {"input_duration_ms": input_duration_ms, "stt_rtf": stt_rtf})
-            print(f"[STT] {user_text!r}")
 
             if not user_text:
                 print("[Warn] No text recognized. Skipping to next file.")
-                write_timing(writer, args, item_name, "e2e_response_ready", int((time.perf_counter() - e2e_t0) * 1000),
+                write_timing(writer, args, item_name, "e2e_response_ready",
+                             int((time.perf_counter() - e2e_t0) * 1000),
+                             e2e_stats,
                              {"input_duration_ms": input_duration_ms, "skipped": True})
+                fcsv.flush()
                 continue
 
-            # -------- LLM & TTS Streaming --------
-            print(f"[LLM] Starting stream...")
-            out_wav = os.path.join(run_dir, f"assistant_{item_index}_{item_name}.wav")
-            first_chunk_ts = None
-            final_wav = None
-            llm_t0 = time.perf_counter()
-            
-            total_tts_time = 0.0
-            tts_first_chunk_ms = None
-            llm_ttfc_ms = None
-            full_reply = ""
-            ollama_stats = None
-            chunk_count = 0
-            
-            for chunk_data in stream_llm_ollama_chat(user_text, model_name=args.ollama_model, url=args.ollama_url):
-                # Handle dict-based chunk from generator
-                if isinstance(chunk_data, dict):
-                    chunk = chunk_data.get("text", "")
-                    if chunk_data.get("ollama_stats"):
-                        ollama_stats = chunk_data["ollama_stats"]
-                else:
-                    chunk = chunk_data  # fallback for plain string
-                
-                if not chunk:
-                    continue
-                chunk_count += 1
-                
-                # LLM Time to First (synthesizable) Chunk
-                if first_chunk_ts is None:
-                    first_chunk_ts = time.perf_counter()
-                    llm_ttfc_ms = int((first_chunk_ts - llm_t0) * 1000)
-                    write_timing(writer, args, item_name, "llm_ttfc", llm_ttfc_ms)
-                    
-                print(f"[LLM Chunk {chunk_count}] {chunk}")
-                full_reply += chunk + " "
-                
-                tts_t0 = time.perf_counter()
-                if args.tts_engine == "piper":
-                    if _piper_voice is not None:
-                        pcm_bytes, sample_rate = tts_piper_python(chunk)
-                    else:
-                        pcm_bytes, sample_rate = tts_piper_exe(
-                            chunk, args.piper_exe, args.piper_voice, sample_rate=piper_sample_rate
-                        )
-                else:
-                    pcm_bytes, sample_rate = tts_coqui_stream(
-                        chunk, args.coqui_language, args.coqui_speaker
-                    )
-                tts_t1 = time.perf_counter()
-                chunk_tts_ms = int((tts_t1 - tts_t0) * 1000)
-                total_tts_time += (tts_t1 - tts_t0)
-                
-                # Track TTS first chunk time separately
-                if tts_first_chunk_ms is None:
-                    tts_first_chunk_ms = chunk_tts_ms
-                    write_timing(writer, args, item_name, "tts_first_chunk", tts_first_chunk_ms)
-                
-                # Közvetlenül a nyitva tartott fájl pufferébe írunk (valódi streaming)
-                if final_wav is None:
-                    final_wav = wave.open(out_wav, "wb")
-                    final_wav.setnchannels(1)
-                    final_wav.setsampwidth(2) # 16-bit
-                    final_wav.setframerate(sample_rate)
-                
-                final_wav.writeframes(pcm_bytes)
+            # LLM TTFT (first token) and TTFC (first chunk handed to TTS).
+            # These differ by the time the chunker spends filling a chunk.
+            llm_ttft_ms = llm_metrics.get("llm_ttft_ms")
+            if llm_ttft_ms is not None:
+                write_timing(writer, args, item_name, "llm_ttft", llm_ttft_ms,
+                             llm_metrics.get("ttft_stats"))
 
-            if final_wav:
-                final_wav.close()
-            
-            # TTFA (Time to First Audio) = STT + LLM TTFC + TTS first chunk
-            if llm_ttfc_ms is not None and tts_first_chunk_ms is not None:
-                ttfa_ms = stt_ms + llm_ttfc_ms + tts_first_chunk_ms
-                write_timing(writer, args, item_name, "ttfa", ttfa_ms)
-            
+            llm_ttfc_ms = llm_metrics.get("llm_ttfc_ms")
+            if llm_ttfc_ms is not None:
+                write_timing(writer, args, item_name, "llm_ttfc", llm_ttfc_ms,
+                             llm_metrics.get("ttfc_stats"))
+
+            # How long the chunker spent filling the opening chunk once the model
+            # had started producing tokens. This is the slice a short opening
+            # sentence is meant to remove.
+            # The ttfc snapshot's CPU window is exactly this interval.
+            if llm_ttfc_ms is not None and llm_ttft_ms is not None:
+                write_timing(writer, args, item_name, "llm_first_chunk_fill",
+                             llm_ttfc_ms - llm_ttft_ms,
+                             llm_metrics.get("ttfc_stats"),
+                             {"first_chunk_chars": llm_metrics.get("first_chunk_chars"),
+                              "system_prompt": prompt_label})
+
+            # TTS first chunk
+            tts_first_chunk_ms = tts_metrics.get("tts_first_chunk_ms")
+            if tts_first_chunk_ms is not None:
+                write_timing(writer, args, item_name, "tts_first_chunk", tts_first_chunk_ms,
+                             tts_metrics.get("first_chunk_stats"))
+
+            # TTFA (wall-clock time from start of processing to first audio ready)
+            tts_first_t = tts_metrics.get("tts_first_chunk_t")
+            if tts_first_t is not None:
+                ttfa_ms = int((tts_first_t - e2e_t0) * 1000)
+                # Both TTFA rows end at the same instant as tts_first_chunk and
+                # share its snapshot.
+                write_timing(writer, args, item_name, "ttfa", ttfa_ms,
+                             tts_metrics.get("first_chunk_stats"))
+
+                # TTFA anchored at the end of the speech, which is what a user
+                # actually perceives. Only meaningful with realtime pacing; with
+                # 'fast' pacing the audio ends as soon as it is read.
+                speech_end_t = stt_metrics.get("speech_end_t")
+                if speech_end_t is not None:
+                    write_timing(writer, args, item_name, "ttfa_from_speech_end",
+                                 int((tts_first_t - speech_end_t) * 1000),
+                                 tts_metrics.get("first_chunk_stats"),
+                                 {"audio_pacing": args.audio_pacing})
+
             # LLM server-side evaluation metrics (ground truth from Ollama)
+            ollama_stats = llm_metrics.get("ollama_stats")
             if ollama_stats:
                 eval_dur_ns = ollama_stats.get("eval_duration_ns", 0)
                 eval_count = ollama_stats.get("eval_count", 0)
                 tokens_per_sec = round(eval_count / (eval_dur_ns / 1e9), 1) if eval_dur_ns > 0 else 0.0
-                write_timing(writer, args, item_name, "llm_eval", int(eval_dur_ns / 1e6), {
-                    "eval_tokens": eval_count,
-                    "tokens_per_sec": tokens_per_sec,
-                    "prompt_tokens": ollama_stats.get("prompt_eval_count", 0),
-                    "prompt_eval_ms": int(ollama_stats.get("prompt_eval_duration_ns", 0) / 1e6),
-                    "total_duration_ms": int(ollama_stats.get("total_duration_ns", 0) / 1e6),
-                })
-            
-            # Log total TTS time
-            write_timing(writer, args, item_name, "tts_total", int(total_tts_time * 1000))
-            
-            # Output audio duration
-            output_duration_ms = wav_duration_ms(out_wav) if os.path.exists(out_wav) else 0
-            
-            write_timing(writer, args, item_name, "e2e_response_ready", int((time.perf_counter() - e2e_t0) * 1000),
+                write_timing(writer, args, item_name, "llm_eval", int(eval_dur_ns / 1e6),
+                             llm_metrics.get("end_stats"),
+                             {"eval_tokens": eval_count,
+                              "tokens_per_sec": tokens_per_sec,
+                              "prompt_tokens": ollama_stats.get("prompt_eval_count", 0),
+                              "prompt_eval_ms": int(ollama_stats.get("prompt_eval_duration_ns", 0) / 1e6),
+                              "total_duration_ms": int(ollama_stats.get("total_duration_ns", 0) / 1e6)})
+
+            # Log total TTS time. A response that synthesized nothing left this
+            # worker's CPU window unopened, so its snapshot would read 0.0.
+            write_timing(writer, args, item_name, "tts_total",
+                         int(tts_metrics["total_tts_time"] * 1000),
+                         tts_metrics.get("end_stats") if tts_metrics["total_tts_time"] > 0 else None)
+
+            # Output audio duration and E2E summary. A mic session answers more
+            # than once, so the reported duration covers every response WAV.
+            response_wavs = [p for p in tts_metrics.get("out_wavs", []) if os.path.exists(p)]
+            output_duration_ms = sum(wav_duration_ms(p) for p in response_wavs)
+            full_reply = llm_metrics["full_assistant_text"].strip()
+
+            write_timing(writer, args, item_name, "e2e_response_ready",
+                         int((time.perf_counter() - e2e_t0) * 1000),
+                         e2e_stats,
                          {"input_duration_ms": input_duration_ms,
                           "output_duration_ms": output_duration_ms,
-                          "output_wav": out_wav,
-                          "full_text": full_reply.strip(),
-                          "response_word_count": len(full_reply.split()),
-                          "response_char_count": len(full_reply.strip()),
-                          "llm_chunk_count": chunk_count})
-            print(f"[TTS] Stream finished. Saved to {out_wav}.")
+                          "output_wav": response_wavs[0] if response_wavs else "",
+                          "output_wav_count": len(response_wavs),
+                          "full_text": full_reply,
+                          "response_word_count": len(full_reply.split()) if full_reply else 0,
+                          "response_char_count": len(full_reply),
+                          "llm_chunk_count": llm_metrics["llm_chunk_count"]})
+            print(f"[TTS] Stream finished. Saved to {', '.join(response_wavs) or '(no audio)'}.")
+
+            # Flush CSV after each item to prevent data loss
+            fcsv.flush()
 
             # --- Transcript Logging ---
             transcript_record = {
                 "stt_text": user_text,
-                "llm_text": full_reply.strip()
+                "llm_text": full_reply,
             }
 
             # JSONL Logging
@@ -620,11 +1032,20 @@ def main():
             with open(yaml_path, "a", encoding="utf-8") as f_yaml:
                 yaml.dump([transcript_record], f_yaml, sort_keys=False, allow_unicode=True)
 
-            if not args.keep_normalized:
+            if args.input_mode == "file" and not args.keep_normalized:
                 try:
                     os.remove(wav_path)
                 except Exception:
                     pass
+
+            # The stop signal is shared by every item, so a Ctrl+C or an idle
+            # timeout ends the whole run instead of feeding empty audio to the
+            # remaining files.
+            if shutdown_event.is_set():
+                print("[INFO] Stop requested, skipping any remaining items.")
+                break
+
+    stop_gpu_sampler()
 
     print(f"\nDone. Latency/resource log appended to: {args.latency_csv}")
     return 0
