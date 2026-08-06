@@ -118,7 +118,7 @@ python mwe_assistant.py --audio .\a.wav .\b.mp3 .\c.flac --stt-engine whisper --
 Input and pacing:
 
 - `--input-mode {file,mic}`: file input or live capture, default `file`
-- `--audio-pacing {realtime,fast}`: how file input is fed to the STT. `realtime` delivers at 1x speed like a microphone and is required for `ttfa`; `fast` reads as quickly as possible, for throughput and for comparability with older measurements. The CLI default is `realtime`, but the shipped `default_config.yaml` sets `fast`, so a run started from that config gets `fast` unless the flag overrides it
+- `--audio-pacing {realtime,fast}`: how file input is fed to the STT, default `realtime`. `realtime` delivers at 1x speed like a microphone and is required for `ttfa`; `fast` reads as quickly as possible, which suits throughput runs and per-stage costs
 - `--file-realtime-trigger {endpoint,end-of-file}`: what starts the LLM under file input with realtime pacing, default `end-of-file`. See [Trailing silence in input files](#trailing-silence-in-input-files)
 - `--audio-chunk-ms N`: chunk length handed to the STT, default `250`
 - `--playback`: play the TTS output on speakers
@@ -204,7 +204,7 @@ Under `endpoint`, a second end-of-speech signal within one input carries **every
 - A row's CPU window matches its `duration_ms` exactly for `stt`, `llm_ttft`, `llm_first_chunk_fill`, `tts_first_chunk` and `e2e_response_ready`. The rest are approximations: `llm_ttfc` is timed from the start of the request but its CPU window starts at the first token; `ttfa` reuses the `tts_first_chunk` snapshot and `stt_endpoint_delay` the `stt` one; `llm_eval` and `tts_total` carry the snapshot taken when their worker finished.
 - GPU stats are read from `nvidia-smi`; if unavailable or no NVIDIA GPU is present, those fields stay blank. A background sampler refreshes them every second, which keeps the subprocess off the measured path. Fields the driver reports as `[N/A]` are stored blank so the numeric columns stay numeric.
 - `e2e_response_ready` runs from the start of processing to the complete response, in every mode. On file input it therefore includes the delivery of the audio; on a microphone it covers the whole session. It is a wall-clock span, not a latency — for latency use `ttfa`.
-- `stt_rtf` is `stt` divided by the audio duration. Under `realtime` pacing `stt` includes waiting for the audio to arrive, so the ratio exceeds 1 and no longer expresses a real-time factor. Only the `fast` figures do.
+- `stt_rtf` is `stt` divided by the audio duration. It expresses a real-time factor only under `fast` pacing. Under `realtime` pacing `stt` includes waiting for the audio to arrive, which puts the ratio above 1 and makes it a measure of something else.
 - Response length varies enough between runs to hide the effect under test: `llm_eval`, `tts_total` and `e2e_response_ready` scale with it. Pin `llm-temperature: 0` or an `llm-seed` before comparing configurations. `ttfa` and `stt_endpoint_delay` are unaffected, as both conclude before the response length is known.
 
 
@@ -323,11 +323,6 @@ own `ttfa`. Comparisons across engines carry that bias.
 | **extra_json** | – (shares the `stt` row's resource snapshot) |
 | **Blank when** | Same conditions as `ttfa`. |
 
-Typical values measured on `vosk-model-small-en-us-0.15`: ~1100 ms when the
-endpointer fires, ~400 ms when the stream ends first (file input with too little
-trailing silence). Whisper has no endpointer, so its figure is the remaining audio
-plus the entire decode.
-
 ---
 
 ### `llm_ttft` – LLM time to first token
@@ -389,8 +384,8 @@ plus the entire decode.
 
 | Relationship | Always true? |
 |-------------|-------------|
-| `ttfa ≈ stt_endpoint_delay + llm_ttfc + tts_first_chunk` | ✅ To within a few ms — measured at +3 and +4 ms over 16 samples per engine |
-| `ttfa = stt + llm_ttfc + tts_first_chunk` | ❌ **No.** The old formula. `stt` mostly runs *before* the speaker stops, so it is not on the TTFA path at all |
+| `ttfa ≈ stt_endpoint_delay + llm_ttfc + tts_first_chunk` | ✅ To within a few ms |
+| `ttfa` includes any part of `stt` | ❌ `stt` mostly runs while the speaker is still talking, so it is not on the TTFA path |
 | `llm_ttfc = llm_ttft + llm_first_chunk_fill` | ✅ By definition — `llm_first_chunk_fill` is derived from the other two |
 | `e2e >= ttfa` | ✅ But note they start at different instants: `e2e` runs from the start of processing, `ttfa` from the end of the speech, so `e2e` also contains the speech itself |
 | `tts_total >= tts_first_chunk` | ✅ The total is the sum of all chunks |

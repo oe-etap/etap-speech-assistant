@@ -19,9 +19,9 @@ input-mode: file  # 'file' or 'mic'
 #             Input files need ~1.2-1.5 s of silence after the last word, or the
 #             endpointer never fires and the run measures a path live input
 #             never takes. A warning is printed when there is too little.
-#   fast:     read as quickly as possible (original batch behaviour), kept for
-#             comparability with earlier measurements and for throughput.
-audio-pacing: fast
+#   fast:     read as quickly as possible, for throughput runs and for the
+#             per-stage costs, which stay valid without the pacing.
+audio-pacing: realtime
 
 # What starts the LLM under file input with realtime pacing.
 #   endpoint:    answer as soon as the STT calls the utterance over, which is
