@@ -1,23 +1,26 @@
 # Offline Speech Assistant MWE (EN) - File Input, CPU/GPU
 
-Existing audio file(s) -> STT -> LLM -> TTS, mostly offline. The only network-like dependency is the local Ollama HTTP API, and Ollama model downloads happen outside this script.
+Audio -> STT -> LLM -> TTS, mostly offline. The only network-like dependency is the local Ollama HTTP API, and Ollama model downloads happen outside this script.
 
-The script is batch-oriented: it does not record from the microphone. It processes one or more pre-recorded English audio files, writes generated response WAVs, and logs latency plus best-effort CPU/RAM/GPU statistics.
+Input comes either from pre-recorded English audio files or from a live microphone. The three pipeline stages run as concurrent workers and stream into each other, so the TTS starts on the first sentence while the LLM is still generating the rest. The script writes response WAVs and logs latency plus best-effort CPU/RAM/GPU statistics.
 
 ## Features
 
 - Configuration via YAML files (`--config`) or CLI arguments
 - Logs conversation transcripts (STT and LLM text) to `transcripts.jsonl` and `transcripts.yaml`
 - Saves the exact runtime configuration to `config_used.yaml`
-- File-only input via `--audio file1.wav file2.mp3 ...`
+- File input via `--audio file1.wav file2.mp3 ...`, or live capture via `--input-mode mic`
+- File input can be paced at 1x speed (`--audio-pacing realtime`) so that STT overlaps with the speech exactly as it would on a microphone — this is what makes file-based latency numbers carry over to a live deployment
+- Concurrent STT / LLM / TTS workers; a new utterance can interrupt an answer still being generated
 - English-only STT prompt flow and English TTS defaults
 - Selectable STT engine: `--stt-engine vosk` or `--stt-engine whisper`
 - Selectable TTS engine: `--tts-engine piper` or `--tts-engine coqui`
 - CPU/GPU preset via `--mode cpu|gpu`
 - Whisper can run on CPU or CUDA via `--whisper-device cpu|cuda`
 - Input audio is normalized to mono 16 kHz WAV using `ffmpeg`
-- Per-stage timing: `stt`, `llm`, `tts`
-- End-to-end timing: `e2e_response_ready`, measured from the end of the input audio being available to the response audio file being ready
+- Per-stage timing: `stt`, `stt_endpoint_delay`, `llm_ttft`, `llm_first_chunk_fill`, `llm_ttfc`, `tts_first_chunk`, `llm_eval`, `tts_total`
+- `ttfa`: time from the speaker stopping to the first audio out — the figure a user actually perceives
+- `e2e_response_ready`: wall-clock span of the whole item
 - Best-effort resource stats in CSV: CPU %, RAM %, process RSS, and NVIDIA GPU utilization/memory when available
 
 ## Requirements
@@ -111,12 +114,33 @@ python mwe_assistant.py --audio .\a.wav .\b.mp3 .\c.flac --stt-engine whisper --
 - `--out-dir DIR`: base output directory, default `outputs`
 - `--latency-csv PATH`: custom CSV path
 - `--keep-normalized`: keep the intermediate mono 16 kHz WAV files
+
+Input and pacing:
+
+- `--input-mode {file,mic}`: file input or live capture, default `file`
+- `--audio-pacing {realtime,fast}`: how file input is fed to the STT. `realtime` delivers at 1x speed like a microphone and is required for `ttfa`; `fast` reads as quickly as possible, for throughput and for comparability with older measurements. The CLI default is `realtime`, but the shipped `default_config.yaml` sets `fast`, so a run started from that config gets `fast` unless the flag overrides it
+- `--file-realtime-trigger {endpoint,end-of-file}`: what starts the LLM under file input with realtime pacing, default `end-of-file`. See [Trailing silence in input files](#trailing-silence-in-input-files)
+- `--audio-chunk-ms N`: chunk length handed to the STT, default `250`
+- `--playback`: play the TTS output on speakers
+- `--idle-timeout SECONDS`: silence before mic mode exits, default `10`
+
+LLM and TTS behaviour:
+
+- `--system-prompt-file PATH`: prompt variant; the one used is copied to `<out-dir>/system_prompt.txt`
+- `--llm-temperature FLOAT`: sampling temperature, default `0.7`. Set to `0` for reproducible runs
+- `--llm-seed INT`: sampling seed; pin this (or the temperature) before comparing configurations
+- `--llm-max-tokens N`: response cap, default `150`
+- `--tts-chunk-max-chars N`: safety-net chunk length for the LLM → TTS handoff, default `140`. Lower = lower TTFA, higher = better prosody
+
+Engines:
+
 - `--vosk-model PATH`: English Vosk model directory
 - `--whisper-model NAME`: faster-whisper model name, default `small`
 - `--whisper-device {cpu,cuda}`: explicit Whisper device
 - `--whisper-compute-type TYPE`: for example `int8` on CPU or `float16` on CUDA
 - `--piper-exe PATH`: Piper executable
 - `--piper-voice PATH`: English Piper `.onnx` voice
+- `--piper-use-exe`: call the Piper CLI instead of the Python API (slower, spawns a subprocess per chunk)
 - `--coqui-voice NAME`: default `xtts_v2`
 - `--coqui-language CODE`: default `en`
 - `--coqui-speaker NAME`: default `Daisy Studious`
@@ -188,26 +212,48 @@ Under `endpoint`, a second end-of-speech signal within one input carries **every
 
 ## Timeline
 
+Under `realtime` pacing or a live microphone. The two things that matter: the STT
+works *while the speaker is still talking*, and TTFA starts when the speaker stops,
+not when processing does.
+
 ```
-User finishes speaking
-  │
-  ├─── STT ───────┬─── LLM TTFC ───┬──── TTS₁ ──┐
-  │    (stt)      │   (llm_ttfc)   │(tts_first) │
-  │               │                │            │
-  │               │                │   TTFA ◄───┘
-  │               │                │
-  │               │  ┌─── LLM eval ──────────────┐  ← Ollama server-side
-  │               │  │   (llm_eval)              │
-  │               │  └───────────────────────────┘
-  │               │                │
-  │               ├─── TTS₂ ──┬─── TTS₃ ──┐
-  │               │           │           │
-  │               └───────────┴───────────┘
-  │                  (tts_total = Σ TTS)
-  │                                        │
-  ├────────────────────────────────────────┘
-  │              e2e_response_ready
+ e2e_t0 ──── the run begins, audio starts arriving at 1x ───────────────────┐
+   │                                                                        │
+   │  ┌── STT decodes as each chunk lands, overlapped with the speech ──┐   │
+   │  │                                                          (stt)  │   │
+   ▼  │                                                                 │   │
+ speaker stops ◄══ TTFA IS ANCHORED HERE ══════════════════════════╗    │   │
+   │  │   trailing silence keeps playing; the endpointer listens    ║    │   │
+   │  └── endpointer fires, the transcript exists ──────────────────╢    │   │
+   │                                     (stt_endpoint_delay)       ║    │   │
+   ▼                                                                ║        │
+ transcript ready                                                   ║        │
+   │      ├── first token ............................ (llm_ttft)   ║        │
+   │      └── first speakable chunk .................. (llm_ttfc)   ║        │
+   ▼                                                                ║        │
+ first chunk ready                                                  ║        │
+   │      └── TTS synthesises that chunk ....... (tts_first_chunk)  ║        │
+   ▼                                                                ║        │
+ first audio out ◄══════════════════════════════════════════════════╝ = TTFA │
+   │                                                                         │
+   │      remaining chunks stream out       (tts_total, llm_eval)            │
+   ▼                                                                         │
+ response complete ─────────────────────────────────────────────────────────┘
+                                                       = e2e_response_ready
 ```
+
+Two consequences fall out of the shape:
+
+- **`stt` is not part of TTFA.** Most of it happens before the speaker stops. Only
+  what is left over — `stt_endpoint_delay` — lands on the critical path. This is the
+  whole reason a streaming engine beats a buffering one on perceived latency.
+- **`e2e_response_ready` and `ttfa` start at different instants**, so `e2e >= ttfa`
+  holds for a different reason than it looks: `e2e` additionally contains the speech
+  itself.
+
+Under `fast` pacing the picture collapses — the audio is consumed up front, no point
+inside it maps to a wall-clock instant, and `ttfa` and `stt_endpoint_delay` are not
+recorded at all.
 
 ---
 
@@ -217,10 +263,10 @@ User finishes speaking
 
 | | |
 |---|---|
-| **What it measures** | The net time to convert the input audio to text (Vosk or Whisper). |
-| **Measurement point** | Before → after the STT function call. |
-| **duration_ms** | STT net processing time. |
-| **extra_json** | `input_duration_ms` – length of input audio (ms); `stt_rtf` – Real-Time Factor (stt / input_duration; <1.0 = faster than real-time). |
+| **What it measures** | Wall-clock time in the STT worker, from its start to the finalized transcript. Under `fast` pacing that is the net decode cost. Under `realtime` pacing, or on a microphone, it also contains the wait for the audio to arrive, since the worker cannot outrun the speaker. |
+| **Measurement point** | Before → after the transcription loop. |
+| **duration_ms** | STT worker wall-clock time. |
+| **extra_json** | `input_duration_ms` – length of input audio (ms); `stt_rtf` – `stt / input_duration` (a genuine real-time factor only under `fast` pacing; under `realtime` it exceeds 1 because the wait is included); `trailing_silence_ms` – gap between the last recognized word and the end of the audio. |
 
 ---
 
@@ -250,10 +296,59 @@ User finishes speaking
 
 | | |
 |---|---|
-| **What it measures** | The most important metric from a user perspective: how long they have to wait to hear the first word of the response. Calculated metric: `stt + llm_ttfc + tts_first_chunk`. |
-| **Measurement point** | Calculated (not directly measured). |
-| **duration_ms** | `stt + llm_ttfc + tts_first_chunk` |
+| **What it measures** | The metric that matters from a user's perspective: how long they wait, after they stop talking, before hearing the first word back. |
+| **Measurement point** | Directly measured, from the end of the speech to the first synthesized chunk being ready. The end of the speech comes from the STT's own word timings, not from the end of the file and not from the point the STT finalizes. |
+| **duration_ms** | `tts_first_chunk_t − speech_end_t` |
 | **extra_json** | – |
+| **Blank when** | The instant is unknowable: `fast` pacing (no offset in the audio maps to a wall-clock time), or the engine reported no word timings. |
+
+Decomposes as `stt_endpoint_delay + llm_ttfc + tts_first_chunk`, to within a few ms.
+Note that `stt` is **not** a term: under realtime pacing most of it happens before
+the speaker stops.
+
+The anchor is only as good as the engine's timestamps. Against an independent
+energy-based reference on the same audio, Vosk's last-word end runs ~57 ms late and
+Whisper's last-segment end ~252 ms late — and a *later* anchor shortens the engine's
+own `ttfa`. Comparisons across engines carry that bias.
+
+---
+
+### `stt_endpoint_delay` – End of speech to finished transcript
+
+| | |
+|---|---|
+| **What it measures** | How long the STT took to decide the utterance was over and produce the text. On a live microphone this is the endpointer waiting out the trailing silence, usually the largest single component of what a user perceives. |
+| **Measurement point** | End of speech (from word timings) → the finalized result arriving. |
+| **duration_ms** | `stt_final_t − speech_end_t` |
+| **extra_json** | – (shares the `stt` row's resource snapshot) |
+| **Blank when** | Same conditions as `ttfa`. |
+
+Typical values measured on `vosk-model-small-en-us-0.15`: ~1100 ms when the
+endpointer fires, ~400 ms when the stream ends first (file input with too little
+trailing silence). Whisper has no endpointer, so its figure is the remaining audio
+plus the entire decode.
+
+---
+
+### `llm_ttft` – LLM time to first token
+
+| | |
+|---|---|
+| **What it measures** | Request sent → first token back. Covers the HTTP round trip and Ollama's prompt evaluation. |
+| **Measurement point** | Start of the streaming request → first token from the generator. |
+| **duration_ms** | Prompt → first token. |
+| **extra_json** | – |
+
+---
+
+### `llm_first_chunk_fill` – First token to first speakable chunk
+
+| | |
+|---|---|
+| **What it measures** | How long the chunker waited for enough text to be worth speaking, once the model had started producing tokens. This is the slice a short opening sentence is meant to remove. |
+| **Measurement point** | Derived: `llm_ttfc − llm_ttft`. |
+| **duration_ms** | First token → first chunk handed to the TTS. |
+| **extra_json** | `first_chunk_chars` – length of that opening chunk; `system_prompt` – the prompt variant in use. |
 
 ---
 
@@ -283,10 +378,10 @@ User finishes speaking
 
 | | |
 |---|---|
-| **What it measures** | The total processing time: from the availability of the normalized audio to the closing of the final response WAV file. In batch mode, this is the "processing latency". |
-| **Measurement point** | After audio normalization → closing WAV file + final write_timing calls. |
-| **duration_ms** | Total STT + LLM streaming + TTS streaming time. |
-| **extra_json** | `input_duration_ms` – length of input audio; `output_duration_ms` – length of output (response) audio; `output_wav` – path of the generated WAV file; `full_text` – full text response of the LLM; `response_word_count` – number of words in the response; `response_char_count` – number of characters in the response; `llm_chunk_count` – number of sentence-level chunks. |
+| **What it measures** | The wall-clock span of the whole item, from the start of processing to the complete response. One definition in every mode: on file input it therefore includes delivering the audio, and on a microphone it covers the entire session. A span, not a latency — for latency use `ttfa`. |
+| **Measurement point** | `e2e_t0`, set before the workers start → after they have drained and the response WAVs are closed. |
+| **duration_ms** | Whole-item wall-clock time. |
+| **extra_json** | `input_duration_ms` – length of input audio; `output_duration_ms` – total length of the response audio; `output_wav` – path of the first generated WAV; `output_wav_count` – number of response WAVs (a mic session answers more than once); `full_text` – full text response of the LLM; `response_word_count`, `response_char_count` – size of the response; `llm_chunk_count` – number of sentence-level chunks. |
 
 ---
 
@@ -294,10 +389,13 @@ User finishes speaking
 
 | Relationship | Always true? |
 |-------------|-------------|
-| `ttfa = stt + llm_ttfc + tts_first_chunk` | ✅ By definition |
-| `e2e >= ttfa` | ✅ E2E includes TTFA + the processing of the remaining chunks |
+| `ttfa ≈ stt_endpoint_delay + llm_ttfc + tts_first_chunk` | ✅ To within a few ms — measured at +3 and +4 ms over 16 samples per engine |
+| `ttfa = stt + llm_ttfc + tts_first_chunk` | ❌ **No.** The old formula. `stt` mostly runs *before* the speaker stops, so it is not on the TTFA path at all |
+| `llm_ttfc = llm_ttft + llm_first_chunk_fill` | ✅ By definition — `llm_first_chunk_fill` is derived from the other two |
+| `e2e >= ttfa` | ✅ But note they start at different instants: `e2e` runs from the start of processing, `ttfa` from the end of the speech, so `e2e` also contains the speech itself |
 | `tts_total >= tts_first_chunk` | ✅ The total is the sum of all chunks |
 | `llm_eval < total_duration_ms` (extra_json) | ✅ The total also includes prompt eval and overhead |
 | `llm_ttfc >= llm_eval` | ❌ Not always! TTFC measures until the first sentence arrives, eval is the generation time of **all** tokens. For short responses TTFC ≈ eval; for long responses TTFC < eval. |
 | `tokens_per_sec ≈ eval_tokens / (llm_eval / 1000)` | ✅ By definition |
-| `stt_rtf = stt / input_duration_ms` | ✅ By definition |
+| `stt_rtf = stt / input_duration_ms` | ✅ By definition — but only a real-time factor under `fast` pacing |
+| `ttfa` and `stt_endpoint_delay` present | ❌ Only under `realtime` pacing or mic input, and only when the engine reports word timings |
