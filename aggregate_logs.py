@@ -21,8 +21,8 @@ from typing import Dict, List, Any, Tuple
 
 
 # Preferred order of stages for clear reporting
-KNOWN_STAGES = ["stt", "stt_endpoint_delay", "llm_ttft", "llm_first_chunk_fill",
-                "llm_ttfc", "tts_first_chunk", "ttfa",
+KNOWN_STAGES = ["stt", "stt_endpoint_delay", "llm_prompt_eval", "llm_ttft",
+                "llm_first_chunk_fill", "llm_ttfc", "tts_first_chunk", "ttfa",
                 "llm_eval", "tts_total", "e2e_response_ready"]
 
 # Columns whose value decides how a row is to be read. Runs that disagree on

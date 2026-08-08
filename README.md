@@ -159,7 +159,7 @@ Each run creates `outputs/<YYYYMMDD_HHMMSS>/` containing:
 
 The CSV contains:
 
-- `stage`: one of `stt`, `stt_endpoint_delay`, `llm_ttft`, `llm_first_chunk_fill`, `llm_ttfc`, `tts_first_chunk`, `ttfa`, `llm_eval`, `tts_total`, `e2e_response_ready`
+- `stage`: one of `stt`, `stt_endpoint_delay`, `llm_prompt_eval`, `llm_ttft`, `llm_first_chunk_fill`, `llm_ttfc`, `tts_first_chunk`, `ttfa`, `llm_eval`, `tts_total`, `e2e_response_ready`
 - `duration_ms`: stage duration in milliseconds
 - `input_mode`, `audio_pacing`, `utterance_trigger`: how the audio reached the pipeline and what released it to the LLM. Which stages carry a value, and what they include, depends on these, so runs that differ in them must not be pooled. `utterance_trigger` records the behaviour that applied, not the setting that was requested.
 - `cpu_percent`: average system-wide CPU load over the stage the row belongs to
@@ -201,7 +201,7 @@ Under `endpoint`, a second end-of-speech signal within one input carries **every
 
 - CPU/RAM stats require `psutil`; if unavailable, those fields stay blank.
 - Resource columns are captured by the worker that owns the stage, at the moment that stage finishes. `psutil.cpu_percent(interval=None)` reports load since its own previous call and keeps that state per thread, so each stage opens its own measurement window with a priming call when it starts.
-- A row's CPU window matches its `duration_ms` exactly for `stt`, `llm_ttft`, `llm_first_chunk_fill`, `tts_first_chunk` and `e2e_response_ready`. The rest are approximations: `llm_ttfc` is timed from the start of the request but its CPU window starts at the first token; `ttfa` reuses the `tts_first_chunk` snapshot and `stt_endpoint_delay` the `stt` one; `llm_eval` and `tts_total` carry the snapshot taken when their worker finished.
+- A row's CPU window matches its `duration_ms` exactly for `stt`, `llm_ttft`, `llm_first_chunk_fill`, `tts_first_chunk` and `e2e_response_ready`. The rest are approximations: `llm_ttfc` is timed from the start of the request but its CPU window starts at the first token; `ttfa` reuses the `tts_first_chunk` snapshot and `stt_endpoint_delay` the `stt` one; `llm_prompt_eval` reuses the first-token snapshot, the nearest boundary to a phase that had already ended by the time Ollama reported it; `llm_eval` and `tts_total` carry the snapshot taken when their worker finished.
 - GPU stats are read from `nvidia-smi`; if unavailable or no NVIDIA GPU is present, those fields stay blank. A background sampler refreshes them every second, which keeps the subprocess off the measured path. Fields the driver reports as `[N/A]` are stored blank so the numeric columns stay numeric.
 - `e2e_response_ready` runs from the start of processing to the complete response, in every mode. On file input it therefore includes the delivery of the audio; on a microphone it covers the whole session. It is a wall-clock span, not a latency — for latency use `ttfa`.
 - `stt_rtf` is `stt` divided by the audio duration. It expresses a real-time factor only under `fast` pacing. Under `realtime` pacing `stt` includes waiting for the audio to arrive, which puts the ratio above 1 and makes it a measure of something else.
@@ -216,31 +216,46 @@ Under `realtime` pacing or a live microphone. The two things that matter: the ST
 works *while the speaker is still talking*, and TTFA starts when the speaker stops,
 not when processing does.
 
+Bar widths are schematic — chosen for legibility, not measured — and the axis carries
+no units. What the diagram encodes is order and overlap.
+
+```mermaid
+gantt
+    title Realtime pacing — what happens when
+    dateFormat x
+    axisFormat  
+    todayMarker off
+
+    section Audio in
+    speech                       :done,    0,     3100
+    trailing silence             :done,    3100,  4800
+
+    section STT
+    transcribe audio             :active,  0,     4800
+    detect end of speech         :crit,    3100,  4200
+
+    section LLM
+    process prompt               :active,  4200,  4900
+    generate first chunk         :active,  4900,  6100
+    generate remaining chunks    :active,  6100,  8500
+
+    section TTS
+    synthesize first chunk       :active,  6100,  6700
+    synthesize remaining chunks  :active,  6700,  9000
+
+    section Reported
+    time to first audio (TTFA)   :crit,    3100,  6700
+    time to full response        :active,  0,     9000
 ```
- e2e_t0 ──── the run begins, audio starts arriving at 1x ───────────────────┐
-   │                                                                        │
-   │  ┌── STT decodes as each chunk lands, overlapped with the speech ──┐   │
-   │  │                                                          (stt)  │   │
-   ▼  │                                                                 │   │
- speaker stops ◄══ TTFA IS ANCHORED HERE ══════════════════════════╗    │   │
-   │  │   trailing silence keeps playing; the endpointer listens    ║    │   │
-   │  └── endpointer fires, the transcript exists ──────────────────╢    │   │
-   │                                     (stt_endpoint_delay)       ║    │   │
-   ▼                                                                ║        │
- transcript ready                                                   ║        │
-   │      ├── first token ............................ (llm_ttft)   ║        │
-   │      └── first speakable chunk .................. (llm_ttfc)   ║        │
-   ▼                                                                ║        │
- first chunk ready                                                  ║        │
-   │      └── TTS synthesises that chunk ....... (tts_first_chunk)  ║        │
-   ▼                                                                ║        │
- first audio out ◄══════════════════════════════════════════════════╝ = TTFA │
-   │                                                                         │
-   │      remaining chunks stream out       (tts_total, llm_eval)            │
-   ▼                                                                         │
- response complete ─────────────────────────────────────────────────────────┘
-                                                       = e2e_response_ready
-```
+
+Reading it against the CSV: the transcribe bar is `stt` and the one below it
+`stt_endpoint_delay`; the first TTS bar is `tts_first_chunk`; the two reported rows
+are `ttfa` and `e2e_response_ready`.
+
+The first LLM bar is `llm_prompt_eval` and the pair together spans `llm_ttfc`. They
+divide where the model stops reading and starts writing, which falls a little short
+of where `llm_ttft` ends — that one runs on to the first token and also carries the
+HTTP round trip.
 
 Two consequences fall out of the shape:
 
@@ -325,6 +340,21 @@ own `ttfa`. Comparisons across engines carry that bias.
 
 ---
 
+### `llm_prompt_eval` – Reading the prompt
+
+| | |
+|---|---|
+| **What it measures** | Ollama evaluating the prompt — the system prompt, the framing and the recognized text — before it produces anything. Prefill covers every prompt token in a single parallel pass, which makes it far cheaper per token than generation, but it is paid in full on every request. |
+| **Measurement point** | Server-side, read from Ollama's `done: true` message. Reported only once the whole response has finished, so it is known retroactively rather than observed as it happens. |
+| **duration_ms** | `prompt_eval_duration` as reported by Ollama. |
+| **extra_json** | `prompt_tokens` – size of the evaluated prompt; `system_prompt` – the prompt variant in use. |
+
+Being server-side, this excludes the HTTP round trip, so it is shorter than
+`llm_ttft` by that plus the first token's own generation. Shrinking the system prompt
+shows up here first, and through it in `ttfa`.
+
+---
+
 ### `llm_ttft` – LLM time to first token
 
 | | |
@@ -354,7 +384,7 @@ own `ttfa`. Comparisons across engines carry that bias.
 | **What it measures** | The net token generation time (eval_duration) measured on the Ollama server. This is ground truth: it does not include network latency, client-side processing, or TTS time. |
 | **Measurement point** | Read from Ollama's `done: true` message (server-side measurement). |
 | **duration_ms** | Net token generation time on the server. |
-| **extra_json** | `eval_tokens` – number of generated tokens; `tokens_per_sec` – generation speed (tok/s); `prompt_tokens` – number of prompt tokens; `prompt_eval_ms` – prompt processing time (ms); `total_duration_ms` – total Ollama server-side time (load + prompt eval + eval + overhead). |
+| **extra_json** | `eval_tokens` – number of generated tokens; `tokens_per_sec` – generation speed (tok/s); `total_duration_ms` – total Ollama server-side time (load + prompt eval + eval + overhead). The prompt side has its own row, `llm_prompt_eval`. |
 
 ---
 

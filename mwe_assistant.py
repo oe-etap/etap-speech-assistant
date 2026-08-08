@@ -1056,6 +1056,23 @@ def main():
             # LLM server-side evaluation metrics (ground truth from Ollama)
             ollama_stats = llm_metrics.get("ollama_stats")
             if ollama_stats:
+                # Reading the prompt and writing the answer are separate phases with
+                # very different costs: prefill covers every prompt token in one pass,
+                # decoding takes a pass per token. Ollama times them separately, so
+                # they get a row each rather than one lumped LLM figure.
+                #
+                # Both arrive with the final message, once generation has finished.
+                # The prompt was evaluated long before that, so no snapshot taken at
+                # this point describes it; the one from the first token is the closest
+                # boundary available.
+                prompt_eval_ns = ollama_stats.get("prompt_eval_duration_ns", 0)
+                if prompt_eval_ns:
+                    write_timing(writer, args, item_name, "llm_prompt_eval",
+                                 int(prompt_eval_ns / 1e6),
+                                 llm_metrics.get("ttft_stats"),
+                                 {"prompt_tokens": ollama_stats.get("prompt_eval_count", 0),
+                                  "system_prompt": prompt_label})
+
                 eval_dur_ns = ollama_stats.get("eval_duration_ns", 0)
                 eval_count = ollama_stats.get("eval_count", 0)
                 tokens_per_sec = round(eval_count / (eval_dur_ns / 1e9), 1) if eval_dur_ns > 0 else 0.0
@@ -1063,8 +1080,6 @@ def main():
                              llm_metrics.get("end_stats"),
                              {"eval_tokens": eval_count,
                               "tokens_per_sec": tokens_per_sec,
-                              "prompt_tokens": ollama_stats.get("prompt_eval_count", 0),
-                              "prompt_eval_ms": int(ollama_stats.get("prompt_eval_duration_ns", 0) / 1e6),
                               "total_duration_ms": int(ollama_stats.get("total_duration_ns", 0) / 1e6)})
 
             # Log total TTS time. A response that synthesized nothing left this
