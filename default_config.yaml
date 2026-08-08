@@ -31,7 +31,7 @@ audio-pacing: realtime
 #                added to the latency in full.
 # Ignored under 'fast' pacing and in mic mode. No effect with Whisper, which
 # has no endpointer and finalizes only when the stream ends.
-file-realtime-trigger: end-of-file
+file-realtime-trigger: endpoint
 audio-chunk-ms: 250
 playback: false   # Play TTS output on speakers
 idle-timeout: 10.0 # Shutdown after N seconds of silence
@@ -61,14 +61,16 @@ system-prompt-file: "./prompts/short-opener.txt"
 
 llm-max-tokens: 150
 
-# temperature controls how random sampling is; seed controls which random
-# sequence it follows. Response length varies enough between runs to hide the
-# effect under test, so for A/B comparisons pin one of them:
-#   llm-temperature: 0   -> greedy decoding, reproducible on its own
-#   llm-seed: <number>   -> reproducible while sampling stays natural
+# Response length varies enough between runs to hide whatever is under test, and
+# llm_eval, tts_total and e2e_response_ready all scale with it. Greedy decoding
+# removes that variance, so a run repeats exactly.
+#
+# The seed does nothing at temperature 0 and is left unset rather than set to a
+# number that looks load-bearing but is not. Raise the temperature only together
+# with a seed, for instance to sample realistic response lengths.
 # Note: `null` is YAML for "no value"; writing None would be the string "None".
-llm-temperature: 0.7
-llm-seed: null     # no seed -> sampling differs on every run
+llm-temperature: 0
+llm-seed: null
 
 # Safety-net chunk length for the LLM -> TTS handoff. Chunks are normally cut at
 # sentence boundaries; a sentence longer than this is split at a word boundary so

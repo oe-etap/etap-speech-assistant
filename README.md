@@ -119,7 +119,7 @@ Input and pacing:
 
 - `--input-mode {file,mic}`: file input or live capture, default `file`
 - `--audio-pacing {realtime,fast}`: how file input is fed to the STT, default `realtime`. `realtime` delivers at 1x speed like a microphone and is required for `ttfa`; `fast` reads as quickly as possible, which suits throughput runs and per-stage costs
-- `--file-realtime-trigger {endpoint,end-of-file}`: what starts the LLM under file input with realtime pacing, default `end-of-file`. See [Trailing silence in input files](#trailing-silence-in-input-files)
+- `--file-realtime-trigger {endpoint,end-of-file}`: what starts the LLM under file input with realtime pacing, default `endpoint`. See [Trailing silence in input files](#trailing-silence-in-input-files)
 - `--audio-chunk-ms N`: chunk length handed to the STT, default `250`
 - `--playback`: play the TTS output on speakers
 - `--idle-timeout SECONDS`: silence before mic mode exits, default `10`
@@ -127,8 +127,8 @@ Input and pacing:
 LLM and TTS behaviour:
 
 - `--system-prompt-file PATH`: prompt variant; the one used is copied to `<out-dir>/system_prompt.txt`
-- `--llm-temperature FLOAT`: sampling temperature, default `0.7`. Set to `0` for reproducible runs
-- `--llm-seed INT`: sampling seed; pin this (or the temperature) before comparing configurations
+- `--llm-temperature FLOAT`: sampling temperature, default `0` — greedy decoding, so a run repeats exactly. Raise it only with `--llm-seed` set
+- `--llm-seed INT`: sampling seed, unset by default. It does nothing at temperature `0`, and is what keeps a run reproducible above it
 - `--llm-max-tokens N`: response cap, default `150`
 - `--tts-chunk-max-chars N`: safety-net chunk length for the LLM → TTS handoff, default `140`. Lower = lower TTFA, higher = better prosody
 
@@ -188,8 +188,8 @@ How much more than that to allow depends on `file-realtime-trigger`:
 
 | `file-realtime-trigger` | what starts the LLM | trailing silence to aim for |
 |---|---|---|
-| `end-of-file` (default) | the whole file has been read | 1.2–1.5 s, and no more — silence past the endpoint is added to `ttfa` in full |
-| `endpoint` | the STT calls the utterance over, as a microphone would | at least 1.2 s, with no upper bound |
+| `endpoint` (default) | the STT calls the utterance over, as a microphone would | at least 1.2 s, with no upper bound |
+| `end-of-file` | the whole file has been read | 1.2–1.5 s, and no more — silence past the endpoint is added to `ttfa` in full |
 
 `stt_endpoint_delay` is unaffected either way and stays around 1100 ms however long the tail runs.
 
@@ -205,7 +205,9 @@ Under `endpoint`, a second end-of-speech signal within one input carries **every
 - GPU stats are read from `nvidia-smi`; if unavailable or no NVIDIA GPU is present, those fields stay blank. A background sampler refreshes them every second, which keeps the subprocess off the measured path. Fields the driver reports as `[N/A]` are stored blank so the numeric columns stay numeric.
 - `e2e_response_ready` runs from the start of processing to the complete response, in every mode. On file input it therefore includes the delivery of the audio; on a microphone it covers the whole session. It is a wall-clock span, not a latency — for latency use `ttfa`.
 - `stt_rtf` is `stt` divided by the audio duration. It expresses a real-time factor only under `fast` pacing. Under `realtime` pacing `stt` includes waiting for the audio to arrive, which puts the ratio above 1 and makes it a measure of something else.
-- Response length varies enough between runs to hide the effect under test: `llm_eval`, `tts_total` and `e2e_response_ready` scale with it. Pin `llm-temperature: 0` or an `llm-seed` before comparing configurations. `ttfa` and `stt_endpoint_delay` are unaffected, as both conclude before the response length is known.
+- Response length varies enough between runs to hide whatever is under test: `llm_eval`, `tts_total` and `e2e_response_ready` all scale with it. The default `llm-temperature: 0` removes that variance, so a run repeats exactly; raising it needs an `llm-seed` to stay reproducible. `ttfa` and `stt_endpoint_delay` are unaffected either way, as both conclude before the response length is known.
+- Greedy decoding is not how the model would be run in production, so absolute `llm_eval`, `tts_total` and `e2e_response_ready` figures are not a forecast of live behaviour — they are a stable baseline for comparing one configuration against another. Sampling at a realistic temperature, with a seed, is a separate experiment.
+- Pinning either one only makes a run repeat for the *same* prompt. Two STT engines produce different transcripts, so the model receives different text and answers at different lengths — no seed makes the length-dependent stages comparable across engines.
 
 
 # Metric Descriptions

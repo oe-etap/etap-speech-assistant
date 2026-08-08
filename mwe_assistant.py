@@ -637,7 +637,7 @@ def main():
                              "latency). 'fast' reads as quickly as possible (original behaviour).")
     parser.add_argument("--file-realtime-trigger",
                         choices=[TRIGGER_ENDPOINT, TRIGGER_END_OF_FILE],
-                        default=TRIGGER_END_OF_FILE,
+                        default=TRIGGER_ENDPOINT,
                         help="What starts the LLM under file input with realtime pacing. "
                              "'endpoint' answers as soon as the STT calls the utterance "
                              "over, the only thing a microphone can do. 'end-of-file' "
@@ -677,8 +677,11 @@ def main():
                         help="Path to a .txt file holding the system prompt. Prompt variants live "
                              "in prompts/ and are identified by filename; a variant is never edited "
                              "in place, a change means a new file. Falls back to the built-in prompt.")
-    parser.add_argument("--llm-temperature", type=float, default=0.7,
-                        help="Sampling temperature. Use 0 together with --llm-seed for A/B runs.")
+    parser.add_argument("--llm-temperature", type=float, default=0.0,
+                        help="Sampling temperature. 0 is greedy decoding, which makes a run "
+                             "reproducible on its own; the length-dependent stages are "
+                             "otherwise noisy enough to hide whatever is under test. Raise "
+                             "it only with --llm-seed set.")
     parser.add_argument("--llm-seed", type=int, default=None,
                         help="Sampling seed. Leave unset for non-deterministic sampling.")
     parser.add_argument("--llm-max-tokens", type=int, default=150,
