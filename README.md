@@ -355,6 +355,16 @@ Being server-side, this excludes the HTTP round trip, so it is shorter than
 `llm_ttft` by that plus the first token's own generation. Shrinking the system prompt
 shows up here first, and through it in `ttfa`.
 
+**This figure is cache-sensitive.** Ollama keeps the previous request's KV cache and
+reuses however much of the prompt is unchanged. Since the system prompt leads and
+only the user's words differ, consecutive requests reuse nearly all of it, and a
+repeated question reuses the lot. Warmup therefore sends the real framing rather than
+an empty string, so the first utterance starts from the same cache state as every
+later one instead of paying to evaluate the whole prompt. Two consequences when
+reading the number: a run whose input repeats the same question will report values
+far below what a fresh question costs, and a cold server reports several times the
+warm figure.
+
 ---
 
 ### `llm_ttft` – LLM time to first token
