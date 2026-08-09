@@ -191,12 +191,32 @@ class OllamaEngine:
         self._current_response = None
         self._cancel_requested = False
 
+    def _build_prompt(self, user_text: str) -> str:
+        """Wrap the recognized text in the framing the model is asked to answer.
+
+        The system prompt leads, so every request shares a long identical prefix
+        and differs only in the user's words. That is what makes warmup() worth
+        doing: the prefix can stay in the server's cache between requests.
+        """
+        return (
+            f'{self._system_prompt}\n\n'
+            f'The user said: "{user_text}"\n\n'
+            f'Answer:'
+        )
+
     def warmup(self):
-        """Send a minimal request to load the model into VRAM/RAM."""
+        """Load the model and leave the shared prompt prefix in its KV cache.
+
+        Sending the real framing rather than an empty string costs nothing extra
+        and means the first utterance is evaluated the way every later one will
+        be: only its own words are new. Without it the first request pays to
+        evaluate the whole system prompt, which shows up as an outlier several
+        times the size of every other measurement in the run.
+        """
         try:
             self._session.post(self._url, json={
                 "model": self._model,
-                "prompt": "",
+                "prompt": self._build_prompt(""),
                 "options": {"num_predict": 1}
             }, timeout=120)
         except Exception as e:
@@ -240,11 +260,7 @@ class OllamaEngine:
         self.cancel()
         self._cancel_requested = False
 
-        prompt = (
-            f'{self._system_prompt}\n\n'
-            f'The user said: "{user_text}"\n\n'
-            f'Answer:'
-        )
+        prompt = self._build_prompt(user_text)
 
         chunker = TextChunker(max_chars=self._chunk_max_chars)
         ollama_stats = None
