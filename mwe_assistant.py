@@ -66,6 +66,16 @@ GPU_SAMPLE_INTERVAL_S = 1.0
 # How long to wait for the pipeline workers to drain before reading their metrics
 WORKER_SHUTDOWN_TIMEOUT_S = 10.0
 
+# Silence an endpointer needs after the last word before it calls an utterance
+# over. Measured against vosk-model-small-en-us-0.15, which fires at ~1100 ms
+# and not at all below it. Input files with less than this never exercise the
+# endpointer, so their latency figures do not carry over to live input.
+MIN_TRAILING_SILENCE_MS = 1200
+
+# What hands an utterance to the LLM.
+TRIGGER_ENDPOINT = "endpoint"        # the STT calling the utterance over
+TRIGGER_END_OF_FILE = "end-of-file"  # the input running out
+
 
 # ---------- Helpers ----------
 def is_mono_16k_pcm(path):
@@ -267,6 +277,21 @@ def collect_resource_snapshot():
     return stats
 
 
+def triggers_on_endpoint(args):
+    """Whether an utterance is released as soon as the STT calls it over.
+
+    A microphone has no other option, its stream never ends. File input can
+    wait for the file instead, and under 'fast' pacing it always does: the
+    audio is consumed faster than real time, so waiting costs nothing and the
+    stages that would show a difference are not measured there anyway.
+    """
+    if args.input_mode == "mic":
+        return True
+    if args.audio_pacing != PACING_REALTIME:
+        return False
+    return args.file_realtime_trigger == TRIGGER_ENDPOINT
+
+
 def write_timing(writer, args, item, stage, duration_ms, stats=None, extra=None):
     """Append one CSV row for a stage.
 
@@ -279,6 +304,12 @@ def write_timing(writer, args, item, stage, duration_ms, stats=None, extra=None)
         "mode": args.mode,
         "stt_engine": args.stt_engine,
         "tts_engine": args.tts_engine,
+        "input_mode": args.input_mode,
+        "audio_pacing": args.audio_pacing if args.input_mode == "file" else "",
+        # The behaviour that applied, not the setting that was asked for: the
+        # setting only takes effect under file input with realtime pacing.
+        "utterance_trigger": (TRIGGER_ENDPOINT if triggers_on_endpoint(args)
+                              else TRIGGER_END_OF_FILE),
         "item": item,
         "stage": stage,
         "duration_ms": int(duration_ms),
@@ -294,20 +325,26 @@ def write_timing(writer, args, item, stage, duration_ms, stats=None, extra=None)
 
 
 # ---------- Pipeline Workers ----------
-def stt_worker(stt_engine, audio_source, mailbox, stt_metrics, input_mode="file"):
+def stt_worker(stt_engine, audio_source, mailbox, stt_metrics,
+               trigger_on_endpoint=False):
     """Feed audio to the STT engine and hand finalized utterances to the LLM.
 
-    - In 'mic' mode: every finalized utterance is handed over immediately, so a
-      new utterance can interrupt an answer that is still being generated.
-    - In 'file' mode: the LLM is triggered once, at the end of the file.
+    trigger_on_endpoint decides what releases an utterance:
+
+    - True: every finalized result goes over immediately, so the answer starts
+      as soon as the STT calls the utterance over. A later utterance can then
+      interrupt an answer still being generated. This is the only option a live
+      microphone has, since its stream never ends.
+    - False: nothing is handed over until the input runs out, and the LLM is
+      triggered once with everything that was recognized.
 
     Partial results are printed for visibility but never trigger generation:
     starting on a partial costs a full generation whenever the guess is wrong,
     which is what made the earlier experiments slower rather than faster.
 
-    Records speech_end_t on every finalized result: this is the anchor for the
-    TTFA metric a user actually perceives, which starts when they stop talking
-    rather than when processing begins.
+    Records two instants per finalized result: when the speaker stopped, which
+    is the anchor for the TTFA a user perceives, and when the transcript existed.
+    The gap between them is the engine's endpointing delay.
     """
     try:
         # Opens this thread's CPU window for the span reported as stt_ms.
@@ -327,14 +364,21 @@ def stt_worker(stt_engine, audio_source, mailbox, stt_metrics, input_mode="file"
                 accumulated_final + " " + result["text"]
             ).strip()
 
-            stt_metrics["last_speech_t"] = time.perf_counter()
-            stt_metrics["speech_end_t"] = audio_source.speech_end_t()
+            speech_end_s = result.get("speech_end_s")
+            stt_metrics["final_t"] = time.perf_counter()
+            stt_metrics["speech_end_t"] = audio_source.speech_end_t(speech_end_s)
+            stt_metrics["speech_end_s"] = speech_end_s
             stt_metrics["user_text"] = accumulated_final
 
-            if input_mode == "mic":
+            if trigger_on_endpoint:
+                # Carries everything recognized so far, not just this result:
+                # an endpointer that fires while the speaker is only drawing
+                # breath would otherwise have the LLM answer half a sentence.
+                # The mailbox supersedes the earlier text and the generation
+                # started on it is cancelled.
                 mailbox.put(accumulated_final)
 
-        if input_mode == "file" and accumulated_final:
+        if not trigger_on_endpoint and accumulated_final:
             mailbox.put(accumulated_final)
 
         t1 = time.perf_counter()
@@ -591,6 +635,16 @@ def main():
                         help="How input files are fed to the STT engine. 'realtime' simulates a "
                              "microphone at 1x speed so STT overlaps with speech (representative "
                              "latency). 'fast' reads as quickly as possible (original behaviour).")
+    parser.add_argument("--file-realtime-trigger",
+                        choices=[TRIGGER_ENDPOINT, TRIGGER_END_OF_FILE],
+                        default=TRIGGER_ENDPOINT,
+                        help="What starts the LLM under file input with realtime pacing. "
+                             "'endpoint' answers as soon as the STT calls the utterance "
+                             "over, the only thing a microphone can do. 'end-of-file' "
+                             "waits for the whole file, so any silence past the endpoint "
+                             "is added to the latency. Ignored under 'fast' pacing and in "
+                             "mic mode, and has no effect with Whisper, which has no "
+                             "endpointer.")
     parser.add_argument("--audio-chunk-ms", type=int, default=DEFAULT_CHUNK_MS,
                         help="Audio chunk length in milliseconds fed to the STT engine")
     parser.add_argument("--playback", action="store_true", help="Play TTS output on speakers")
@@ -623,8 +677,11 @@ def main():
                         help="Path to a .txt file holding the system prompt. Prompt variants live "
                              "in prompts/ and are identified by filename; a variant is never edited "
                              "in place, a change means a new file. Falls back to the built-in prompt.")
-    parser.add_argument("--llm-temperature", type=float, default=0.7,
-                        help="Sampling temperature. Use 0 together with --llm-seed for A/B runs.")
+    parser.add_argument("--llm-temperature", type=float, default=0.0,
+                        help="Sampling temperature. 0 is greedy decoding, which makes a run "
+                             "reproducible on its own; the length-dependent stages are "
+                             "otherwise noisy enough to hide whatever is under test. Raise "
+                             "it only with --llm-seed set.")
     parser.add_argument("--llm-seed", type=int, default=None,
                         help="Sampling seed. Leave unset for non-deterministic sampling.")
     parser.add_argument("--llm-max-tokens", type=int, default=150,
@@ -759,12 +816,19 @@ def main():
 
     save_system_prompt(run_dir, prompt_label, system_prompt)
 
+    # These ride along on every row so a stage is always interpretable on its
+    # own: which stages carry a value, and what they include, depends on them.
+    # Averaging across a mix of them is meaningless.
     fieldnames = [
-        "ts_iso", "mode", "stt_engine", "tts_engine", "item", "stage", "duration_ms",
+        "ts_iso", "mode", "stt_engine", "tts_engine",
+        "input_mode", "audio_pacing", "utterance_trigger",
+        "item", "stage", "duration_ms",
         "cpu_percent", "ram_percent", "rss_mb",
         "gpu_util_percent", "gpu_mem_used_mb", "gpu_mem_total_mb", "gpu_name",
         "extra_json",
     ]
+
+    trigger_on_endpoint = triggers_on_endpoint(args)
 
     # Signals the microphone source to stop capturing
     shutdown_event = threading.Event()
@@ -844,7 +908,7 @@ def main():
             stt_t = threading.Thread(
                 target=stt_worker,
                 args=(stt_engine, audio_source, mailbox, stt_metrics,
-                      args.input_mode),
+                      trigger_on_endpoint),
                 daemon=True,
             )
             llm_t = threading.Thread(
@@ -879,8 +943,8 @@ def main():
                         else:
                             last_action_t = max(
                                 last_action_t,
-                                stt_metrics.get("last_speech_t", e2e_t0),
-                                tts_metrics.get("last_play_t", e2e_t0)
+                                stt_metrics.get("final_t") or e2e_t0,
+                                tts_metrics.get("last_play_t") or e2e_t0
                             )
                             
                         if now - last_action_t > args.idle_timeout:
@@ -903,9 +967,6 @@ def main():
             # Covers the item as a whole rather than a single stage.
             e2e_stats = collect_resource_snapshot()
 
-            if args.input_mode == "mic":
-                e2e_t0 = stt_metrics.get("last_speech_t", e2e_t0)
-
             user_text = stt_metrics.get("user_text") or ""
             stt_ms = stt_metrics.get("stt_ms") or 0
             # Read after the workers finish: a mic source only knows how much
@@ -913,9 +974,25 @@ def main():
             input_duration_ms = audio_source.duration_ms
 
             stt_rtf = round(stt_ms / input_duration_ms, 3) if input_duration_ms > 0 else 0.0
+            stt_extra = {"input_duration_ms": input_duration_ms, "stt_rtf": stt_rtf}
+
+            # Trailing silence is what an endpointer needs to see before it can
+            # call the utterance over. Too little and the engine only finalizes
+            # because the file ran out, a signal a live microphone never gets.
+            speech_end_s = stt_metrics.get("speech_end_s")
+            if speech_end_s is not None and input_duration_ms > 0:
+                trailing_silence_ms = input_duration_ms - int(speech_end_s * 1000)
+                stt_extra["trailing_silence_ms"] = trailing_silence_ms
+                if (args.input_mode == "file"
+                        and args.audio_pacing == PACING_REALTIME
+                        and trailing_silence_ms < MIN_TRAILING_SILENCE_MS):
+                    print(f"[WARN] Only {trailing_silence_ms} ms of silence after the last "
+                          f"word; {MIN_TRAILING_SILENCE_MS} ms or more is needed for the "
+                          f"endpointer to fire. This run measures the end-of-file path, "
+                          f"which live microphone input never takes, so its TTFA is optimistic.")
+
             write_timing(writer, args, item_name, "stt", stt_ms,
-                         stt_metrics.get("stats"),
-                         {"input_duration_ms": input_duration_ms, "stt_rtf": stt_rtf})
+                         stt_metrics.get("stats"), stt_extra)
 
             if not user_text:
                 print("[Warn] No text recognized. Skipping to next file.")
@@ -955,28 +1032,50 @@ def main():
                 write_timing(writer, args, item_name, "tts_first_chunk", tts_first_chunk_ms,
                              tts_metrics.get("first_chunk_stats"))
 
-            # TTFA (wall-clock time from start of processing to first audio ready)
+            # TTFA: from the moment the speaker stopped to the first audio out.
+            # Blank whenever that instant is unknown -- no word timings from the
+            # engine, or 'fast' pacing, where the audio does not advance at
+            # wall-clock speed and no offset within it maps to a timestamp.
+            speech_end_t = stt_metrics.get("speech_end_t")
             tts_first_t = tts_metrics.get("tts_first_chunk_t")
-            if tts_first_t is not None:
-                ttfa_ms = int((tts_first_t - e2e_t0) * 1000)
-                # Both TTFA rows end at the same instant as tts_first_chunk and
-                # share its snapshot.
-                write_timing(writer, args, item_name, "ttfa", ttfa_ms,
+            if tts_first_t is not None and speech_end_t is not None:
+                # Ends at the same instant as tts_first_chunk, so it shares that
+                # stage's snapshot.
+                write_timing(writer, args, item_name, "ttfa",
+                             int((tts_first_t - speech_end_t) * 1000),
                              tts_metrics.get("first_chunk_stats"))
 
-                # TTFA anchored at the end of the speech, which is what a user
-                # actually perceives. Only meaningful with realtime pacing; with
-                # 'fast' pacing the audio ends as soon as it is read.
-                speech_end_t = stt_metrics.get("speech_end_t")
-                if speech_end_t is not None:
-                    write_timing(writer, args, item_name, "ttfa_from_speech_end",
-                                 int((tts_first_t - speech_end_t) * 1000),
-                                 tts_metrics.get("first_chunk_stats"),
-                                 {"audio_pacing": args.audio_pacing})
+            # How long the STT took to decide the utterance was over, measured
+            # from the actual end of speech. On file input this is the flush
+            # after the stream ends; on a microphone it is the endpointer
+            # waiting out the trailing silence, which dominates perceived
+            # latency and is otherwise invisible.
+            stt_final_t = stt_metrics.get("final_t")
+            if stt_final_t is not None and speech_end_t is not None:
+                write_timing(writer, args, item_name, "stt_endpoint_delay",
+                             int((stt_final_t - speech_end_t) * 1000),
+                             stt_metrics.get("stats"))
 
             # LLM server-side evaluation metrics (ground truth from Ollama)
             ollama_stats = llm_metrics.get("ollama_stats")
             if ollama_stats:
+                # Reading the prompt and writing the answer are separate phases with
+                # very different costs: prefill covers every prompt token in one pass,
+                # decoding takes a pass per token. Ollama times them separately, so
+                # they get a row each rather than one lumped LLM figure.
+                #
+                # Both arrive with the final message, once generation has finished.
+                # The prompt was evaluated long before that, so no snapshot taken at
+                # this point describes it; the one from the first token is the closest
+                # boundary available.
+                prompt_eval_ns = ollama_stats.get("prompt_eval_duration_ns", 0)
+                if prompt_eval_ns:
+                    write_timing(writer, args, item_name, "llm_prompt_eval",
+                                 int(prompt_eval_ns / 1e6),
+                                 llm_metrics.get("ttft_stats"),
+                                 {"prompt_tokens": ollama_stats.get("prompt_eval_count", 0),
+                                  "system_prompt": prompt_label})
+
                 eval_dur_ns = ollama_stats.get("eval_duration_ns", 0)
                 eval_count = ollama_stats.get("eval_count", 0)
                 tokens_per_sec = round(eval_count / (eval_dur_ns / 1e9), 1) if eval_dur_ns > 0 else 0.0
@@ -984,8 +1083,6 @@ def main():
                              llm_metrics.get("end_stats"),
                              {"eval_tokens": eval_count,
                               "tokens_per_sec": tokens_per_sec,
-                              "prompt_tokens": ollama_stats.get("prompt_eval_count", 0),
-                              "prompt_eval_ms": int(ollama_stats.get("prompt_eval_duration_ns", 0) / 1e6),
                               "total_duration_ms": int(ollama_stats.get("total_duration_ns", 0) / 1e6)})
 
             # Log total TTS time. A response that synthesized nothing left this

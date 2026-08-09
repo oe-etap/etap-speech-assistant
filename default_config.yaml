@@ -14,10 +14,24 @@ input-mode: file  # 'file' or 'mic'
 
 # How input files are fed to the STT engine.
 #   realtime: simulate a microphone at 1x speed, so STT overlaps with the speech.
-#             Required for TTFA numbers that reflect a live deployment.
-#   fast:     read as quickly as possible (original batch behaviour), kept for
-#             comparability with earlier measurements.
-audio-pacing: fast
+#             Required for ttfa and stt_endpoint_delay, which are blank without
+#             it: only here does a point inside the audio map to an instant.
+#             Input files need ~1.2-1.5 s of silence after the last word, or the
+#             endpointer never fires and the run measures a path live input
+#             never takes. A warning is printed when there is too little.
+#   fast:     read as quickly as possible, for throughput runs and for the
+#             per-stage costs, which stay valid without the pacing.
+audio-pacing: realtime
+
+# What starts the LLM under file input with realtime pacing.
+#   endpoint:    answer as soon as the STT calls the utterance over, which is
+#                the only thing a microphone can do. Silence past the endpoint
+#                costs nothing, so the trailing-silence upper bound drops away.
+#   end-of-file: wait for the whole file. Any silence beyond the endpoint is
+#                added to the latency in full.
+# Ignored under 'fast' pacing and in mic mode. No effect with Whisper, which
+# has no endpointer and finalizes only when the stream ends.
+file-realtime-trigger: endpoint
 audio-chunk-ms: 250
 playback: false   # Play TTS output on speakers
 idle-timeout: 10.0 # Shutdown after N seconds of silence
@@ -47,14 +61,16 @@ system-prompt-file: "./prompts/short-opener.txt"
 
 llm-max-tokens: 150
 
-# temperature controls how random sampling is; seed controls which random
-# sequence it follows. Response length varies enough between runs to hide the
-# effect under test, so for A/B comparisons pin one of them:
-#   llm-temperature: 0   -> greedy decoding, reproducible on its own
-#   llm-seed: <number>   -> reproducible while sampling stays natural
+# Response length varies enough between runs to hide whatever is under test, and
+# llm_eval, tts_total and e2e_response_ready all scale with it. Greedy decoding
+# removes that variance, so a run repeats exactly.
+#
+# The seed does nothing at temperature 0 and is left unset rather than set to a
+# number that looks load-bearing but is not. Raise the temperature only together
+# with a seed, for instance to sample realistic response lengths.
 # Note: `null` is YAML for "no value"; writing None would be the string "None".
-llm-temperature: 0.7
-llm-seed: null     # no seed -> sampling differs on every run
+llm-temperature: 0
+llm-seed: null
 
 # Safety-net chunk length for the LLM -> TTS handoff. Chunks are normally cut at
 # sentence boundaries; a sentence longer than this is split at a word boundary so
