@@ -31,6 +31,9 @@ Common:
 - `ffmpeg` on PATH
 - Ollama running locally, for example `ollama serve`
 - A pulled Ollama model, for example `ollama pull phi3:mini`
+- Only for `--input-mode mic` and `--playback`: the PortAudio library that
+  `sounddevice` binds to (Debian/Ubuntu: `apt install libportaudio2`). File mode
+  needs no audio device and runs on a headless server without it.
 
 CPU package setup:
 
