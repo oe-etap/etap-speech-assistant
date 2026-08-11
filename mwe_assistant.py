@@ -30,7 +30,11 @@ import soundfile as sf
 try:
     import sounddevice as sd
     _HAS_SD = True
-except ImportError:
+except (ImportError, OSError):
+    # OSError, not just ImportError: the package can be installed while the
+    # PortAudio shared library it binds to is missing, which is the normal state
+    # of a headless server. File mode needs no audio device, so the pipeline
+    # stays usable there and only mic input and playback report the lack.
     sd = None
     _HAS_SD = False
 
@@ -588,7 +592,10 @@ def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics, playback=False):
     try:
         if playback:
             if not _HAS_SD:
-                raise ImportError("sounddevice module is required for playback")
+                raise ImportError(
+                    "playback needs sounddevice and the PortAudio library it "
+                    "binds to (Debian/Ubuntu: apt install libportaudio2)"
+                )
             stream = sd.RawOutputStream(
                 samplerate=tts_engine.sample_rate, 
                 channels=1, 

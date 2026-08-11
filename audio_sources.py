@@ -24,7 +24,11 @@ from typing import Iterator
 try:
     import sounddevice as sd
     _HAS_SD = True
-except ImportError:
+except (ImportError, OSError):
+    # OSError, not just ImportError: the package can be installed while the
+    # PortAudio shared library it binds to is missing, which is the normal state
+    # of a headless server. Only MicAudioSource needs a device, so file playback
+    # of recordings keeps working there.
     sd = None
     _HAS_SD = False
 
@@ -169,7 +173,10 @@ class MicAudioSource(AudioSource):
         """
         super().__init__(chunk_ms, stop_event)
         if not _HAS_SD:
-            raise ImportError("sounddevice is required for microphone input")
+            raise ImportError(
+                "microphone input needs sounddevice and the PortAudio library "
+                "it binds to (Debian/Ubuntu: apt install libportaudio2)"
+            )
         self._save_path = save_path
 
     def chunks(self) -> Iterator[bytes]:
