@@ -16,9 +16,11 @@ input-mode: file  # 'file' or 'mic'
 #   realtime: simulate a microphone at 1x speed, so STT overlaps with the speech.
 #             Required for ttfa and stt_endpoint_delay, which are blank without
 #             it: only here does a point inside the audio map to an instant.
-#             Input files need ~1.2-1.5 s of silence after the last word, or the
-#             endpointer never fires and the run measures a path live input
-#             never takes. A warning is printed when there is too little.
+#             Input files need enough silence after the last word for the
+#             endpointer to fire before the audio runs out -- about 1.1 s at the
+#             settings below, and more if vosk-endpoint-silence-ms is raised.
+#             Short of that the run measures a path live input never takes. A
+#             warning is printed when there is too little, naming the figure.
 #   fast:     read as quickly as possible, for throughput runs and for the
 #             per-stage costs, which stay valid without the pacing.
 audio-pacing: realtime
@@ -38,6 +40,20 @@ idle-timeout: 10.0 # Shutdown after N seconds of silence
 
 # STT Options
 vosk-model: "./vosk/vosk-model-small-en-us-0.15"
+
+# Silence after the last word before Vosk calls the utterance over. This is the
+# largest single component of what a user perceives as the response time, and
+# the whole of it is on the critical path.
+#
+# Too low and the endpointer fires on a breath: the LLM is handed half a
+# question, and that generation is discarded when the rest of the words arrive.
+# Swept over 833 recordings (see vosk_endpoint_sweep.py), 600 ms is where that
+# stops happening -- and waiting longer buys nothing, since the one utterance
+# still split at 600 ms is a false start that survives 1500 ms too.
+#
+# 0 leaves the model's own settings alone, which work out slower (~1050 ms of
+# stt_endpoint_delay against ~990 ms) and split more.
+vosk-endpoint-silence-ms: 600
 whisper-model: "small"
 whisper-device: "cpu"
 whisper-compute-type: "int8"

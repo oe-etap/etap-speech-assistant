@@ -39,23 +39,26 @@ Usage:
         --vosk-model vosk/vosk-model-small-en-us-0.15 --include-stock
 """
 
-import argparse
-import csv
-import json
 import os
-import re
-import shutil
-import statistics
-import sys
-import time
-import wave
-from concurrent.futures import ProcessPoolExecutor
-from pathlib import Path
 
-# Keep the per-worker BLAS/ONNX thread pools at one thread: the parallelism here
-# is one process per file, and nested pools only fight over the same cores.
+# Before anything pulls in numpy or onnxruntime: keep the per-worker thread
+# pools at one thread. The parallelism here is one process per file, and nested
+# pools only fight over the same cores.
 for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_var, "1")
+
+import argparse           # noqa: E402
+import csv                # noqa: E402
+import json               # noqa: E402
+import re                 # noqa: E402
+import statistics         # noqa: E402
+import sys                # noqa: E402
+import time               # noqa: E402
+import wave               # noqa: E402
+from concurrent.futures import ProcessPoolExecutor   # noqa: E402
+from pathlib import Path                             # noqa: E402
+
+from stt_engines import write_endpoint_variant       # noqa: E402
 
 SAMPLE_RATE = 16000
 SAMPLE_WIDTH = 2
@@ -78,45 +81,22 @@ VAD_MIN_SPEECH_MS = 100
 # --------------------------------------------------------------------------
 
 def build_model_variant(src_model: str, dest: str, t_end_s: float) -> str:
-    """Materialize a model directory whose endpointer waits `t_end_s` seconds.
+    """A model directory whose endpointer waits `t_end_s` seconds.
 
-    Everything except `conf/` is symlinked, so a variant costs a few hundred
-    bytes rather than a copy of the acoustic model.
+    The reference decode asks for `NO_ENDPOINT_S`, which is past the length of
+    any recording: that also silences rule 1, so leading silence cannot end the
+    utterance before it starts and the whole file arrives as one segment with
+    one word list.
     """
-    src = Path(src_model).resolve()
-    dst = Path(dest)
-    if dst.is_dir():
-        shutil.rmtree(dst)
-    (dst / "conf").mkdir(parents=True)
+    variant = write_endpoint_variant(
+        src_model, dest, t_end_s,
+        quiet_timeout_s=t_end_s if t_end_s >= NO_ENDPOINT_S else None)
 
-    for entry in src.iterdir():
-        if entry.name != "conf":
-            os.symlink(entry, dst / entry.name)
-    for entry in (src / "conf").iterdir():
-        if entry.name != "model.conf":
-            os.symlink(entry, dst / "conf" / entry.name)
-
-    base = (src / "conf" / "model.conf").read_text().splitlines()
-    lines = [ln for ln in base
-             if "endpoint.rule" not in ln and ln.strip()]
-    lines += [
-        # Rules 2-4 differ only in how confident the decoder has to be; pinning
-        # them together makes the endpointer fire on t_end of silence and
-        # nothing else.
-        f"--endpoint.rule2.min-trailing-silence={t_end_s}",
-        f"--endpoint.rule3.min-trailing-silence={t_end_s}",
-        f"--endpoint.rule4.min-trailing-silence={t_end_s}",
-        # Not under test: without this, a long recording would be endpointed on
-        # its length alone and counted as a cut.
-        "--endpoint.rule5.min-utterance-length=10000.0",
-    ]
-    if t_end_s >= NO_ENDPOINT_S:
-        # The reference decode wants no endpointing whatsoever, including the
-        # "nothing recognized yet" rule that leading silence would otherwise
-        # trip.
-        lines.append(f"--endpoint.rule1.min-trailing-silence={t_end_s}")
-    (dst / "conf" / "model.conf").write_text("\n".join(lines) + "\n")
-    return str(dst)
+    # Not under test: left alone, a recording past the default 20 s cap would be
+    # endpointed on its length and counted as a cut.
+    conf = Path(variant) / "conf" / "model.conf"
+    conf.write_text(conf.read_text() + "--endpoint.rule5.min-utterance-length=10000.0\n")
+    return variant
 
 
 # --------------------------------------------------------------------------

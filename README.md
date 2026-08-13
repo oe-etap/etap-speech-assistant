@@ -14,6 +14,7 @@ Input comes either from pre-recorded English audio files or from a live micropho
 - Concurrent STT / LLM / TTS workers; a new utterance can interrupt an answer still being generated
 - English-only STT prompt flow and English TTS defaults
 - Selectable STT engine: `--stt-engine vosk` or `--stt-engine whisper`
+- Tunable Vosk endpointer via `--vosk-endpoint-silence-ms`, the largest single component of perceived latency; `vosk_endpoint_sweep.py` measures the setting against a corpus of recordings
 - Selectable TTS engine: `--tts-engine piper` or `--tts-engine coqui`
 - CPU/GPU preset via `--mode cpu|gpu`
 - Whisper can run on CPU or CUDA via `--whisper-device cpu|cuda`
@@ -138,6 +139,7 @@ LLM and TTS behaviour:
 Engines:
 
 - `--vosk-model PATH`: English Vosk model directory
+- `--vosk-endpoint-silence-ms N`: silence after the last word before Vosk calls the utterance over, default `600`. The largest single component of perceived latency; `0` keeps the model's own settings. See [Tuning the endpointer](#tuning-the-endpointer)
 - `--whisper-model NAME`: faster-whisper model name, default `small`
 - `--whisper-device {cpu,cuda}`: explicit Whisper device
 - `--whisper-compute-type TYPE`: for example `int8` on CPU or `float16` on CUDA
@@ -183,18 +185,85 @@ The anchor therefore comes from the STT's own word timings, which both engines r
 
 Both stages are **blank under `fast` pacing**: the audio does not advance at wall-clock speed there, so no offset within it corresponds to an instant. Use `realtime` for any latency claim; `fast` remains useful for throughput and for the per-stage costs (`stt`, `llm_ttfc`, `tts_first_chunk`, `e2e_response_ready`), which stay valid.
 
+### Tuning the endpointer
+
+`--vosk-endpoint-silence-ms` is how long Vosk waits after the last word before
+calling the utterance over. It lands on the critical path in full, so it is the
+single largest thing standing between a speaker finishing and hearing a reply —
+and it cannot simply be turned down, because an endpointer that fires on a
+breath hands the LLM half a question and has to retract that answer when the
+rest of the words arrive.
+
+`vosk_endpoint_sweep.py` measures both costs against a corpus. Swept over 833
+HeySQuAD recordings with `vosk-model-small-en-us-0.15`, counting only the 577
+where an independent engine confirms Vosk was following the speech:
+
+| `--vosk-endpoint-silence-ms` | utterances split mid-sentence | `stt_endpoint_delay` p50 |
+|---|---|---|
+| 300 | 2.95% | 690 ms |
+| 400 | 1.73% | 780 ms |
+| 500 | 0.69% | 870 ms |
+| **600** (default) | **0.17%** | **990 ms** |
+| 800 | 0.17% | 1180 ms |
+| 1200 | 0.17% | 1610 ms |
+| `0`, the model's own settings | 0.35% | 1050 ms |
+
+600 ms is where the curve stops moving: the one recording still split there is a
+false start — "now", a 1.7 s pause, then the question — and it survives 1500 ms
+too. Everything above 600 ms is latency bought for nothing. The model's shipped
+settings are beaten on both counts, being both slower and more prone to
+splitting, because they gate three different silence lengths on decoder
+confidence rather than committing to one.
+
+What the setting costs is predictable to within about 15 ms:
+
+```
+stt_endpoint_delay ≈ vosk-endpoint-silence-ms + 280 ms + audio-chunk-ms / 2
+```
+
+The 280 ms is the recognizer's own lag; the chunk term is there because the
+endpointer can only fire on a chunk boundary, which makes `--audio-chunk-ms` a
+second, smaller latency knob — 250 → 50 ms buys about 80 ms for roughly 15% more
+STT CPU, and does not move the 600 ms threshold.
+
+Read the table as calibrated, not universal. These are read-aloud questions; a
+speaker composing a sentence as they go pauses longer, and a different model
+decodes the silences differently. The setting has no effect with Whisper, which
+has no endpointer at all.
+
+To re-run it on recordings of your own users:
+
+```bash
+python vosk_endpoint_sweep.py --audio-dir path/to/wavs --vosk-model ./vosk/vosk-model-small-en-us-0.15 --include-stock
+```
+
+The recordings need the same trailing silence any `realtime` run does, and more
+of it the higher the sweep reaches: the `never_fired` column counts the files
+that ran out before the endpointer decided, and any row with a nonzero count
+there is measuring the end of the file rather than the setting. The sweep leans
+on faster-whisper to tell recordings the recognizer failed on from real pauses,
+without which the cut rates come out several times too high — `--no-whisper`
+skips that at the cost of the numbers meaning much less.
+
 ### Trailing silence in input files
 
-For `realtime` pacing to stand in for a microphone, input files need enough silence after the last word for the endpointer to fire — measured at roughly 1100 ms with `vosk-model-small-en-us-0.15`. Below that the engine only finalizes because the file ran out, a signal live input never gets, and the run reports an optimistic TTFA. A warning is printed when this happens.
+For `realtime` pacing to stand in for a microphone, input files need enough
+silence after the last word for the endpointer to fire before the audio runs
+out — which is the same `vosk-endpoint-silence-ms + 280 ms + chunk/2` as above,
+plus a margin: about **1.1 s at the default settings**. Below that the engine
+only finalizes because the file ran out, a signal live input never gets, and the
+run reports an optimistic TTFA. A warning is printed when this happens, and it
+names the figure that applies to the settings in use — raising the endpointer
+wait raises what a file has to carry.
 
 How much more than that to allow depends on `file-realtime-trigger`:
 
 | `file-realtime-trigger` | what starts the LLM | trailing silence to aim for |
 |---|---|---|
-| `endpoint` (default) | the STT calls the utterance over, as a microphone would | at least 1.2 s, with no upper bound |
-| `end-of-file` | the whole file has been read | 1.2–1.5 s, and no more — silence past the endpoint is added to `ttfa` in full |
+| `endpoint` (default) | the STT calls the utterance over, as a microphone would | comfortably past the figure above, with no upper bound |
+| `end-of-file` | the whole file has been read | that figure and no more — silence past the endpoint is added to `ttfa` in full |
 
-`stt_endpoint_delay` is unaffected either way and stays around 1100 ms however long the tail runs.
+`stt_endpoint_delay` is unaffected either way and stays put however long the tail runs.
 
 The setting applies only to file input with realtime pacing. Mic mode always triggers on the endpoint, having no stream end to wait for; `fast` pacing always waits for the file, where doing so costs nothing. It has no effect with Whisper, which has no endpointer and finalizes only when the stream ends.
 
@@ -343,6 +412,13 @@ own `ttfa`. Comparisons across engines carry that bias.
 | **duration_ms** | `stt_final_t − speech_end_t` |
 | **extra_json** | – (shares the `stt` row's resource snapshot) |
 | **Blank when** | Same conditions as `ttfa`. |
+
+With Vosk this is the one stage that is directly configurable:
+`vosk-endpoint-silence-ms + 280 ms + audio-chunk-ms / 2`, about 990 ms at the
+defaults. Where that number should sit, and what lowering it costs, is
+[Tuning the endpointer](#tuning-the-endpointer). Whisper has no endpointer, so
+under file input this is the flush once the stream ends and the setting does
+nothing.
 
 ---
 

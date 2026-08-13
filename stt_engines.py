@@ -11,6 +11,10 @@ decides how fast the audio arrives.
 
 from abc import ABC, abstractmethod
 import json
+import os
+import shutil
+import tempfile
+from pathlib import Path
 from typing import Iterable, Iterator
 
 import numpy as np
@@ -51,10 +55,76 @@ class BaseSTTEngine(ABC):
         ...
 
 
+# Kaldi's endpointing rules fire on an OR. Rules 2, 3 and 4 each pair a silence
+# length with a decoder-confidence bound, so the shipped model has no single
+# "wait this long" number; writing the same value into all three gives it one.
+# Rule 1 (silence with nothing recognized at all) is a different question and
+# keeps its own setting; rule 5 caps utterance length and is left alone.
+_ENDPOINT_RULES = ("rule2", "rule3", "rule4")
+
+
+def write_endpoint_variant(model_path: str, dest: str, trailing_silence_s: float,
+                           quiet_timeout_s: float = None) -> str:
+    """Materialize a Vosk model whose endpointer waits `trailing_silence_s`.
+
+    Vosk 0.3.44 has no runtime endpointer API -- `SetEndpointerDelays` arrived
+    in a later release -- so the setting can only reach Kaldi through the
+    model's own `conf/model.conf`, which is read once at load time. The model is
+    not copied: everything but `conf/` is linked back to the original, which
+    keeps a variant to a few hundred bytes. Where the filesystem refuses links
+    (Windows without the privilege) it falls back to copying.
+
+    `quiet_timeout_s` overrides rule 1, how long a silence with nothing
+    recognized in it runs before the recognizer gives up on the utterance.
+    Left alone by default.
+    """
+    src, dst = Path(model_path).resolve(), Path(dest)
+    if dst.is_dir():
+        shutil.rmtree(dst)
+    (dst / "conf").mkdir(parents=True)
+
+    def link(entry: Path, target: Path):
+        try:
+            os.symlink(entry, target)
+        except (OSError, NotImplementedError):
+            (shutil.copytree if entry.is_dir() else shutil.copy2)(entry, target)
+
+    for entry in src.iterdir():
+        if entry.name != "conf":
+            link(entry, dst / entry.name)
+    for entry in (src / "conf").iterdir():
+        if entry.name != "model.conf":
+            link(entry, dst / "conf" / entry.name)
+
+    kept = [ln for ln in (src / "conf" / "model.conf").read_text().splitlines()
+            if ln.strip() and not any(f"endpoint.{r}." in ln for r in _ENDPOINT_RULES)]
+    kept += [f"--endpoint.{rule}.min-trailing-silence={trailing_silence_s}"
+             for rule in _ENDPOINT_RULES]
+    if quiet_timeout_s is not None:
+        kept = [ln for ln in kept if "endpoint.rule1." not in ln]
+        kept.append(f"--endpoint.rule1.min-trailing-silence={quiet_timeout_s}")
+    (dst / "conf" / "model.conf").write_text("\n".join(kept) + "\n")
+    return str(dst)
+
+
 class VoskEngine(BaseSTTEngine):
     """Vosk-based STT engine with streaming partial/final results."""
 
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, endpoint_silence_ms: int = 0):
+        """
+        Args:
+            model_path: English Vosk model directory.
+            endpoint_silence_ms: Silence after the last word before the
+                endpointer calls the utterance over. 0 leaves the model's own
+                settings in place. Anything else is applied through a temporary
+                model variant, since the value cannot be set at runtime.
+        """
+        self._workdir = None
+        if endpoint_silence_ms:
+            self._workdir = tempfile.TemporaryDirectory(prefix="vosk-endpoint-")
+            model_path = write_endpoint_variant(
+                model_path, os.path.join(self._workdir.name, "model"),
+                endpoint_silence_ms / 1000.0)
         self._model = Model(model_path)
 
     def transcribe_stream(self, chunks: Iterable[bytes]) -> Iterator[dict]:
