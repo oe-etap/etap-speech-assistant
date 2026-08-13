@@ -139,7 +139,7 @@ LLM and TTS behaviour:
 Engines:
 
 - `--vosk-model PATH`: English Vosk model directory
-- `--vosk-endpoint-silence-ms N`: silence after the last word before Vosk calls the utterance over, default `600`. The largest single component of perceived latency; `0` keeps the model's own settings. See [Tuning the endpointer](#tuning-the-endpointer)
+- `--vosk-endpoint-silence-ms N` or `N/N/N`: silence after the last word before Vosk calls the utterance over, default `600`. The largest single component of perceived latency. `0` keeps the model's own settings; three values set Kaldi's rules 2, 3 and 4 separately, keeping its habit of leaving early when the words already sound complete. See [Tuning the endpointer](#tuning-the-endpointer)
 - `--whisper-model NAME`: faster-whisper model name, default `small`
 - `--whisper-device {cpu,cuda}`: explicit Whisper device
 - `--whisper-compute-type TYPE`: for example `int8` on CPU or `float16` on CUDA
@@ -216,20 +216,41 @@ independent, so the split column is unaffected.
 false start — "now", a 1.7 s pause, then the question — and it survives 1500 ms
 too. Everything above 600 ms is latency bought for nothing.
 
-Against the model's shipped settings that is a win at the median and a larger
-one in the tail, but not on every utterance. Those settings gate three silence
-lengths on decoder confidence, so they fire at 0.5 s when the decoder is sure
-and wait up to 1.0 s when it is not; a flat 600 ms gives up the fast case to
-remove the slow one. Per utterance, against stock:
+### One wait, or three
 
-| | p5 | p25 | p50 | p90 | p99 | p90 − p10 |
+A single number is a deliberate simplification of what Kaldi offers, and it is
+worth knowing what it gives up. Rules 2, 3 and 4 each pair a silence length with
+a bound on *relative cost* — how much worse ending the utterance here is than
+carrying on. A low relative cost means the words so far already parse as a
+finished utterance, so the shipped 0.5 / 0.75 / 1.0 s reads as **leave early if
+it sounds complete, otherwise hold on**. Writing one number into all three
+disables that: the ungated rule 4 then always fires first.
+
+`--vosk-endpoint-silence-ms` therefore also takes three values. Measured at a
+100 ms chunk over the same 577 recordings:
+
+| schedule | split mid-sentence | p5 | p50 | p90 | p99 | mean vs `600` |
 |---|---|---|---|---|---|---|
-| stock, 250 ms chunk | 760 | 920 | 1050 | 1220 | 1300 | 410 |
-| 600 ms, 100 ms chunk | 810 | 870 | 930 | 1030 | 1080 | 204 |
+| `0` — shipped, 500/750/1000 | 3 (0.52%) | 730 | 990 | 1130 | 1200 | +41 ms |
+| **`600`** (default) | **1 (0.17%)** | 810 | **930** | 1030 | 1080 | — |
+| `500/600/600` | 3 (0.52%) | 730 | **880** | 1010 | 1060 | −42 ms |
+| `500/550/600` | 4 (0.69%) | 730 | **850** | 960 | 1020 | −75 ms |
 
-Better on 384 of 577 recordings, worse on 127 — and half the spread, which is
-the part a user notices as the assistant answering at a predictable pace rather
-than an average one.
+The median understates what the gating does: `500/600/600` leaves 459 recordings
+exactly where the flat setting does and takes **221 ms off the 111 it does
+touch** — the fifth where the decoder is sure. Both it and the flat 600 ms beat
+the shipped settings outright, so there is no reason to run those.
+
+The obvious hope, that the fast exits could be kept and the splits tightened
+away, does not survive measurement: bringing rule 2's `max-relative-cost` down
+from Kaldi's 2.0 to 1.0 cuts the recordings it accelerates from 111 to 10 and
+returns the split rate to 1. The speed and the splits are the same firings.
+
+So the choice is a real trade, not an oversight. The default is the flat 600 ms
+because a split is not merely wasted compute: at a TTFA around 1.7 s the answer
+to the half-sentence has usually started playing before the rest of the words
+arrive to retract it, and the user hears a false start. Where that matters less
+than latency, `--vosk-endpoint-silence-ms 500/600/600` is one flag away.
 
 What the setting costs is predictable to within about 30 ms:
 

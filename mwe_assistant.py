@@ -85,12 +85,36 @@ WORKER_SHUTDOWN_TIMEOUT_S = 10.0
 # those sends half a question to the LLM, whose answer is then thrown away when
 # the rest of the words arrive. Above 600 ms nothing improves: the one recording
 # still split at 600 ms is a false start ("now", 1.7 s, then the question) that
-# survives 1500 ms too. The model's own settings sit at an effective ~750 ms and
-# split two, so this is the shorter wait *and* the safer one.
+# survives 1500 ms too.
+#
+# One number for every utterance is a deliberate simplification, and it is not
+# free. The shipped configuration instead gates three waits on how complete the
+# words already sound, which buys 220 ms on the fifth of utterances where the
+# decoder is sure -- at three times the split rate, and 40 ms slower on average
+# because its ceiling is 1.0 s. `500/600/600` is that mechanism with the ceiling
+# brought down, and beats the shipped settings outright; it stays available
+# rather than default because a split can be heard, the answer having often
+# started playing before the rest of the sentence arrives to retract it.
 #
 # Read on a different corpus with care. These are read-aloud questions; a
 # speaker composing a sentence as they go pauses longer.
-DEFAULT_ENDPOINT_SILENCE_MS = 600
+DEFAULT_ENDPOINT_SILENCE_MS = (600, 600, 600)
+
+
+def format_schedule(schedule):
+    """How a schedule is written back to the user and into config_used.yaml."""
+    if not max(schedule):
+        return "model default"
+    return str(schedule[0]) if len(set(schedule)) == 1 else "/".join(map(str, schedule))
+
+
+def parse_endpoint_schedule(spec):
+    """`600` for one wait, or `500/600/600` for Kaldi's rules 2, 3 and 4."""
+    parts = tuple(int(p) for p in str(spec).split("/"))
+    if len(parts) not in (1, 3):
+        raise argparse.ArgumentTypeError(f"expected N or N/N/N, got {spec!r}")
+    return parts * 3 if len(parts) == 1 else parts
+
 
 # What the endpointer costs on top of the wait itself: the recognizer's own lag
 # between the last word and the silence it scores, plus whatever is left of a
@@ -117,8 +141,13 @@ STOCK_EQUIVALENT_SILENCE_MS = 700
 
 
 def endpoint_delay_ms(endpoint_silence_ms, chunk_ms, worst_case=False):
-    """What `stt_endpoint_delay` comes out at, typically or in the tail."""
-    wait_ms = endpoint_silence_ms or STOCK_EQUIVALENT_SILENCE_MS
+    """What `stt_endpoint_delay` comes out at, typically or in the tail.
+
+    A gated schedule is read at its ceiling, the wait that applies when the
+    decoder is not persuaded the utterance is over. Its faster rules only ever
+    subtract, so this is the bound the trailing-silence check needs.
+    """
+    wait_ms = max(endpoint_silence_ms) or STOCK_EQUIVALENT_SILENCE_MS
     if worst_case:
         return round(wait_ms + ENDPOINT_P99_LAG_MS + ENDPOINT_P99_LAG_CHUNK_SHARE * chunk_ms)
     return round(wait_ms + ENDPOINT_LAG_MS + ENDPOINT_LAG_CHUNK_SHARE * chunk_ms)
@@ -782,12 +811,14 @@ def main():
 
     # STT options
     parser.add_argument("--vosk-model", default="./vosk/vosk-model-small-en-us-0.15", help="Path to English Vosk model dir")
-    parser.add_argument("--vosk-endpoint-silence-ms", type=int, default=DEFAULT_ENDPOINT_SILENCE_MS,
+    parser.add_argument("--vosk-endpoint-silence-ms", type=parse_endpoint_schedule,
+                        default=DEFAULT_ENDPOINT_SILENCE_MS,
                         help="Silence after the last word before Vosk calls the utterance "
                              "over. Lower answers sooner but risks firing on a breath and "
-                             "sending half a sentence to the LLM. 0 keeps whatever the "
-                             "model ships with. See vosk_endpoint_sweep.py for how the "
-                             "default was arrived at.")
+                             "sending half a sentence to the LLM. `0` keeps whatever the "
+                             "model ships with; `500/600/600` restores its habit of leaving "
+                             "early when the words already parse as a finished utterance. "
+                             "See vosk_endpoint_sweep.py for how the default was arrived at.")
     parser.add_argument("--whisper-model", default="small", help="faster-whisper model name")
     parser.add_argument("--whisper-device", choices=["cpu", "cuda"], default=None, help="Device for faster-whisper")
     parser.add_argument("--whisper-compute-type", default=None, help="Compute type (int8, float16, etc.)")
@@ -833,6 +864,13 @@ def main():
             parser.set_defaults(**yaml_cfg)
 
     args = parser.parse_args()
+
+    # A YAML value reaches argparse through set_defaults, which skips the `type`
+    # conversion a command line goes through, so the schedule is normalized here
+    # rather than in one of the two places it can arrive from.
+    args.vosk_endpoint_silence_ms = parse_endpoint_schedule(args.vosk_endpoint_silence_ms) \
+        if not isinstance(args.vosk_endpoint_silence_ms, tuple) \
+        else args.vosk_endpoint_silence_ms
 
     if args.input_mode == "mic":
         args.audio = ["mic"]
@@ -926,6 +964,7 @@ def main():
         args.latency_csv = os.path.join(run_dir, f"latency_log_{timestamp}.csv")
 
     config_to_save = vars(args).copy()
+    config_to_save["vosk_endpoint_silence_ms"] = format_schedule(args.vosk_endpoint_silence_ms)
 
     # Filter out settings that are not used by the selected engine
     if args.stt_engine == "whisper":
@@ -1126,7 +1165,7 @@ def main():
                     print(f"[WARN] Only {trailing_silence_ms} ms of silence after the last "
                           f"word; {needed_ms} ms or more is needed for the endpointer to "
                           f"fire at --vosk-endpoint-silence-ms "
-                          f"{args.vosk_endpoint_silence_ms or 'model default'}. This run "
+                          f"{format_schedule(args.vosk_endpoint_silence_ms)}. This run "
                           f"measures the end-of-file path, which live microphone input "
                           f"never takes, so its TTFA is optimistic.")
 

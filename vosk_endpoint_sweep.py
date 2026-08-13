@@ -12,10 +12,14 @@ Vosk 0.3.44 has no runtime endpointer API (`SetEndpointerDelays` arrived later),
 so the threshold comes from the model's own `conf/model.conf`, read at load
 time. Each swept value therefore gets a model directory of its own: every
 subdirectory symlinked back to the real model, with a rewritten `model.conf`.
-Kaldi's four silence rules fire on an OR, so all three that require decoded
-speech are pinned to the same value, which collapses them into the single
-"t_end" knob this script sweeps. Rule 1 (silence with nothing recognized at all)
-keeps its default, and rule 5 (utterance length cap) is lifted out of the way.
+Kaldi's four silence rules fire on an OR. Rules 2, 3 and 4 pair a silence length
+with a bound on how much worse ending the utterance is than continuing it, so
+the shipped 0.5/0.75/1.0 s reads as "leave early if the words already parse as a
+finished utterance, otherwise hold on". A swept value of `600` writes that one
+number into all three, which flattens the schedule -- the ungated rule 4 then
+always fires first. `500/600/600` sets them separately and keeps the gating.
+Rule 1 (silence with nothing recognized at all) keeps its default, and rule 5
+(utterance length cap) is lifted out of the way.
 
 A firing is judged against two independent references:
 
@@ -63,12 +67,13 @@ from stt_engines import write_endpoint_variant       # noqa: E402
 SAMPLE_RATE = 16000
 SAMPLE_WIDTH = 2
 
-# min-trailing-silence for the reference decode. Any value past the longest file
-# disables endpointing outright, which is what the reference needs: one segment,
-# one word list, covering the whole recording.
-NO_ENDPOINT_S = 1000.0
+# min-trailing-silence for the reference decode, in ms. Any value past the length
+# of the longest recording disables endpointing outright, which is what the
+# reference needs: one segment, one word list, covering the whole file.
+NO_ENDPOINT_MS = 1_000_000
 
-DEFAULT_T_END_MS = [200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200, 1500]
+DEFAULT_T_END_MS = [(ms,) * 3 for ms in
+                    (200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200, 1500)]
 
 # Silero segments shorter than this are dropped before the speech boundaries are
 # read off. Isolated blips are usually a click or a breath, and letting one
@@ -80,17 +85,37 @@ VAD_MIN_SPEECH_MS = 100
 # model variants
 # --------------------------------------------------------------------------
 
-def build_model_variant(src_model: str, dest: str, t_end_s: float) -> str:
-    """A model directory whose endpointer waits `t_end_s` seconds.
+def parse_schedule(spec: str):
+    """A swept value: one number, or three for Kaldi's rules 2, 3 and 4.
 
-    The reference decode asks for `NO_ENDPOINT_S`, which is past the length of
+    `600` flattens the three rules into a single wait. `500/600/600` keeps the
+    shipped shape -- leave at 0.5 s if the words already parse as a finished
+    utterance, otherwise hold -- and only moves where the thresholds sit.
+    """
+    parts = tuple(int(p) for p in str(spec).split("/"))
+    if len(parts) not in (1, 3):
+        raise argparse.ArgumentTypeError(f"expected N or N/N/N, got {spec!r}")
+    return parts * 3 if len(parts) == 1 else parts
+
+
+def label_of(schedule) -> str:
+    return str(schedule[0]) if len(set(schedule)) == 1 else "/".join(map(str, schedule))
+
+
+def build_model_variant(src_model: str, dest: str, schedule_ms,
+                        max_relative_cost=None) -> str:
+    """A model directory whose endpointer follows `schedule_ms`.
+
+    The reference decode asks for `NO_ENDPOINT_MS`, which is past the length of
     any recording: that also silences rule 1, so leading silence cannot end the
     utterance before it starts and the whole file arrives as one segment with
     one word list.
     """
+    seconds = tuple(ms / 1000.0 for ms in schedule_ms)
     variant = write_endpoint_variant(
-        src_model, dest, t_end_s,
-        quiet_timeout_s=t_end_s if t_end_s >= NO_ENDPOINT_S else None)
+        src_model, dest, seconds,
+        quiet_timeout_s=seconds[0] if schedule_ms[0] >= NO_ENDPOINT_MS else None,
+        max_relative_cost=max_relative_cost)
 
     # Not under test: left alone, a recording past the default 20 s cap would be
     # endpointed on its length and counted as a cut.
@@ -380,8 +405,12 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--audio-dir", required=True)
     ap.add_argument("--vosk-model", required=True)
-    ap.add_argument("--t-end-ms", type=int, nargs="+", default=DEFAULT_T_END_MS,
-                    help="endpointer silence thresholds to sweep, in ms")
+    ap.add_argument("--t-end-ms", type=parse_schedule, nargs="+", default=DEFAULT_T_END_MS,
+                    help="endpointer schedules to sweep. `600` puts one wait in "
+                         "front of every utterance; `500/600/600` sets Kaldi's "
+                         "rules 2, 3 and 4 separately, keeping the shipped "
+                         "behaviour of leaving early when the words already parse "
+                         "as a finished utterance")
     ap.add_argument("--chunk-ms", type=int, nargs="+", default=[250],
                     help="chunk sizes to sweep; the endpointer can only fire on a "
                          "chunk boundary, so this bounds its time resolution")
@@ -389,6 +418,13 @@ def main():
                     help="also measure the model's shipped endpointer settings, as "
                          "the baseline any swept value has to beat. Reported as "
                          "t_end_ms=0")
+    ap.add_argument("--max-relative-cost", type=lambda s: [float(x) for x in s.split("/")],
+                    default=None,
+                    help="how much worse ending the utterance may be than continuing "
+                         "before each of rules 2, 3 and 4 declines to fire, as A/B/C. "
+                         "Kaldi's 2.0/8.0/inf is what makes the rules differ; "
+                         "tightening the first asks for more certainty before an "
+                         "early exit. Applies to every swept schedule")
     ap.add_argument("--min-coverage", type=float, default=0.5,
                     help="least of the VAD-detected speech the reference decode has "
                          "to account for before a file counts toward the headline "
@@ -427,7 +463,8 @@ def main():
              run_pool(analyze_audio, _vad_init, (), files, args.jobs, "vad")}
 
     print("stage 2: reference decode (endpointing disabled)", flush=True)
-    ref_model = build_model_variant(args.vosk_model, models_dir / "reference", NO_ENDPOINT_S)
+    ref_model = build_model_variant(args.vosk_model, models_dir / "reference",
+                                    (NO_ENDPOINT_MS,) * 3)
     reference = {r["file"]: r for r in
                  run_pool(decode, _decode_init, (ref_model, args.chunk_ms[0]),
                           files, args.jobs, "reference")}
@@ -488,25 +525,29 @@ def main():
     rows = []
     detail = (out_dir / "sweep.jsonl").open("w")
     for chunk_ms in args.chunk_ms:
-        swept = ([0] if args.include_stock else []) + sorted(args.t_end_ms)
-        for t_end_ms in swept:
-            if t_end_ms == 0:
+        swept = ([(0, 0, 0)] if args.include_stock else []) + \
+            sorted(args.t_end_ms, key=lambda s: (max(s), s))
+        for schedule in swept:
+            label = label_of(schedule)
+            if schedule[0] == 0:
                 # The model as shipped: rules 2/3/4 at 0.5/0.75/1.0 s, each
-                # gated on a different decoder confidence, so no single number
+                # gated on a different relative cost, so no single number
                 # describes it. Measured, not swept.
-                variant, label = args.vosk_model, "stock config"
+                variant, label = args.vosk_model, "stock"
             else:
-                variant = build_model_variant(args.vosk_model,
-                                              models_dir / f"te_{t_end_ms}",
-                                              t_end_ms / 1000.0)
-                label = f"t_end={t_end_ms}ms"
+                variant = build_model_variant(
+                    args.vosk_model, models_dir / f"te_{label.replace('/', '_')}",
+                    schedule, args.max_relative_cost)
+                if args.max_relative_cost:
+                    label += f" cost={'/'.join(map(str, args.max_relative_cost))}"
             runs = run_pool(decode, _decode_init, (variant, chunk_ms), files,
-                            args.jobs, f"chunk={chunk_ms}ms {label}")
+                            args.jobs, f"chunk={chunk_ms}ms t_end={label}")
             scored = [score(r, audio[r["file"]]) for r in runs]
             for s, r in zip(scored, runs):
-                detail.write(json.dumps({"chunk_ms": chunk_ms, "t_end_ms": t_end_ms,
+                detail.write(json.dumps({"chunk_ms": chunk_ms, "t_end_ms": max(schedule),
+                                         "schedule_ms": list(schedule), "label": label,
                                          **s, "segments": r["segments"]}) + "\n")
-            rows.append(summarize(scored, chunk_ms, t_end_ms, usable))
+            rows.append(summarize(scored, chunk_ms, label, usable))
             print("    " + fmt_row(rows[-1]), flush=True)
     detail.close()
 
@@ -518,12 +559,12 @@ def main():
     print(f"\nwrote {out_dir}/summary.csv", flush=True)
 
 
-def summarize(scored, chunk_ms, t_end_ms, usable) -> dict:
+def summarize(scored, chunk_ms, label, usable) -> dict:
     subset = [s for s in scored if s["file"] in usable]
     delays = [s["endpoint_delay_ms"] for s in subset if s["endpoint_delay_ms"] is not None]
     return {
         "chunk_ms": chunk_ms,
-        "t_end_ms": t_end_ms,
+        "t_end_ms": label,
         "n_all": len(scored),
         "n_usable": len(subset),
         "cut_all": sum(s["acoustic_cut"] for s in scored),

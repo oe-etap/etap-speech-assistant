@@ -56,10 +56,15 @@ vosk-model: "./vosk/vosk-model-small-en-us-0.15"
 # stops happening -- and waiting longer buys nothing, since the one utterance
 # still split at 600 ms is a false start that survives 1500 ms too.
 #
-# 0 leaves the model's own settings alone. Those gate three silence lengths on
-# decoder confidence, so they beat a flat 600 ms on the utterances the decoder is
-# surest about and lose badly on the rest: 120 ms slower at the median, 220 ms at
-# the 99th percentile, and twice the spread.
+# One number puts the same wait in front of every utterance. Three -- written
+# 500/600/600, for Kaldi's rules 2, 3 and 4 -- keep the shipped habit of leaving
+# early when the words already parse as a finished utterance, which takes 220 ms
+# off the fifth of utterances where the decoder is sure, at three times the
+# split rate. That trade is left to the operator: a split is audible, the answer
+# to the half-sentence having usually started playing before the rest arrives.
+#
+# 0 leaves the model's own settings alone. Nothing recommends them: both of the
+# above are faster and split no more often.
 vosk-endpoint-silence-ms: 600
 whisper-model: "small"
 whisper-device: "cpu"
