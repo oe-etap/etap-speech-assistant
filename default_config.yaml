@@ -56,8 +56,10 @@ vosk-model: "./vosk/vosk-model-small-en-us-0.15"
 # stops happening -- and waiting longer buys nothing, since the one utterance
 # still split at 600 ms is a false start that survives 1500 ms too.
 #
-# 0 leaves the model's own settings alone, which work out about 60 ms slower
-# whatever the chunk size, and split more.
+# 0 leaves the model's own settings alone. Those gate three silence lengths on
+# decoder confidence, so they beat a flat 600 ms on the utterances the decoder is
+# surest about and lose badly on the rest: 120 ms slower at the median, 220 ms at
+# the 99th percentile, and twice the spread.
 vosk-endpoint-silence-ms: 600
 whisper-model: "small"
 whisper-device: "cpu"

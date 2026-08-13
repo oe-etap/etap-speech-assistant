@@ -214,10 +214,22 @@ independent, so the split column is unaffected.
 
 600 ms is where the curve stops moving: the one recording still split there is a
 false start — "now", a 1.7 s pause, then the question — and it survives 1500 ms
-too. Everything above 600 ms is latency bought for nothing. The model's shipped
-settings are beaten on both counts, being both slower and more prone to
-splitting, because they gate three different silence lengths on decoder
-confidence rather than committing to one.
+too. Everything above 600 ms is latency bought for nothing.
+
+Against the model's shipped settings that is a win at the median and a larger
+one in the tail, but not on every utterance. Those settings gate three silence
+lengths on decoder confidence, so they fire at 0.5 s when the decoder is sure
+and wait up to 1.0 s when it is not; a flat 600 ms gives up the fast case to
+remove the slow one. Per utterance, against stock:
+
+| | p5 | p25 | p50 | p90 | p99 | p90 − p10 |
+|---|---|---|---|---|---|---|
+| stock, 250 ms chunk | 760 | 920 | 1050 | 1220 | 1300 | 410 |
+| 600 ms, 100 ms chunk | 810 | 870 | 930 | 1030 | 1080 | 204 |
+
+Better on 384 of 577 recordings, worse on 127 — and half the spread, which is
+the part a user notices as the assistant answering at a predictable pace rather
+than an average one.
 
 What the setting costs is predictable to within about 30 ms:
 
@@ -260,6 +272,25 @@ splits at 50–200 ms against 4 at 250 ms).
 
 The default is 100 rather than 50 because the last 20 ms of the available saving
 doubles the handoff rate for a fifth of the benefit.
+
+### What it comes to end to end
+
+The two settings together, run through the whole pipeline on the four sample
+recordings — Vosk, phi3:mini, Piper, greedy decoding, 8 repeats per
+configuration, alternating — with both configurations verified to put identical
+text into the LLM:
+
+| stage | shipped settings, 250 ms chunk | 600 ms, 100 ms chunk | |
+|---|---|---|---|
+| `stt_endpoint_delay` | 1067 ms | 870 ms | **−197 ms** |
+| `llm_ttfc` | 386 ms | 390 ms | +4 ms |
+| `tts_first_chunk` | 396 ms | 406 ms | +11 ms |
+| **`ttfa`** | **1920 ms** | **1684 ms** | **−236 ms** |
+
+The LLM and TTS stages do not move, which is the point: the change is confined
+to the stage it was aimed at, and lands on `ttfa` in full. Three of the four
+recordings improve by 214–230 ms; the fourth is 66 ms worse, being one of the
+confident utterances the shipped settings endpoint at 0.5 s.
 
 The CPU column is a paired measurement, 5 interleaved repeats over 378 s of
 audio in a single process, and it says there is nothing to pay: run-to-run noise
