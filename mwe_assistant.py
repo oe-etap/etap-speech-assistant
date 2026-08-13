@@ -95,15 +95,15 @@ DEFAULT_ENDPOINT_SILENCE_MS = 600
 # What the endpointer costs on top of the wait itself: the recognizer's own lag
 # between the last word and the silence it scores, plus whatever is left of a
 # chunk when the threshold is crossed, since it can only fire on a chunk
-# boundary. Both terms are fitted over vosk_endpoint_sweep.py's output -- 24
-# combinations of 50/250 ms chunks with 200-1500 ms waits, over the 577
-# recordings it counts -- to
+# boundary. Both terms are fitted over vosk_endpoint_sweep.py's output -- 32
+# combinations of six chunk sizes from 50 to 250 ms with 200-1500 ms waits, over
+# the 577 recordings it counts -- to
 #
 #     stt_endpoint_delay ~= wait + LAG_MS + LAG_CHUNK_SHARE * audio-chunk-ms
 #
 # fitted once for the median and once for the 99th percentile. Residuals stay
-# within 30 ms in both cases. The chunk coefficients rest on two chunk sizes, so
-# they interpolate between 50 and 250 ms rather than stating a law.
+# within 35 ms in both cases, and the chunk term is linear across every size
+# measured. Nothing here says it stays linear past 250 ms.
 ENDPOINT_LAG_MS = 280
 ENDPOINT_LAG_CHUNK_SHARE = 0.4
 ENDPOINT_P99_LAG_MS = 390

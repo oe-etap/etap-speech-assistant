@@ -398,6 +398,10 @@ def main():
                          "and still count as followed")
     ap.add_argument("--whisper-model", default="small",
                     help="faster-whisper model for the second opinion")
+    ap.add_argument("--whisper-cache", default=None,
+                    help="reuse the second opinion from an earlier run's files.jsonl. "
+                         "It depends only on the audio, so sweeping something else "
+                         "over the same corpus need not pay for it twice")
     ap.add_argument("--no-whisper", action="store_true",
                     help="skip the second opinion. Faster, but the cut rates come "
                          "out several times too high: see the note above coverage()")
@@ -429,7 +433,18 @@ def main():
                           files, args.jobs, "reference")}
 
     whisper = {}
-    if not args.no_whisper:
+    if args.whisper_cache:
+        whisper = {r["file"]: {"text": r["whisper_text"], "n_words": r["whisper_n_words"],
+                               "mean_prob": r["whisper_mean_prob"],
+                               "word_gaps_s": r["whisper_word_gaps_s"]}
+                   for r in (json.loads(l) for l in open(args.whisper_cache))
+                   if r.get("whisper_n_words") is not None}
+        missing = [f for f in audio if f not in whisper]
+        if missing:
+            sys.exit(f"--whisper-cache is missing {len(missing)} of the files being "
+                     f"swept, starting with {missing[0]}")
+        print(f"stage 2b: second opinion reused from {args.whisper_cache}", flush=True)
+    elif not args.no_whisper:
         print(f"stage 2b: second opinion (faster-whisper {args.whisper_model})", flush=True)
         try:
             whisper = {w["file"]: w for w in

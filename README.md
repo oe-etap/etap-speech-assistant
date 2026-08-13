@@ -222,18 +222,50 @@ stt_endpoint_delay  ≈ vosk-endpoint-silence-ms + 280 ms + 0.40 × audio-chunk-
                     ≈ vosk-endpoint-silence-ms + 390 ms + 0.75 × audio-chunk-ms   (99th percentile)
 ```
 
-Both are least-squares fits over the sweep's own output — 24 combinations of
-50/250 ms chunks with 200–1500 ms waits — not derivations. The constant is the
-recognizer's lag between the last word and the silence it scores; the chunk term
-is there because the endpointer can only fire on a chunk boundary, which makes
-`--audio-chunk-ms` a second, smaller latency knob: 250 → 50 ms buys about 80 ms
-for roughly 15% more STT CPU, and does not move the 600 ms threshold. Having
-only two chunk sizes behind them, the chunk coefficients interpolate between 50
-and 250 ms rather than stating a law.
+Both are least-squares fits over the sweep's own output — 32 combinations of six
+chunk sizes from 50 to 250 ms with 200–1500 ms waits — not derivations. The
+constant is the recognizer's lag between the last word and the silence it
+scores. The chunk term is there because the endpointer can only fire on a chunk
+boundary; it holds across the range measured, but nothing here says it stays
+linear past 250 ms.
 
 The gap between the two lines is the spread from one utterance to the next,
 around 200 ms at a 250 ms chunk. Quote the median as the latency; size input
 files against the 99th percentile.
+
+### Chunk size
+
+`--audio-chunk-ms` is the second latency knob, and a cheaper one than it looks.
+Measured at `--vosk-endpoint-silence-ms 600` over the same 577 recordings:
+
+| `--audio-chunk-ms` | `stt_endpoint_delay` p50 | vs 250 ms | split mid-sentence | WER vs Whisper | STT CPU |
+|---|---|---|---|---|---|
+| 50 | 910 ms | −80 ms | 1 (0.17%) | 0.1735 | −0.1% |
+| 100 | 930 ms | −60 ms | 1 (0.17%) | 0.1732 | +1.1% |
+| 125 | 945 ms | −45 ms | 1 (0.17%) | 0.1739 | −0.4% |
+| 150 | 960 ms | −30 ms | 1 (0.17%) | 0.1746 | +0.8% |
+| 200 | 970 ms | −20 ms | 1 (0.17%) | 0.1737 | −4.3% |
+| 250 | 990 ms | — | 1 (0.17%) | 0.1741 | — |
+
+Only the first column moves. Accuracy is flat to within 0.0014 WER, and the
+endpointer splits the same single recording at every size — a smaller chunk
+removes the accidental extra tolerance a coarse one grants, but at 600 ms the
+real margin is wide enough that nothing depends on it. Lower the chunk to buy
+latency; it will not buy safety, and at 500 ms of wait it costs a little (5
+splits at 50–200 ms against 4 at 250 ms).
+
+The CPU column is a paired measurement, 5 interleaved repeats over 378 s of
+audio in a single process, and it says there is nothing to pay: run-to-run noise
+is 14% of the mean, so anything here is well inside it. That is what the
+mechanism predicts — the cost is per frame of audio, not per call, and even
+50 ms chunks add only a few thousand FFI crossings over six minutes of audio.
+The −4.3% at 200 ms reproduced across all five repeats but fits no trend and has
+no explanation, so it is reported rather than relied on.
+
+The measurement is a tight decode loop on an idle 16-core machine. It does not
+capture what more frequent handoffs cost the pipeline's own queues, or a
+microphone driver asked for smaller blocks, so treat 50 ms as measured rather
+than proven in production.
 
 Read the table as calibrated, not universal. These are read-aloud questions; a
 speaker composing a sentence as they go pauses longer, and a different model
