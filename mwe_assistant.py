@@ -93,18 +93,35 @@ WORKER_SHUTDOWN_TIMEOUT_S = 10.0
 DEFAULT_ENDPOINT_SILENCE_MS = 600
 
 # What the endpointer costs on top of the wait itself: the recognizer's own lag
-# between the last word and the silence it scores, plus however much of a chunk
-# is left when the threshold is crossed. Fitted over the same sweep, across
-# 200-1000 ms thresholds and 50/250 ms chunks, to within about 15 ms.
+# between the last word and the silence it scores, plus whatever is left of a
+# chunk when the threshold is crossed, since it can only fire on a chunk
+# boundary. Both terms are fitted over vosk_endpoint_sweep.py's output -- 24
+# combinations of 50/250 ms chunks with 200-1500 ms waits, over the 577
+# recordings it counts -- to
+#
+#     stt_endpoint_delay ~= wait + LAG_MS + LAG_CHUNK_SHARE * audio-chunk-ms
+#
+# fitted once for the median and once for the 99th percentile. Residuals stay
+# within 30 ms in both cases. The chunk coefficients rest on two chunk sizes, so
+# they interpolate between 50 and 250 ms rather than stating a law.
 ENDPOINT_LAG_MS = 280
+ENDPOINT_LAG_CHUNK_SHARE = 0.4
+ENDPOINT_P99_LAG_MS = 390
+ENDPOINT_P99_LAG_CHUNK_SHARE = 0.75
+
+# The model's own settings gate three silence lengths on decoder confidence and
+# so have no single wait to substitute here. Measured, they behave like this
+# one: 1050 ms median and 1300 ms p99 at a 250 ms chunk, both of which the
+# formulas above reproduce from 700 to within 30 ms.
+STOCK_EQUIVALENT_SILENCE_MS = 700
 
 
-def endpoint_delay_ms(endpoint_silence_ms, chunk_ms):
-    """Roughly what `stt_endpoint_delay` will come out at for a setting."""
-    # The model as shipped gates three silence lengths on decoder confidence, so
-    # it has no single wait to add. Measured at ~1050 ms p50 at a 250 ms chunk.
-    silence_ms = endpoint_silence_ms or 750
-    return silence_ms + ENDPOINT_LAG_MS + chunk_ms // 2
+def endpoint_delay_ms(endpoint_silence_ms, chunk_ms, worst_case=False):
+    """What `stt_endpoint_delay` comes out at, typically or in the tail."""
+    wait_ms = endpoint_silence_ms or STOCK_EQUIVALENT_SILENCE_MS
+    if worst_case:
+        return round(wait_ms + ENDPOINT_P99_LAG_MS + ENDPOINT_P99_LAG_CHUNK_SHARE * chunk_ms)
+    return round(wait_ms + ENDPOINT_LAG_MS + ENDPOINT_LAG_CHUNK_SHARE * chunk_ms)
 
 
 def min_trailing_silence_ms(args):
@@ -112,10 +129,12 @@ def min_trailing_silence_ms(args):
 
     Below this the engine only finalizes because the file ran out, a signal a
     live microphone never gets, so the run reports a latency live input would
-    never achieve. Scales with the endpointer setting: raising the wait raises
-    what a file has to carry.
+    never achieve. How long the endpointer takes varies from one utterance to
+    the next by around 200 ms, so this is the 99th percentile rather than the
+    median: a file cut to the median figure would fall short half the time.
     """
-    return endpoint_delay_ms(args.vosk_endpoint_silence_ms, args.audio_chunk_ms) + 200
+    return endpoint_delay_ms(args.vosk_endpoint_silence_ms, args.audio_chunk_ms,
+                             worst_case=True)
 
 
 # What hands an utterance to the LLM.

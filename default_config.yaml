@@ -17,7 +17,7 @@ input-mode: file  # 'file' or 'mic'
 #             Required for ttfa and stt_endpoint_delay, which are blank without
 #             it: only here does a point inside the audio map to an instant.
 #             Input files need enough silence after the last word for the
-#             endpointer to fire before the audio runs out -- about 1.1 s at the
+#             endpointer to fire before the audio runs out -- about 1.2 s at the
 #             settings below, and more if vosk-endpoint-silence-ms is raised.
 #             Short of that the run measures a path live input never takes. A
 #             warning is printed when there is too little, naming the figure.

@@ -215,16 +215,25 @@ settings are beaten on both counts, being both slower and more prone to
 splitting, because they gate three different silence lengths on decoder
 confidence rather than committing to one.
 
-What the setting costs is predictable to within about 15 ms:
+What the setting costs is predictable to within about 30 ms:
 
 ```
-stt_endpoint_delay ≈ vosk-endpoint-silence-ms + 280 ms + audio-chunk-ms / 2
+stt_endpoint_delay  ≈ vosk-endpoint-silence-ms + 280 ms + 0.40 × audio-chunk-ms   (median)
+                    ≈ vosk-endpoint-silence-ms + 390 ms + 0.75 × audio-chunk-ms   (99th percentile)
 ```
 
-The 280 ms is the recognizer's own lag; the chunk term is there because the
-endpointer can only fire on a chunk boundary, which makes `--audio-chunk-ms` a
-second, smaller latency knob — 250 → 50 ms buys about 80 ms for roughly 15% more
-STT CPU, and does not move the 600 ms threshold.
+Both are least-squares fits over the sweep's own output — 24 combinations of
+50/250 ms chunks with 200–1500 ms waits — not derivations. The constant is the
+recognizer's lag between the last word and the silence it scores; the chunk term
+is there because the endpointer can only fire on a chunk boundary, which makes
+`--audio-chunk-ms` a second, smaller latency knob: 250 → 50 ms buys about 80 ms
+for roughly 15% more STT CPU, and does not move the 600 ms threshold. Having
+only two chunk sizes behind them, the chunk coefficients interpolate between 50
+and 250 ms rather than stating a law.
+
+The gap between the two lines is the spread from one utterance to the next,
+around 200 ms at a 250 ms chunk. Quote the median as the latency; size input
+files against the 99th percentile.
 
 Read the table as calibrated, not universal. These are read-aloud questions; a
 speaker composing a sentence as they go pauses longer, and a different model
@@ -249,12 +258,12 @@ skips that at the cost of the numbers meaning much less.
 
 For `realtime` pacing to stand in for a microphone, input files need enough
 silence after the last word for the endpointer to fire before the audio runs
-out — which is the same `vosk-endpoint-silence-ms + 280 ms + chunk/2` as above,
-plus a margin: about **1.1 s at the default settings**. Below that the engine
-only finalizes because the file ran out, a signal live input never gets, and the
-run reports an optimistic TTFA. A warning is printed when this happens, and it
-names the figure that applies to the settings in use — raising the endpointer
-wait raises what a file has to carry.
+out. That is the 99th-percentile line above — the median would leave half the
+utterances short — which comes to about **1.2 s at the default settings**. Below
+it the engine only finalizes because the file ran out, a signal live input never
+gets, and the run reports an optimistic TTFA. A warning is printed when this
+happens, and it names the figure that applies to the settings in use: raising
+the endpointer wait raises what a file has to carry.
 
 How much more than that to allow depends on `file-realtime-trigger`:
 
@@ -414,7 +423,7 @@ own `ttfa`. Comparisons across engines carry that bias.
 | **Blank when** | Same conditions as `ttfa`. |
 
 With Vosk this is the one stage that is directly configurable:
-`vosk-endpoint-silence-ms + 280 ms + audio-chunk-ms / 2`, about 990 ms at the
+`vosk-endpoint-silence-ms + 280 ms + 0.40 × audio-chunk-ms`, about 990 ms at the
 defaults. Where that number should sit, and what lowering it costs, is
 [Tuning the endpointer](#tuning-the-endpointer). Whisper has no endpointer, so
 under file input this is the flush once the stream ends and the setting does
