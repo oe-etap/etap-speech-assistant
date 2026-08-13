@@ -17,8 +17,9 @@ input-mode: file  # 'file' or 'mic'
 #             Required for ttfa and stt_endpoint_delay, which are blank without
 #             it: only here does a point inside the audio map to an instant.
 #             Input files need enough silence after the last word for the
-#             endpointer to fire before the audio runs out -- about 1.2 s at the
-#             settings below, and more if vosk-endpoint-silence-ms is raised.
+#             endpointer to fire before the audio runs out -- about 1.1 s at the
+#             settings below, and more if vosk-endpoint-silence-ms or
+#             audio-chunk-ms is raised.
 #             Short of that the run measures a path live input never takes. A
 #             warning is printed when there is too little, naming the figure.
 #   fast:     read as quickly as possible, for throughput runs and for the
@@ -34,7 +35,11 @@ audio-pacing: realtime
 # Ignored under 'fast' pacing and in mic mode. No effect with Whisper, which
 # has no endpointer and finalizes only when the stream ends.
 file-realtime-trigger: endpoint
-audio-chunk-ms: 250
+# Chunk length handed to the STT. The endpointer can only fire on a chunk
+# boundary, so this costs about 0.4 ms of response time per ms of chunk. Nothing
+# else measurably moves with it between 50 and 250 ms -- not accuracy, not how
+# often the endpointer fires mid-sentence, not STT CPU.
+audio-chunk-ms: 100
 playback: false   # Play TTS output on speakers
 idle-timeout: 10.0 # Shutdown after N seconds of silence
 
@@ -51,8 +56,8 @@ vosk-model: "./vosk/vosk-model-small-en-us-0.15"
 # stops happening -- and waiting longer buys nothing, since the one utterance
 # still split at 600 ms is a false start that survives 1500 ms too.
 #
-# 0 leaves the model's own settings alone, which work out slower (~1050 ms of
-# stt_endpoint_delay against ~990 ms) and split more.
+# 0 leaves the model's own settings alone, which work out about 60 ms slower
+# whatever the chunk size, and split more.
 vosk-endpoint-silence-ms: 600
 whisper-model: "small"
 whisper-device: "cpu"
