@@ -247,10 +247,12 @@ from Kaldi's 2.0 to 1.0 cuts the recordings it accelerates from 111 to 10 and
 returns the split rate to 1. The speed and the splits are the same firings.
 
 So the choice is a real trade, not an oversight. The default is the flat 600 ms
-because a split is not merely wasted compute: at a TTFA around 1.7 s the answer
-to the half-sentence has usually started playing before the rest of the words
-arrive to retract it, and the user hears a false start. Where that matters less
-than latency, `--vosk-endpoint-silence-ms 500/600/600` is one flag away.
+for two reasons. A split is not merely wasted compute: at a TTFA around 1.7 s
+the answer to the half-sentence has usually started playing before the rest of
+the words arrive to retract it, and the user hears a false start. And the gain
+it is traded against is unpredictable — see below, the accelerated fifth is not
+distinguishable from the rest by anything an operator can see. Where latency
+matters more, `--vosk-endpoint-silence-ms 500/600/600` is one flag away.
 
 What the setting costs is predictable to within about 30 ms:
 
@@ -301,17 +303,30 @@ recordings — Vosk, phi3:mini, Piper, greedy decoding, 8 repeats per
 configuration, alternating — with both configurations verified to put identical
 text into the LLM:
 
-| stage | shipped settings, 250 ms chunk | 600 ms, 100 ms chunk | |
+| stage | shipped, 250 ms chunk | `600`, 100 ms chunk | `500/600/600`, 100 ms chunk |
 |---|---|---|---|
-| `stt_endpoint_delay` | 1067 ms | 870 ms | **−197 ms** |
-| `llm_ttfc` | 386 ms | 390 ms | +4 ms |
-| `tts_first_chunk` | 396 ms | 406 ms | +11 ms |
-| **`ttfa`** | **1920 ms** | **1684 ms** | **−236 ms** |
+| `stt_endpoint_delay` | 1064 ms | **870 ms** | 872 ms |
+| `llm_ttfc` | 382 ms | 396 ms | 386 ms |
+| `tts_first_chunk` | 400 ms | 396 ms | 404 ms |
+| **`ttfa`** | **1914 ms** | **1694 ms** | **1698 ms** |
 
 The LLM and TTS stages do not move, which is the point: the change is confined
-to the stage it was aimed at, and lands on `ttfa` in full. Three of the four
-recordings improve by 214–230 ms; the fourth is 66 ms worse, being one of the
-confident utterances the shipped settings endpoint at 0.5 s.
+to the stage it was aimed at, and lands on `ttfa` in full.
+
+The gated schedule comes out identical to the flat one here — within 1 ms per
+recording, not within noise but genuinely the same firings. Four recordings
+cannot say otherwise: the gate touches 19% of utterances, so the chance that
+none of four samples it is 43%. What this measurement shows is the endpointer
+ceiling, which both configurations share; for what the gating is worth, only the
+corpus figures above can speak.
+
+Nor is the accelerated fifth predictable from anything visible. Split by whether
+the gate fires, the two groups match on word count (11 against 10) and on speech
+duration (3.90 s against 3.82 s), and their transcripts read alike — "in what
+part of the united states is texas located" is accelerated while "when was the
+county borough of liverpool created" is not. The gate is not rewarding
+well-formed questions in any way an operator could anticipate; it is 220 ms on
+an arbitrary fifth of turns.
 
 The CPU column is a paired measurement, 5 interleaved repeats over 378 s of
 audio in a single process, and it says there is nothing to pay: run-to-run noise
