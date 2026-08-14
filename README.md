@@ -19,6 +19,7 @@ Input comes either from pre-recorded English audio files or from a live micropho
 - Selectable TTS engine: `--tts-engine piper` or `--tts-engine coqui`
 - CPU/GPU preset via `--mode cpu|gpu`
 - Whisper can run on CPU or CUDA via `--whisper-device cpu|cuda`
+- Piper can run on CPU or CUDA via `--piper-device cpu|cuda`, which trades a per-call cost against a per-second-of-speech one and so helps long chunks and hurts short ones — see [Piper on the GPU](#piper-on-the-gpu)
 - Input audio is normalized to mono 16 kHz WAV using `ffmpeg`
 - Per-stage timing: `stt`, `stt_endpoint_delay`, `llm_ttft`, `llm_first_chunk_fill`, `llm_ttfc`, `tts_first_chunk`, `llm_eval`, `tts_total`
 - `ttfa`: time from the speaker stopping to the first audio out — the figure a user actually perceives
@@ -53,6 +54,11 @@ Additional assets:
 
 - For Vosk: an English model, for example `vosk-model-small-en-us-0.15`
 - For Piper: an English voice, for example `en_US-lessac-medium.onnx`
+- Only for `--piper-device cuda`: an `onnxruntime-gpu` in place of the CPU
+  `onnxruntime` that `piper-tts` installs, and one built for the GPU's compute
+  capability. `requirements_gpu.txt` carries the commands and
+  [Piper on the GPU](#piper-on-the-gpu) explains which versions a pre-Ampere
+  card is limited to
 - For Coqui XTTS-v2: the model is loaded through the `TTS` package
 - For GPU stats: an NVIDIA driver, read through `nvidia-ml-py` (in both requirements files) or, failing that, an `nvidia-smi` on PATH
 - System prompts: `prompts/*.txt`, referenced by `system-prompt-file`. These are
@@ -133,7 +139,7 @@ Input and pacing:
 LLM and TTS behaviour:
 
 - `--system-prompt-file PATH`: prompt variant; the one used is copied to `<out-dir>/system_prompt.txt`
-- `--llm-temperature FLOAT`: sampling temperature, default `0` — greedy decoding, so a run repeats exactly. Raise it only with `--llm-seed` set
+- `--llm-temperature FLOAT`: sampling temperature, default `0` — greedy decoding, which removes most of the run-to-run variance in response length but does **not** make two runs identical; see [What this measurement cannot tell you](#what-this-measurement-cannot-tell-you). Raise it only with `--llm-seed` set
 - `--llm-seed INT`: sampling seed, unset by default. It does nothing at temperature `0`, and is what keeps a run reproducible above it
 - `--llm-max-tokens N`: response cap, default `150`
 - `--tts-chunk-max-chars N`: safety-net chunk length for the LLM → TTS handoff, default `140`. Lower = lower TTFA, higher = better prosody
@@ -148,6 +154,7 @@ Engines:
 - `--piper-exe PATH`: Piper executable
 - `--piper-voice PATH`: English Piper `.onnx` voice
 - `--piper-use-exe`: call the Piper CLI instead of the Python API (slower, spawns a subprocess per chunk)
+- `--piper-device {cpu,cuda}`: execution provider for the Piper voice model, following `--mode` when unset. What it buys depends on how long the chunk is, and on the four sample recordings it did not move `ttfa` outside the noise; see [Piper on the GPU](#piper-on-the-gpu)
 - `--coqui-voice NAME`: default `xtts_v2`
 - `--coqui-language CODE`: default `en`
 - `--coqui-speaker NAME`: default `Daisy Studious`
@@ -413,6 +420,155 @@ How much more than that to allow depends on `file-realtime-trigger`:
 The setting applies only to file input with realtime pacing. Mic mode always triggers on the endpoint, having no stream end to wait for; `fast` pacing always waits for the file, where doing so costs nothing. It has no effect with Whisper, which has no endpointer and finalizes only when the stream ends.
 
 Under `endpoint`, a second end-of-speech signal within one input carries **everything recognized so far**, not just the new sentence, and supersedes the answer already in flight. An endpointer that fires while the speaker is only drawing breath would otherwise have the LLM answer half a sentence. Note that this is not conversation memory: each request to Ollama is independent, carries no `context` and no message history, and the assistant's own previous replies are never fed back.
+
+### Piper on the GPU
+
+Piper is a VITS model in ONNX, so `--piper-device cuda` moves it to the
+CUDA execution provider. It runs, and it is faster at synthesizing a paragraph.
+It is not obviously worth turning on, and the reason is that the two devices
+fail differently: **the GPU pays a fixed cost per call and the CPU pays per
+second of speech it produces.**
+
+Measured on the voice model alone, one sentence per call, nothing else running —
+median over 12 distinct sentences per bucket, each synthesized once:
+
+| sentence length | CPU | CUDA |
+|---|---|---|
+| 48 chars | **92 ms** | 130 ms |
+| 56 chars | **102 ms** | 130 ms |
+| 102 chars | 160 ms | **148 ms** |
+| 142 chars | 234 ms | **156 ms** |
+
+The CUDA column is nearly flat — 26 ms across a threefold change in length —
+while the CPU column rises roughly in proportion to it, at about 1.5 ms per
+character. They cross at about 80 characters. Below that the GPU is the slower
+setting, and no amount of shortening the text gets under its floor.
+
+Most of that floor is setup for a tensor shape the session has not seen. Saying
+the same sentence three times in a row separates the two costs, and they belong
+almost entirely to the GPU:
+
+| | first call | third call | paid per new shape |
+|---|---|---|---|
+| CPU | 116 ms | 119 ms | **0 ms** |
+| CUDA | 138 ms | 80 ms | **58 ms** |
+
+The penalty is flat at 56–60 ms across every length tested, and the CPU does not
+have it at all — its third call is no faster than its first. A server that said
+one sentence over and over would see the 80 ms figure; this pipeline never
+repeats a sentence, so it pays the 138 ms one on every chunk. That single 58 ms
+is what moves the crossover from about 40 characters to about 80, which is to
+say it is the whole question.
+
+#### What the device comes to end to end
+
+The same four recordings, once each, everything else held at the defaults. Note
+that the two runs are not a paired measurement — see the caveat below:
+
+| stage | `--piper-device cpu` | `--piper-device cuda` |
+|---|---|---|
+| `tts_first_chunk` (mean) | 342 ms | **260 ms** |
+| `tts_first_chunk` (SD) | 119 ms | **25 ms** |
+| `llm_ttfc` | 321 ms | 326 ms |
+| **`ttfa`** (mean) | **1716 ms** | **1637 ms** |
+| **`ttfa`** (p50) | **1690 ms** | **1630 ms** |
+
+`tts_first_chunk` against the length of the chunk it actually synthesized shows
+the table above surviving into the pipeline, inflated by roughly a factor of two
+on both devices by everything else competing for the machine:
+
+| recording | CPU run | CUDA run |
+|---|---|---|
+| 00012 | 24 chars → 203 ms | 76 chars → 227 ms |
+| 00004 | 42 chars → 285 ms | 23 chars → 264 ms |
+| 00032 | 62 chars → 418 ms | 61 chars → 262 ms |
+| 00005 | 105 chars → 462 ms | 95 chars → 287 ms |
+
+The two columns are not the same sentences — that is the whole difficulty, and
+what the next section is about — but read down each one and the CPU triples over
+its range while the GPU does not move. Row 00032 is very nearly a controlled
+comparison, 62 characters against 61, and the GPU wins it by 156 ms. The
+shortest chunk in either run, 24 characters against 23, goes the other way by
+61 ms.
+
+**`ttfa` barely moves, and this is structural rather than bad luck.** The
+`short-opener.txt` prompt asks for "a very short sentence of at most five words"
+before any detail, precisely so that the first chunk is small and reaches the
+speaker early. That deliberately puts the only chunk `ttfa` waits on into the
+half of the range where the GPU is behind. The GPU's advantage lands on chunks
+two and later — real work, but work that happens while the user is already
+listening, so it shows up in `tts_total` and not in what they wait for.
+
+`tts_total` falls 30% between the two runs, and most of that is not the device:
+the GPU run's answers were shorter, 51.8 s of speech against 67.8 s. Normalized
+per second of audio produced, the drop is **16%** — over 00005, 00012 and 00032
+only, since 00004's endpointer fired twice and `tts_total` resets on the cancel
+while both of its WAVs stay on disk, which would flatter whichever run it landed
+in.
+
+#### What this measurement cannot tell you
+
+Four recordings, one run each. The `ttfa` difference is smaller than the spread
+within either run, so read it as "no clear movement", not as 79 ms.
+
+Worse, the two runs are **not paired**. `llm-temperature` is 0 and the STT fed
+both runs identical transcripts, yet Ollama returned different answers — "He
+inherited her estate" against "He became her first grandchild" on the same
+question. Greedy decoding is reproducible within a process, not across restarts
+of a GPU-resident model, and the claim elsewhere in this file that a run repeats
+exactly does not hold across runs. Since `tts_first_chunk` scales with the text
+it is handed, that difference lands directly on the stage under test. It
+happened to run against the GPU here — the GPU run's first chunks averaged 64
+characters to the CPU run's 58, and were still faster — so the direction of the
+`tts_first_chunk` result is safe even if the size of it is not.
+
+The isolated benchmark above has no such problem: identical sentences, one
+process, and it is what the recommendation rests on.
+
+Nothing here was measured with Piper as the only tenant of the GPU. Ollama holds
+phi3:mini in VRAM throughout and is generating the rest of the answer while the
+first chunk is synthesized. That costs less than it sounds — synthesis under an
+active Ollama generation is 12 ms slower than on an idle GPU — but a larger
+model, or a second process, is a different situation.
+
+#### Getting it to run
+
+`--piper-device cuda` needs an `onnxruntime-gpu` built for the GPU's compute
+capability, and ONNX Runtime does not treat a provider that fails to initialize
+as an error — it drops to the CPU and runs. A run logged as GPU would then be a
+CPU run with a misleading `config_used.yaml`, so the engine checks what the
+session actually got and refuses to start instead.
+
+On the V100 this was measured on (compute capability 7.0), two version ceilings
+apply, both because CUDA 13 dropped Volta:
+
+- `onnxruntime-gpu` 1.27 and later are CUDA 13 builds. They load, then fail in
+  `cublasCreate` with `CUBLAS_STATUS_ARCH_MISMATCH`. **1.26.0** is the last
+  CUDA 12 build.
+- cuDNN 9.11 dropped Volta as well, and the `[cudnn]` extra resolves to a
+  current one. The symptom is different — the session builds and the first
+  `Conv` fails with `CUDNN_STATUS_EXECUTION_FAILED_CUDART`. **9.10.2.21** is the
+  last one with Volta kernels.
+
+On Ampere or newer neither ceiling applies. `requirements_gpu.txt` carries the
+commands.
+
+#### Is it worth turning on
+
+On this hardware and this prompt, not for `ttfa`.
+
+It is worth turning on for the other three things it does. The CPU stops being
+the bottleneck it was: system CPU during the first-chunk window falls from
+**91% to 12%**, because the CPU provider spreads that synthesis across every
+core it can find and the CUDA one does not. Long answers get cheaper, `tts_total`
+improving 16% per second of speech produced. And the spread of
+`tts_first_chunk` collapses from 119 ms to 25 ms — for a stage sitting on the
+critical path, a predictable 260 ms may be worth more than something averaging
+342 ms and reaching 462.
+
+The setting that would actually move `ttfa` is not the device. It is the length
+of the first chunk, which `short-opener.txt` and `--tts-chunk-max-chars` already
+control, and which the CPU is better at.
 
 ## Aggregating a run
 

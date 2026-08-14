@@ -940,6 +940,11 @@ def main():
     parser.add_argument("--piper-exe", default="./piper/piper.exe", help="Path to Piper executable (piper or piper.exe)")
     parser.add_argument("--piper-voice", default="./piper/en_US-lessac-medium.onnx", help="Path to English Piper .onnx voice")
     parser.add_argument("--piper-use-exe", action="store_true", help="Use Piper CLI executable instead of Python API (slower, spawns subprocess per chunk)")
+    parser.add_argument("--piper-device", choices=["cpu", "cuda"], default=None,
+                        help="ONNX Runtime execution provider for the Piper voice model. "
+                             "Defaults to the --mode preset. 'cuda' needs an onnxruntime-gpu "
+                             "matching the GPU's compute capability, and is refused rather "
+                             "than silently served from the CPU. Ignored with --piper-use-exe.")
     parser.add_argument("--coqui-voice", default="xtts_v2", help="Coqui voice model key")
     parser.add_argument("--coqui-language", default="en", help="Language code for Coqui")
     parser.add_argument("--coqui-speaker", default="Daisy Studious", help="Speaker id for Coqui")
@@ -1024,6 +1029,8 @@ def main():
         args.whisper_device = "cuda" if args.mode == "gpu" else "cpu"
     if args.whisper_compute_type is None:
         args.whisper_compute_type = "float16" if args.whisper_device == "cuda" else "int8"
+    if args.piper_device is None:
+        args.piper_device = "cuda" if args.mode == "gpu" else "cpu"
 
     # Any one-off setup cost happens here, before a stage is ever timed.
     start_gpu_monitor()
@@ -1061,6 +1068,7 @@ def main():
             voice_path=args.piper_voice,
             exe_path=args.piper_exe,
             use_exe=args.piper_use_exe,
+            device=args.piper_device,
         )
     elif args.tts_engine == "coqui":
         tts_engine = CoquiEngine(
@@ -1096,6 +1104,7 @@ def main():
         config_to_save.pop("piper_exe", None)
         config_to_save.pop("piper_voice", None)
         config_to_save.pop("piper_use_exe", None)
+        config_to_save.pop("piper_device", None)
 
     config_dump_path = os.path.join(run_dir, "config_used.yaml")
     with open(config_dump_path, "w", encoding="utf-8") as f:

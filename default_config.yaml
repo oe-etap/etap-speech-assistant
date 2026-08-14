@@ -82,6 +82,21 @@ piper-exe: "./piper/piper.exe"
 piper-voice: "./piper/en_US-lessac-medium.onnx"
 piper-use-exe: false
 
+# Execution provider for the Piper voice model, cpu or cuda. Unset follows the
+# `mode` preset above.
+#
+# The GPU has a floor of about 70 ms per call that no amount of shortening gets
+# under, while the CPU's cost tracks the length of the audio produced. Below
+# roughly 40 characters the CPU is ahead and cuda is the slower setting; above
+# it the gap opens the other way, to better than half at a full-length chunk.
+# Since the first chunk of an answer is the short one, and it alone is what
+# `ttfa` waits on, this is not the free win it looks like -- see the README.
+#
+# Needs an onnxruntime-gpu built for the GPU's compute capability. A provider
+# that fails to initialize is not an error to ONNX Runtime, which quietly runs
+# on the CPU instead; that is refused here rather than logged as a GPU run.
+piper-device: cpu
+
 coqui-voice: "xtts_v2"
 coqui-language: "en"
 coqui-speaker: "Daisy Studious"
@@ -98,7 +113,11 @@ llm-max-tokens: 150
 
 # Response length varies enough between runs to hide whatever is under test, and
 # llm_eval, tts_total and e2e_response_ready all scale with it. Greedy decoding
-# removes that variance, so a run repeats exactly.
+# removes most of that variance -- but not all of it, and not reliably across
+# process restarts: two runs over the same recordings, with identical
+# transcripts reaching the LLM, still came back with different answers from a
+# GPU-resident phi3:mini. Treat temperature 0 as narrowing the spread, not as
+# pairing two runs.
 #
 # The seed does nothing at temperature 0 and is left unset rather than set to a
 # number that looks load-bearing but is not. Raise the temperature only together
