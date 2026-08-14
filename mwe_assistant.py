@@ -1193,6 +1193,11 @@ def main():
             mailbox = UtteranceMailbox()
             tts_queue = queue.Queue()
 
+            # Setting up a recognizer is not recognition: doing it here keeps
+            # its cost out of both windows opened below, the way the model load
+            # is kept out by pre-loading before the loop.
+            stt_engine.warmup()
+
             # Opens the main thread's window, which spans the whole item.
             prime_cpu_percent()
 
