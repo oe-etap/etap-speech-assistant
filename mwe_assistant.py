@@ -38,6 +38,7 @@ except (ImportError, OSError):
     sd = None
     _HAS_SD = False
 
+import aggregate_logs
 from audio_sources import (
     DEFAULT_CHUNK_MS, PACING_FAST, PACING_REALTIME,
     FileAudioSource, MicAudioSource,
@@ -293,6 +294,40 @@ def save_system_prompt(run_dir, label, text):
     """
     with open(os.path.join(run_dir, "system_prompt.txt"), "w", encoding="utf-8") as f:
         f.write(f"{label}\n\n{text}\n")
+
+
+def save_run_summary(run_dir, latency_csv):
+    """Aggregate the log this run just wrote, into the folder it wrote it to.
+
+    The CSV holds one row per stage per recording, which is the raw material and
+    not the result: what the run measured is a distribution, and a folder left
+    without its summary is one that every later reader has to remember to run
+    aggregate_logs.py over. So the run does it itself, over the log it wrote to
+    and nothing else - which is every row of that file, including any earlier
+    run's when --latency-csv points them all at one.
+
+    Nothing here is allowed to fail the run. The recordings have been processed
+    and their measurements are on disk by this point; an unwritable folder or a
+    log with nothing in it yet is worth a warning, not the loss of the run.
+    """
+    try:
+        report = aggregate_logs.summarize_run(run_dir, logs=latency_csv)
+    except Exception as e:
+        print(f"[WARN] Could not summarize the run log: {e}")
+        return None
+
+    if report is None:
+        print(f"[WARN] No aggregate summary written: '{latency_csv}' holds no readable rows.")
+        return None
+
+    # The same warnings the script prints, and for the same reason: they are
+    # what says whether the numbers just written can be read at face value.
+    for warning in report.warnings:
+        print(warning if warning.startswith(" ") else f"[WARN] {warning}")
+
+    for path in report.files.values():
+        print(f"Aggregate summary saved to: {path}")
+    return report
 
 
 def wav_duration_ms(wav_path):
@@ -860,6 +895,10 @@ def main():
 
     parser.add_argument("--out-dir", type=str, default="outputs", help="Where to save the audiofiles")
     parser.add_argument("--latency-csv", type=str, default=None, help="CSV file to append latency/resource logs")
+    parser.add_argument("--no-summary", dest="summary", action="store_false",
+                        help="Skip the aggregate report the run otherwise leaves in its own "
+                             "folder. The CSV is written either way, and aggregate_logs.py "
+                             "produces the same report from it afterwards.")
     parser.add_argument("--keep-normalized", action="store_true", help="Keep ffmpeg-normalized input WAVs")
     parser.add_argument("--input-mode", choices=["file", "mic"], default="file", help="Input mode: file or live mic")
     parser.add_argument("--audio-pacing", choices=[PACING_REALTIME, PACING_FAST], default=PACING_REALTIME,
@@ -1411,6 +1450,12 @@ def main():
     stop_gpu_monitor()
 
     print(f"\nDone. Latency/resource log appended to: {args.latency_csv}")
+
+    # Last, and outside the CSV's `with`: the log has to be closed and complete
+    # before anything reads it back.
+    if args.summary:
+        save_run_summary(run_dir, args.latency_csv)
+
     return 0
 
 

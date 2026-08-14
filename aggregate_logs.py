@@ -17,6 +17,10 @@ whether a change moved anything or the machine simply had a different morning.
 
 Writes a formatted table for reading, a TSV for pasting into a spreadsheet and,
 with --json-file, the whole thing including the per-item values for reanalysis.
+
+Importable as much as runnable: aggregate() does from code what the command
+line does, which is how mwe_assistant.py leaves a summary in the folder of
+every run it finishes.
 """
 
 import argparse
@@ -27,7 +31,7 @@ import json
 import os
 from pathlib import Path
 import sys
-from typing import Dict, List, Any, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Any, Optional, Sequence, Set, Tuple, Union
 
 import run_statistics as rstat
 
@@ -66,6 +70,18 @@ EXTRA_LABELS = {
 # interval for it needs 368 items before both of its ends exist, so at
 # the sizes these runs come in it is the largest observation wearing a label.
 DEFAULT_QUANTILES = (0.5, 0.9, 0.95)
+
+# Defaults shared by the command line and by whatever imports this module, so
+# that a summary written during a run and one written afterwards agree.
+DEFAULT_LOG_COUNT = 4
+DEFAULT_CONFIDENCE = 0.95
+DEFAULT_RESAMPLES = 5000
+
+# What the three outputs are called when the caller names a folder rather than
+# a file. A run folder carries them under these names.
+SUMMARY_FILENAME = "log_averages_summary.txt"
+TSV_FILENAME = "log_averages.tsv"
+JSON_FILENAME = "log_averages.json"
 
 
 @dataclass
@@ -910,6 +926,191 @@ def build_json(analysis: Analysis) -> Dict[str, Any]:
     return payload
 
 
+# ---------- Callable interface ----------
+PathLike = Union[str, os.PathLike]
+
+# How a selection of logs may be named: a directory to search, a single run
+# folder, one CSV, or the paths outright.
+LogSelection = Union[PathLike, Sequence[PathLike]]
+
+
+@dataclass
+class Report:
+    """A rendered analysis, and wherever it was written."""
+    analysis: Analysis
+    text: str
+    tsv: str
+    files: Dict[str, Path] = field(default_factory=dict)
+
+    @property
+    def warnings(self) -> List[str]:
+        return self.analysis.warnings
+
+    def as_json(self) -> Dict[str, Any]:
+        """The whole analysis, the per-recording values included."""
+        return build_json(self.analysis)
+
+
+def normalize_quantiles(values: Iterable[float]) -> List[float]:
+    """Percentages or fractions, in any order, to the fractions reported.
+
+    The median is always among them: the report quotes it as the figure to
+    read, and a caller asking only for the tail did not mean to remove it.
+    """
+    quantiles = [value / 100 if value > 1 else value for value in map(float, values)]
+    for quantile in quantiles:
+        if not 0 < quantile < 1:
+            raise ValueError(f"quantile out of range: {quantile}")
+    return sorted(set(quantiles) | {0.5})
+
+
+def check_options(log_count: int, confidence: float, warmup: int) -> None:
+    """Reject the arguments that describe no analysis, whatever asked for one."""
+    if log_count <= 0:
+        raise ValueError("log count must be a positive integer")
+    if not 0.5 < confidence < 1:
+        raise ValueError("confidence must sit between 0.5 and 1")
+    if warmup < 0:
+        raise ValueError("warmup cannot be negative")
+
+
+def resolve_logs(logs: LogSelection, log_count: int = DEFAULT_LOG_COUNT) -> List[Path]:
+    """The CSVs a selection names.
+
+    A directory is searched for its latest `log_count` logs; a run folder or a
+    single CSV names itself. A sequence is taken as given, since a caller that
+    assembled one has already chosen.
+    """
+    if isinstance(logs, (str, os.PathLike)):
+        return find_latest_csv_logs(Path(logs), log_count)
+    return [Path(path) for path in logs]
+
+
+def analyze_logs(logs: LogSelection, *, log_count: int = DEFAULT_LOG_COUNT, warmup: int = 0,
+                 confidence: float = DEFAULT_CONFIDENCE,
+                 quantiles: Iterable[float] = DEFAULT_QUANTILES,
+                 resamples: int = DEFAULT_RESAMPLES, seed: int = rstat.DEFAULT_SEED,
+                 compare: Optional[LogSelection] = None, compare_count: int = 1,
+                 primary: Optional[str] = None) -> Optional[Analysis]:
+    """Pool a selection of runs into one analysis, against a baseline if given.
+
+    Returns None where the selection holds nothing readable. That is a state to
+    handle rather than an error: a run that logged nothing has nothing to say
+    about itself. A baseline that cannot be read is the lesser problem, the
+    current runs still standing on their own, so it warns and reports them.
+
+    Raises ValueError on arguments that describe no analysis.
+    """
+    check_options(log_count, confidence, warmup)
+    quantiles = normalize_quantiles(quantiles)
+
+    csv_files = resolve_logs(logs, log_count)
+    if not csv_files:
+        return None
+
+    analysis = build_analysis(csv_files, log_count, warmup, confidence,
+                              quantiles, resamples, seed)
+    if not analysis or not compare:
+        return analysis
+
+    baseline_files = resolve_logs(compare, max(1, compare_count))
+    if not baseline_files:
+        print(f"Warning: no baseline logs found in '{compare}'; "
+              f"reporting the current runs alone.", file=sys.stderr)
+        return analysis
+
+    chosen = {path.resolve() for path in csv_files}
+    baseline_files = [path for path in baseline_files if path.resolve() not in chosen]
+    if not baseline_files:
+        print("Warning: the baseline selected the same logs as the analysis; "
+              "skipping the comparison.", file=sys.stderr)
+        return analysis
+
+    baseline = build_analysis(baseline_files, compare_count, warmup, confidence,
+                              quantiles, resamples, seed)
+    if not baseline:
+        return analysis
+
+    analysis.baseline = baseline
+    analysis.primary = primary
+    analysis.comparison, analysis.paired = compare_analyses(
+        analysis, baseline, confidence, primary)
+    if primary and primary not in analysis.comparison:
+        print(f"Warning: the primary stage '{primary}' is not one either run recorded; "
+              f"no stage was held out of the correction.", file=sys.stderr)
+        analysis.primary = None
+
+    return analysis
+
+
+def render_report(analysis: Analysis) -> Report:
+    """Everything the analysis renders to, written nowhere yet."""
+    return Report(analysis=analysis, text=format_report(analysis), tsv=format_tsv(analysis))
+
+
+def write_report(report: Report, output_file: Optional[PathLike] = None,
+                 tsv_file: Optional[PathLike] = None,
+                 json_file: Optional[PathLike] = None) -> Dict[str, Path]:
+    """Write whichever outputs were asked for; answer with the ones that landed.
+
+    A path that cannot be written is reported and skipped rather than raised:
+    the analysis behind it is the expensive part, and losing the other two
+    outputs, or a caller's run, over one unwritable directory helps nobody.
+    """
+    targets = [("text", output_file, report.text), ("tsv", tsv_file, report.tsv)]
+    if json_file:
+        targets.append(("json", json_file, json.dumps(report.as_json(), indent=2)))
+
+    for kind, target, content in targets:
+        if not target:
+            continue
+        path = Path(target)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        except OSError as e:
+            print(f"Error writing {kind} file '{path}': {e}", file=sys.stderr)
+            continue
+        report.files[kind] = path
+
+    return report.files
+
+
+def aggregate(logs: LogSelection, output_file: Optional[PathLike] = None,
+              tsv_file: Optional[PathLike] = None,
+              json_file: Optional[PathLike] = None, **options) -> Optional[Report]:
+    """Analyze a selection of runs and write the report where asked for.
+
+    The whole of what the command line does, in one call, so that a run can
+    summarize itself the moment it finishes rather than waiting for somebody to
+    remember the script. `options` are analyze_logs's, and None comes back for
+    the same reason it does there.
+    """
+    analysis = analyze_logs(logs, **options)
+    if analysis is None:
+        return None
+
+    report = render_report(analysis)
+    write_report(report, output_file, tsv_file, json_file)
+    return report
+
+
+def summarize_run(run_dir: PathLike, logs: Optional[LogSelection] = None,
+                  **options) -> Optional[Report]:
+    """Summarize one run into its own folder, under the standard three names.
+
+    `logs` defaults to the folder itself, which is where a run leaves its CSV;
+    it is worth passing when the log was directed elsewhere.
+    """
+    run_dir = Path(run_dir)
+    options.setdefault("log_count", 1)
+    return aggregate(run_dir if logs is None else logs,
+                     output_file=run_dir / SUMMARY_FILENAME,
+                     tsv_file=run_dir / TSV_FILENAME,
+                     json_file=run_dir / JSON_FILENAME,
+                     **options)
+
+
 # ---------- Entry point ----------
 def parse_quantiles(text: str) -> List[float]:
     values = []
@@ -917,12 +1118,11 @@ def parse_quantiles(text: str) -> List[float]:
         part = part.strip()
         if not part:
             continue
-        number_part = float(part)
-        values.append(number_part / 100 if number_part > 1 else number_part)
-    for value in values:
-        if not 0 < value < 1:
-            raise argparse.ArgumentTypeError(f"quantile out of range: {value}")
-    return sorted(set(values) | {0.5})
+        values.append(float(part))
+    try:
+        return normalize_quantiles(values)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e))
 
 
 def main():
@@ -930,16 +1130,17 @@ def main():
         description=__doc__,
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    parser.add_argument("-c", "--log-count", type=int, default=4,
-                        help="Number of latest CSV run log files to analyze (default: 4).")
+    parser.add_argument("-c", "--log-count", type=int, default=DEFAULT_LOG_COUNT,
+                        help=f"Number of latest CSV run log files to analyze "
+                             f"(default: {DEFAULT_LOG_COUNT}).")
     parser.add_argument("-d", "--outputs-dir", type=str, default="outputs",
                         help="Directory holding the run folders, a single run folder, or one\n"
                              "CSV file (default: 'outputs').")
     parser.add_argument("-o", "--output-file", type=str,
-                        default=os.path.join("outputs", "log_averages_summary.txt"),
+                        default=os.path.join("outputs", SUMMARY_FILENAME),
                         help="Where to write the formatted report.")
     parser.add_argument("-t", "--tsv-file", type=str,
-                        default=os.path.join("outputs", "log_averages.tsv"),
+                        default=os.path.join("outputs", TSV_FILENAME),
                         help="Where to write the stage summary as TSV.")
     parser.add_argument("-j", "--json-file", type=str, default=None,
                         help="Also write the full analysis, per-recording values included,\n"
@@ -958,28 +1159,26 @@ def main():
                         help="Drop the first N recordings of every run. The first pays for\n"
                              "loading whatever the run loads lazily; 1 is usually right when\n"
                              "the question is steady-state latency (default: 0).")
-    parser.add_argument("--confidence", type=float, default=0.95,
-                        help="Confidence level for every interval, and 1 minus the level at\n"
-                             "which the Holm correction holds the family (default: 0.95).")
+    parser.add_argument("--confidence", type=float, default=DEFAULT_CONFIDENCE,
+                        help=f"Confidence level for every interval, and 1 minus the level at\n"
+                             f"which the Holm correction holds the family "
+                             f"(default: {DEFAULT_CONFIDENCE}).")
     default_percentiles = ",".join(str(int(q * 100)) for q in DEFAULT_QUANTILES)
     parser.add_argument("--percentiles", type=str, default=default_percentiles,
                         help=f"Which percentiles to report (default: '{default_percentiles}').\n"
                              f"99 needs 368 recordings before an interval for it exists.")
-    parser.add_argument("--bootstrap", type=int, default=5000,
-                        help="Resamples behind the mean's interval; 0 turns it off (default: 5000).")
+    parser.add_argument("--bootstrap", type=int, default=DEFAULT_RESAMPLES,
+                        help=f"Resamples behind the mean's interval; 0 turns it off "
+                             f"(default: {DEFAULT_RESAMPLES}).")
     parser.add_argument("--seed", type=int, default=rstat.DEFAULT_SEED,
                         help="Seed for the bootstrap, so the report is reproducible.")
 
     args = parser.parse_args()
 
-    if args.log_count <= 0:
-        print("Error: --log-count must be a positive integer.", file=sys.stderr)
-        sys.exit(1)
-    if not 0.5 < args.confidence < 1:
-        print("Error: --confidence must sit between 0.5 and 1.", file=sys.stderr)
-        sys.exit(1)
-    if args.warmup < 0:
-        print("Error: --warmup cannot be negative.", file=sys.stderr)
+    try:
+        check_options(args.log_count, args.confidence, args.warmup)
+    except ValueError as e:
+        print(f"Error: {e}.", file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -989,77 +1188,34 @@ def main():
         sys.exit(1)
 
     outputs_dir = Path(args.outputs_dir)
-    csv_files = find_latest_csv_logs(outputs_dir, args.log_count)
+    csv_files = resolve_logs(outputs_dir, args.log_count)
     if not csv_files:
         print(f"No log files found in '{outputs_dir}'. Exiting.", file=sys.stderr)
         sys.exit(1)
 
     print(f"Analyzing the last {len(csv_files)} CSV log file(s) from '{outputs_dir}'...")
 
-    analysis = build_analysis(csv_files, args.log_count, args.warmup, args.confidence,
-                              quantiles, args.bootstrap, args.seed)
+    analysis = analyze_logs(csv_files, log_count=args.log_count, warmup=args.warmup,
+                            confidence=args.confidence, quantiles=quantiles,
+                            resamples=args.bootstrap, seed=args.seed,
+                            compare=args.compare, compare_count=args.compare_count,
+                            primary=args.primary)
     if not analysis:
         print("Every selected log was empty or unreadable. Exiting.", file=sys.stderr)
         sys.exit(1)
 
-    if args.compare:
-        baseline_files = find_latest_csv_logs(Path(args.compare), max(1, args.compare_count))
-        if not baseline_files:
-            print(f"Warning: no baseline logs found in '{args.compare}'; "
-                  f"reporting the current runs alone.", file=sys.stderr)
-        else:
-            chosen = {p.resolve() for p in csv_files}
-            baseline_files = [p for p in baseline_files if p.resolve() not in chosen]
-            if not baseline_files:
-                print("Warning: --compare selected the same logs as the analysis; "
-                      "skipping the comparison.", file=sys.stderr)
-            else:
-                baseline = build_analysis(baseline_files, args.compare_count, args.warmup,
-                                          args.confidence, quantiles, args.bootstrap, args.seed)
-                if baseline:
-                    analysis.baseline = baseline
-                    analysis.primary = args.primary
-                    analysis.comparison, analysis.paired = compare_analyses(
-                        analysis, baseline, args.confidence, args.primary)
-                    if args.primary and args.primary not in analysis.comparison:
-                        print(f"Warning: --primary '{args.primary}' is not a stage either run "
-                              f"recorded; no stage was held out of the correction.",
-                              file=sys.stderr)
-                        analysis.primary = None
-
     for warning in analysis.warnings:
         print(warning if warning.startswith(" ") else f"WARNING: {warning}", file=sys.stderr)
 
-    report = format_report(analysis)
-    print("\n" + report + "\n")
+    report = render_report(analysis)
+    print("\n" + report.text + "\n")
 
-    output_path = Path(args.output_file)
-    try:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(report)
-        print(f"Summary text table saved to : {output_path.resolve()}")
-    except Exception as e:
-        print(f"Error writing output file '{output_path}': {e}", file=sys.stderr)
-
-    tsv_path = Path(args.tsv_file)
-    try:
-        tsv_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(tsv_path, "w", encoding="utf-8") as f:
-            f.write(format_tsv(analysis))
-        print(f"Tab-separated TSV table saved to : {tsv_path.resolve()}")
-    except Exception as e:
-        print(f"Error writing TSV file '{tsv_path}': {e}", file=sys.stderr)
-
-    if args.json_file:
-        json_path = Path(args.json_file)
-        try:
-            json_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(build_json(analysis), f, indent=2)
-            print(f"JSON analysis saved to : {json_path.resolve()}")
-        except Exception as e:
-            print(f"Error writing JSON file '{json_path}': {e}", file=sys.stderr)
+    written = write_report(report, args.output_file, args.tsv_file, args.json_file)
+    labels = {"text": "Summary text table saved to",
+              "tsv": "Tab-separated TSV table saved to",
+              "json": "JSON analysis saved to"}
+    for kind, path in written.items():
+        print(f"{labels[kind]} : {path.resolve()}")
 
 
 if __name__ == "__main__":

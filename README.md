@@ -9,6 +9,7 @@ Input comes either from pre-recorded English audio files or from a live micropho
 - Configuration via YAML files (`--config`) or CLI arguments
 - Logs conversation transcripts to `transcripts.jsonl` and `transcripts.yaml`, carrying what the recording was supposed to say next to what the STT heard
 - Saves the exact runtime configuration to `config_used.yaml`
+- Aggregates its own latency log when the run finishes, so every run folder carries the distribution it measured and not just the raw rows (`--no-summary` opts out)
 - File input via `--audio file1.wav file2.mp3 ...`, or live capture via `--input-mode mic`
 - File input can be paced at 1x speed (`--audio-pacing realtime`) so that STT overlaps with the speech exactly as it would on a microphone — this is what makes file-based latency numbers carry over to a live deployment
 - Concurrent STT / LLM / TTS workers; a new utterance can interrupt an answer still being generated
@@ -117,6 +118,7 @@ python mwe_assistant.py --audio .\a.wav .\b.mp3 .\c.flac --stt-engine whisper --
 - `--tts-engine {piper,coqui}`: text-to-speech engine
 - `--out-dir DIR`: base output directory, default `outputs`
 - `--latency-csv PATH`: custom CSV path
+- `--no-summary`: skip the aggregate report the run otherwise leaves in its own folder. The CSV is written either way, and `aggregate_logs.py` produces the same report from it afterwards
 - `--keep-normalized`: keep the intermediate mono 16 kHz WAV files
 
 Input and pacing:
@@ -173,6 +175,7 @@ Each run creates `outputs/<YYYYMMDD_HHMMSS>/` containing:
   under `audios/` ships in. Recordings with no such file, no matching row, or a
   live microphone get `null` instead; nothing else changes.
 - `latency_log_<timestamp>.csv`
+- `log_averages_summary.txt`, `log_averages.tsv` and `log_averages.json`: the aggregate of that CSV, written when the run finishes. They are exactly what `aggregate_logs.py` produces over the same log — see [Aggregating a run](#aggregating-a-run) for how to read them, and `--no-summary` to skip them
 
 The CSV contains:
 
@@ -426,6 +429,32 @@ It writes a formatted table, a TSV for spreadsheets, and with `-j` a JSON
 carrying the per-recording values for reanalysis elsewhere. The report covers
 the distribution of each stage, the precision of each estimate, the tail
 quantiles, a per-run breakdown, and the resource levels.
+
+**A finished run has already done this to its own log**, leaving all three files
+in its folder under the names above, so the command line is for reanalysis —
+dropping the first recording, changing the quantiles, pooling several runs, or
+comparing two of them — rather than for seeing the run at all. `--no-summary`
+turns that off.
+
+The same aggregation is available from code, which is how the run performs it:
+
+```python
+import aggregate_logs
+
+# One run, into its own folder, under the three standard names.
+report = aggregate_logs.summarize_run("outputs/20260814_101500")
+
+# Or the full CLI in one call, over whatever selection of logs.
+report = aggregate_logs.aggregate("outputs", output_file="summary.txt",
+                                  log_count=4, warmup=1)
+
+print(report.analysis.summaries["ttfa"].median, report.warnings)
+```
+
+`aggregate()` returns `None` where the selection holds no readable log — a run
+that measured nothing has nothing to report — and takes everything the flags
+below take. `analyze_logs()` stops before the rendering if only the numbers are
+wanted, and `report.as_json()` is the `-j` payload without a file.
 
 Useful flags:
 
