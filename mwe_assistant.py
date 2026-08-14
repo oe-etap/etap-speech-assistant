@@ -948,6 +948,11 @@ def main():
     parser.add_argument("--coqui-voice", default="xtts_v2", help="Coqui voice model key")
     parser.add_argument("--coqui-language", default="en", help="Language code for Coqui")
     parser.add_argument("--coqui-speaker", default="Daisy Studious", help="Speaker id for Coqui")
+    parser.add_argument("--coqui-device", choices=["cpu", "cuda"], default=None,
+                        help="Device for Coqui XTTS-v2, following the --mode preset when "
+                             "unset. Unlike Piper this is not a tuning knob: XTTS-v2 is "
+                             "autoregressive and runs slower than real time on a CPU. "
+                             "Refused rather than silently served from the CPU.")
 
     # Shared LLM
     parser.add_argument("--ollama-model", default="phi3:mini", help="Ollama model (e.g. phi3:mini)")
@@ -1031,6 +1036,8 @@ def main():
         args.whisper_compute_type = "float16" if args.whisper_device == "cuda" else "int8"
     if args.piper_device is None:
         args.piper_device = "cuda" if args.mode == "gpu" else "cpu"
+    if args.coqui_device is None:
+        args.coqui_device = "cuda" if args.mode == "gpu" else "cpu"
 
     # Any one-off setup cost happens here, before a stage is ever timed.
     start_gpu_monitor()
@@ -1075,6 +1082,7 @@ def main():
             model_name=args.coqui_voice,
             language=args.coqui_language,
             speaker=args.coqui_speaker,
+            device=args.coqui_device,
         )
     tts_engine.warmup()
 
@@ -1100,6 +1108,7 @@ def main():
         config_to_save.pop("coqui_voice", None)
         config_to_save.pop("coqui_language", None)
         config_to_save.pop("coqui_speaker", None)
+        config_to_save.pop("coqui_device", None)
     elif args.tts_engine == "coqui":
         config_to_save.pop("piper_exe", None)
         config_to_save.pop("piper_voice", None)

@@ -20,6 +20,7 @@ Input comes either from pre-recorded English audio files or from a live micropho
 - CPU/GPU preset via `--mode cpu|gpu`
 - Whisper can run on CPU or CUDA via `--whisper-device cpu|cuda`
 - Piper can run on CPU or CUDA via `--piper-device cpu|cuda`, which trades a per-call cost against a per-second-of-speech one and so helps long chunks and hurts short ones — see [Piper on the GPU](#piper-on-the-gpu)
+- Coqui XTTS-v2 can run on CPU or CUDA via `--coqui-device cpu|cuda`, where the GPU is worth 4-5x and is effectively required — see [Coqui XTTS-v2](#coqui-xtts-v2)
 - Input audio is normalized to mono 16 kHz WAV using `ffmpeg`
 - Per-stage timing: `stt`, `stt_endpoint_delay`, `llm_ttft`, `llm_first_chunk_fill`, `llm_ttfc`, `tts_first_chunk`, `llm_eval`, `tts_total`
 - `ttfa`: time from the speaker stopping to the first audio out — the figure a user actually perceives
@@ -59,7 +60,12 @@ Additional assets:
   capability. `requirements_gpu.txt` carries the commands and
   [Piper on the GPU](#piper-on-the-gpu) explains which versions a pre-Ampere
   card is limited to
-- For Coqui XTTS-v2: the model is loaded through the `TTS` package
+- For Coqui XTTS-v2: the `coqui-tts` package, **not** the original `TTS`
+  distribution, which caps at Python 3.11 and cannot be installed here. It needs
+  a GPU to be usable and a PyTorch built for that GPU's compute capability;
+  `requirements_gpu.txt` carries the commands and
+  [Coqui XTTS-v2](#coqui-xtts-v2) the reasoning. The model is a 1.87 GB download
+  under a non-commercial licence
 - For GPU stats: an NVIDIA driver, read through `nvidia-ml-py` (in both requirements files) or, failing that, an `nvidia-smi` on PATH
 - System prompts: `prompts/*.txt`, referenced by `system-prompt-file`. These are
   local and not version controlled, so prompt wording can be iterated on freely.
@@ -158,6 +164,7 @@ Engines:
 - `--coqui-voice NAME`: default `xtts_v2`
 - `--coqui-language CODE`: default `en`
 - `--coqui-speaker NAME`: default `Daisy Studious`
+- `--coqui-device {cpu,cuda}`: device for XTTS-v2, following `--mode` when unset. Not a tuning knob like `--piper-device`: on a CPU the engine synthesizes slower than it speaks and `ttfa` runs to about 21 s. See [Coqui XTTS-v2](#coqui-xtts-v2)
 - `--ollama-model NAME`: default `phi3:mini`
 - `--ollama-url URL`: default `http://localhost:11434/api/generate`
 
@@ -569,6 +576,106 @@ critical path, a predictable 260 ms may be worth more than something averaging
 The setting that would actually move `ttfa` is not the device. It is the length
 of the first chunk, which `short-opener.txt` and `--tts-chunk-max-chars` already
 control, and which the CPU is better at.
+
+### Coqui XTTS-v2
+
+The other TTS engine works, and the answer to the GPU question is the opposite
+of Piper's: **the GPU is worth 4 to 5 times here, and without it the engine is
+not usable at all.** What it is not is competitive with Piper on either device.
+
+Nothing in `tts_engines.py` had to change to get it running — `CoquiEngine`
+loaded and synthesized correctly on the first try once the environment was
+right. What was wrong was `requirements_gpu.txt`, which could not produce a
+working environment on this Python at all. That is written up under
+[Getting Coqui to install](#getting-coqui-to-install) below.
+
+#### What it costs
+
+Isolated, one sentence per call, three calls each:
+
+| sentence length | CPU | CUDA | speedup |
+|---|---|---|---|
+| 18 chars | 2155 ms | **768 ms** | 2.8x |
+| 42 chars | 5982 ms | **1822 ms** | 3.3x |
+| 105 chars | 9637 ms | **2635 ms** | 3.7x |
+| 137 chars | 11395 ms | **3612 ms** | 3.2x |
+
+There is no crossover and no per-call floor to argue about, which is what makes
+this a different decision from Piper's. XTTS-v2 is autoregressive: it generates
+audio tokens one at a time, so the work scales with the audio produced on both
+devices and the GPU is simply faster at all of it.
+
+The real-time factor is the number to read. On the CPU it is **1.06 to 1.52** —
+the engine produces speech more slowly than the speech is spoken, so it can
+never catch up with a conversation. On the GPU it is 0.31 to 0.46.
+
+#### What it comes to in the pipeline
+
+The four recordings, once on each device. Both runs happened to synthesize
+almost exactly the same amount of audio — 75.7 s against 75.2 s — so unlike the
+Piper pair this one is close to properly paired:
+
+| stage | `--coqui-device cpu` | `--coqui-device cuda` |
+|---|---|---|
+| `tts_first_chunk` (mean) | 11221 ms | **2385 ms** |
+| **`ttfa`** (mean) | **20953 ms** | **4639 ms** |
+| `tts_total` (sum) | 148.9 s | **28.3 s** |
+| synthesis RTF over the run | **1.97** | **0.38** |
+
+Twenty-one seconds to first audio is not a slow setting, it is a broken one. The
+CPU figure is worse than the isolated 1.06–1.52 because in the pipeline the
+engine competes with Vosk and the LLM handoff for the same cores; the GPU figure
+matches its isolated one almost exactly, having no such competition.
+
+#### Against Piper
+
+Same four recordings, same everything else:
+
+| | `tts_first_chunk` | `ttfa` |
+|---|---|---|
+| Piper, CPU | **342 ms** | **1716 ms** |
+| Piper, CUDA | **260 ms** | **1637 ms** |
+| Coqui, CUDA | 2385 ms | 4639 ms |
+| Coqui, CPU | 11221 ms | 20953 ms |
+
+Coqui on a GPU is roughly **seven times** the first-chunk cost of Piper on a
+CPU, and lands `ttfa` about 2.9 s worse. The engine is chosen for voice quality
+and multilingual cloning, neither of which this measurement says anything about;
+it is not a latency option. If Coqui is wanted, the GPU is not optional.
+
+#### Getting Coqui to install
+
+`requirements_gpu.txt` named `TTS==0.22.0`, and no version of that distribution
+can be installed here: every release from 0.15 onward caps at
+`Requires-Python <3.12`, against this project's 3.12.3. The maintained fork
+`coqui-tts` supports 3.10–3.14 and keeps the same `TTS` import name, so the
+engine code carries over unchanged.
+
+Three further pins in that file were wrong in ways that each stop the install or
+the run outright, and two more traps lie outside it:
+
+- `numpy==1.22.0` has no cp312 wheel and its source build fails. It also
+  contradicted `requirements_cpu.txt`'s `numpy==2.2.6`.
+- `vosk` was absent, though it is the default STT engine.
+- `torch==2.13.0` resolves from PyPI to a `+cu130` build whose arch list starts
+  at `sm_75`. On a compute capability 7.0 card `torch.cuda.is_available()`
+  returns **True** and then every kernel fails with
+  `cudaErrorNoKernelImageForDevice`. The `+cu126` build carries `sm_70`.
+- `coqui-tts` asks for `transformers>=4.57` with no upper bound, but
+  transformers 5.x removed `isin_mps_friendly`, which its Tortoise layer
+  imports. A plain install therefore fails at `from TTS.api import TTS`.
+- Asking for `torch==2.13.0` from the cu126 index does **not** fix the third
+  point: pip treats the installed `+cu130` as already satisfying it and does
+  nothing. The local version has to be named — `torch==2.13.0+cu126`.
+
+`requirements_gpu.txt` now carries the verified commands. `CoquiEngine` launches
+a real CUDA kernel at startup rather than trusting `is_available()`, so a wheel
+without kernels for the GPU fails immediately and by name instead of part-way
+through the first synthesis.
+
+XTTS-v2 is published under the Coqui Public Model License, which is
+non-commercial; the first load prompts for agreement and `COQUI_TOS_AGREED=1`
+accepts it non-interactively. The model download is 1.87 GB.
 
 ## Aggregating a run
 

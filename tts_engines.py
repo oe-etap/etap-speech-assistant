@@ -191,18 +191,69 @@ class CoquiEngine(BaseTTSEngine):
     """Coqui TTS engine."""
 
     def __init__(self, model_name: str = "xtts_v2", language: str = "en",
-                 speaker: str = "Daisy Studious"):
+                 speaker: str = "Daisy Studious", device: str = "cpu"):
+        """Initialize the Coqui engine.
+
+        Args:
+            model_name: Model key under tts_models/multilingual/multi-dataset/.
+            language: Language code passed to the model.
+            speaker: Built-in speaker id.
+            device: "cpu" or "cuda". XTTS-v2 is autoregressive and does not run
+                anywhere near real time on a CPU, so this is not the optional
+                setting it is for Piper.
+
+        Raises:
+            RuntimeError: If Coqui is missing, or "cuda" could not be honoured.
+        """
         if not _HAS_TTS:
             raise RuntimeError(
-                "Coqui TTS is not installed. Please install it (usually with GPU requirements) "
-                "to use the CoquiEngine."
+                "Coqui TTS is not installed. Install the coqui-tts package "
+                "(see requirements_gpu.txt); the original `TTS` distribution "
+                "caps at Python 3.11 and cannot be used here."
             )
-        
+
+        if device == "cuda":
+            self._require_working_cuda()
+
         self._tts = TTS(
             model_name=f"tts_models/multilingual/multi-dataset/{model_name}"
         )
+        self._tts.to(device)
+        self._device = device
         self._language = language
         self._speaker = speaker
+        print(f"[INFO] Coqui loaded (model: {model_name}, device: {device})")
+
+    @staticmethod
+    def _require_working_cuda() -> None:
+        """Fail now if CUDA cannot actually run a kernel on this GPU.
+
+        torch.cuda.is_available() only reports that a driver and a device are
+        present. A wheel built without kernels for the device's compute
+        capability passes that check and then fails on the first real op, so
+        this launches one rather than trusting the flag.
+        """
+        try:
+            import torch
+        except ImportError:
+            raise RuntimeError(
+                "Coqui was asked for CUDA but PyTorch is not installed."
+            )
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "Coqui was asked for CUDA but torch.cuda.is_available() is False."
+            )
+        try:
+            torch.zeros(8, device="cuda").add_(1).cpu()
+        except Exception as e:
+            cap = torch.cuda.get_device_capability(0)
+            raise RuntimeError(
+                f"Coqui was asked for CUDA but this PyTorch cannot run on the GPU. "
+                f"Device is compute capability {cap[0]}.{cap[1]}; "
+                f"torch {torch.__version__} was built for {torch.cuda.get_arch_list()}. "
+                f"Install a build that covers it (see requirements_gpu.txt), "
+                f"or run with --coqui-device cpu. Original error: {e}"
+            )
 
     @property
     def sample_rate(self) -> int:

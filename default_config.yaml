@@ -101,6 +101,16 @@ coqui-voice: "xtts_v2"
 coqui-language: "en"
 coqui-speaker: "Daisy Studious"
 
+# Device for Coqui XTTS-v2. Unset follows the `mode` preset above.
+#
+# Not the same kind of choice as piper-device. XTTS-v2 is autoregressive and
+# generates slower than it speaks on this CPU, so `cpu` is not a slower setting
+# but an unusable one -- a single opening sentence takes longer than the entire
+# response budget. On the GPU it is usable and still costs several times what
+# Piper does. Needs a PyTorch built for the GPU's compute capability; see
+# requirements_gpu.txt.
+coqui-device: cuda
+
 # Shared LLM Options
 ollama-model: "phi3:mini"
 ollama-url: "http://localhost:11434/api/generate"

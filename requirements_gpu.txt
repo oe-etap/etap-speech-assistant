@@ -1,37 +1,84 @@
-# Python packages for GPU mode (UNTESTED)
+# Python packages for GPU mode
 # External runtime dependency (install separately): ffmpeg (CLI must be on PATH)
-# Also ensure a CUDA-capable GPU and a matching PyTorch CUDA build.
+#
+# Verified 2026-08-14 on Python 3.12.3 with a GRID V100DX-32C (compute
+# capability 7.0, driver 580.65). The version choices below are mostly
+# consequences of that 7.0, and are marked where they are.
+#
+# This file previously pinned TTS==0.22.0, torch==2.13.0, numpy==1.22.0 and
+# scipy==1.11.4, and omitted vosk. None of the first three could be installed
+# at all on this Python, and vosk is the default STT engine, so the file could
+# not produce a working environment. What follows was installed and run.
+
+vosk==0.3.44
 faster-whisper==1.2.1
-TTS==0.22.0
-torch==2.13.0
 soundfile==0.14.0
-numpy==1.22.0
+numpy==2.2.6
 requests==2.34.2
-scipy==1.11.4
+scipy==1.15.3
 psutil==7.2.2
 piper-tts==1.4.2
 PyYAML==6.0.3
 sounddevice==0.5.1
 nvidia-ml-py==13.610.43
 
-# Piper on --piper-device cuda. piper-tts pulls in the CPU-only `onnxruntime`,
-# which provides the same import name, so the two cannot be installed together:
+# ---------------------------------------------------------------------------
+# Piper on --piper-device cuda
+# ---------------------------------------------------------------------------
+# piper-tts pulls in the CPU-only `onnxruntime`, which provides the same import
+# name, so the two cannot be installed together:
 #
 #   pip uninstall -y onnxruntime
 #   pip install "onnxruntime-gpu[cuda,cudnn]==1.26.0"
-#
-# The pin is a compute capability decision, not a preference for an older
-# release. onnxruntime-gpu 1.27 and up are built against CUDA 13, which dropped
-# Volta (7.0) and everything below it; on such a GPU they load and then fail in
-# cuBLAS. 1.26.0 is the last CUDA 12 build. On Ampere or newer, the current
-# release is fine and the pin can go.
-#
-# cuDNN carries the same constraint one version deeper: 9.11 dropped Volta, and
-# on a 7.0 GPU the extras above resolve to a cuDNN that has no kernels for it,
-# which surfaces as CUDNN_STATUS_EXECUTION_FAILED_CUDART on the first Conv.
-# 9.10.2.21 is the last one that runs there:
-#
 #   pip install "nvidia-cudnn-cu12==9.10.2.21"
 #
-# Whether any of this is worth installing is a separate question, and the
-# answer is not a plain yes. See the README.
+# Both pins are compute capability decisions, not preferences for older
+# releases. CUDA 13 dropped Volta (7.0) and everything below it:
+#   - onnxruntime-gpu 1.27+ are CUDA 13 builds. They load, then fail in
+#     cublasCreate with CUBLAS_STATUS_ARCH_MISMATCH. 1.26.0 is the last CUDA 12
+#     build.
+#   - cuDNN 9.11+ dropped Volta too, and the [cudnn] extra resolves to a current
+#     one. Different symptom: the session builds and the first Conv fails with
+#     CUDNN_STATUS_EXECUTION_FAILED_CUDART. 9.10.2.21 is the last that works.
+# On Ampere or newer both pins can go.
+#
+# Worth knowing before installing any of it: on the four sample recordings the
+# GPU did not move ttfa outside the noise. See "Piper on the GPU" in the README.
+
+# ---------------------------------------------------------------------------
+# Coqui XTTS-v2 on --tts-engine coqui
+# ---------------------------------------------------------------------------
+#   pip install "coqui-tts==0.27.5" "transformers>=4.57,<5" "torchcodec>=0.8.0"
+#   pip install torch==2.13.0+cu126 torchaudio==2.11.0+cu126 \
+#       --index-url https://download.pytorch.org/whl/cu126
+#
+# Not the `TTS` distribution this file used to name. Every release of `TTS`
+# caps at Requires-Python <3.12, so on Python 3.12 it cannot be installed at
+# any version. `coqui-tts` is the maintained fork, supports 3.10-3.14, and
+# keeps the same `TTS` import name, so tts_engines.py needs no change for it.
+#
+# The two extra pins are both cases of a package's own metadata being too loose:
+#   - coqui-tts asks for transformers>=4.57 with no upper bound, but
+#     transformers 5.x removed transformers.pytorch_utils.isin_mps_friendly,
+#     which TTS.tts.layers.tortoise.autoregressive imports. A plain install
+#     therefore yields an ImportError on `from TTS.api import TTS`.
+#   - torch 2.9+ needs torchcodec for audio IO, which coqui-tts declares only
+#     under its [codec] extra. Without it the same import fails, though with a
+#     message that names the fix.
+#
+# The +cu126 suffix and the index-url are load-bearing, and both parts matter:
+# the default PyPI torch 2.13.0 is a +cu130 build whose arch list starts at
+# sm_75, so on a 7.0 GPU torch.cuda.is_available() returns True and every
+# kernel then fails with cudaErrorNoKernelImageForDevice. Asking for plain
+# `torch==2.13.0` from the cu126 index is not enough either -- pip treats the
+# already-installed +cu130 as satisfying it and does nothing. Name the local
+# version explicitly, as above. CoquiEngine launches a real kernel at startup
+# rather than trusting is_available(), so a wrong build fails loudly.
+#
+# XTTS-v2 is published under the Coqui Public Model License (non-commercial).
+# The first load prompts for agreement; COQUI_TOS_AGREED=1 accepts it
+# non-interactively. Model download is 1.87 GB.
+#
+# Worth knowing before installing any of it: XTTS-v2 needs the GPU to be usable
+# at all, and even there it is several times slower than Piper is on a CPU. See
+# "Coqui XTTS-v2" in the README.
