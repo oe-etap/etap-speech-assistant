@@ -172,15 +172,19 @@ TRIGGER_END_OF_FILE = "end-of-file"  # the input running out
 
 
 # ---------- Helpers ----------
-# What a recording was supposed to say, for the transcript log to sit next to
-# what the STT heard. It comes from a metadata.csv beside the audio, joined on
-# the filename -- the layout the corpus ships in. One CSV serves every recording
-# in its directory, so it is read once per directory rather than once per file.
-_ground_truth_by_dir = {}
+# What is already known about a recording, from a metadata.csv beside the audio
+# joined on the filename -- the layout the corpus ships in. Two things are taken
+# from it: `question`, so the transcript log carries what the recording was
+# supposed to say, and `speech_end_ms`, a VAD's reading of where the speech
+# stops, which anchors the latency metrics. One CSV serves every recording in
+# its directory, so it is read once per directory rather than once per file.
+_metadata_by_dir = {}
+
+USABLE_COLUMNS = ("question", "speech_end_ms")
 
 
-def read_ground_truth(directory):
-    """`filename` -> `question` from `<directory>/metadata.csv`, or empty."""
+def read_metadata(directory):
+    """`filename` -> row, from `<directory>/metadata.csv`, or empty."""
     path = os.path.join(directory, "metadata.csv")
     try:
         with open(path, newline="", encoding="utf-8") as fh:
@@ -191,21 +195,43 @@ def read_ground_truth(directory):
         print(f"[WARN] {path} could not be read: {e}")
         return {}
 
-    if not rows or not {"filename", "question"} <= rows[0].keys():
+    if not rows or "filename" not in rows[0]:
         if rows:
-            print(f"[WARN] {path} has no 'filename' and 'question' columns; "
-                  f"transcripts will carry no original text")
+            print(f"[WARN] {path} has no 'filename' column, so none of it can be "
+                  f"matched to an input file")
         return {}
-    print(f"[INFO] Original text for {len(rows)} recordings from {path}")
-    return {r["filename"]: r["question"] for r in rows if r.get("filename")}
+    usable = [c for c in USABLE_COLUMNS if c in rows[0]]
+    print(f"[INFO] Metadata for {len(rows)} recordings from {path}"
+          f" ({', '.join(usable) if usable else 'nothing this run can use'})")
+    return {r["filename"]: r for r in rows if r.get("filename")}
 
 
-def ground_truth_text(audio_path):
-    """What this recording was supposed to say, or None if nothing says so."""
+def metadata_for(audio_path):
+    """The metadata row describing this recording, or an empty one."""
     directory = os.path.dirname(os.path.abspath(audio_path))
-    if directory not in _ground_truth_by_dir:
-        _ground_truth_by_dir[directory] = read_ground_truth(directory)
-    return _ground_truth_by_dir[directory].get(os.path.basename(audio_path))
+    if directory not in _metadata_by_dir:
+        _metadata_by_dir[directory] = read_metadata(directory)
+    return _metadata_by_dir[directory].get(os.path.basename(audio_path)) or {}
+
+
+def ground_truth_text(row):
+    """What this recording was supposed to say, or None if nothing says so."""
+    return row.get("question") or None
+
+
+def reference_speech_end_s(row):
+    """Where a VAD put the end of the speech, in seconds into the recording.
+
+    A better anchor for the latency metrics than the recognizer's own word
+    timings, which are a by-product of decoding rather than a measurement of the
+    audio, and which are missing entirely when the recognizer fails on a
+    recording. Measured on the normalized mono 16 kHz audio, which is what the
+    pipeline feeds the STT, so the offset lines up with the stream.
+    """
+    try:
+        return float(row["speech_end_ms"]) / 1000.0
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def is_mono_16k_pcm(path):
@@ -516,7 +542,7 @@ def write_timing(writer, args, item, stage, duration_ms, stats=None, extra=None)
 
 # ---------- Pipeline Workers ----------
 def stt_worker(stt_engine, audio_source, mailbox, stt_metrics,
-               trigger_on_endpoint=False):
+               trigger_on_endpoint=False, reference_speech_end_s=None):
     """Feed audio to the STT engine and hand finalized utterances to the LLM.
 
     trigger_on_endpoint decides what releases an utterance:
@@ -535,6 +561,13 @@ def stt_worker(stt_engine, audio_source, mailbox, stt_metrics,
     Records two instants per finalized result: when the speaker stopped, which
     is the anchor for the TTFA a user perceives, and when the transcript existed.
     The gap between them is the engine's endpointing delay.
+
+    reference_speech_end_s, when a metadata.csv supplies one, replaces the
+    engine's own word timing as that anchor. It is the better of the two: a
+    measurement of the audio rather than a by-product of decoding it, the same
+    for every finalized result rather than moving with each, and present even
+    where the recognizer heard nothing. Which one was used is reported on the
+    `stt` row, since runs anchored differently are not comparable.
     """
     try:
         # Opens this thread's CPU window for the span reported as stt_ms.
@@ -554,7 +587,12 @@ def stt_worker(stt_engine, audio_source, mailbox, stt_metrics,
                 accumulated_final + " " + result["text"]
             ).strip()
 
-            speech_end_s = result.get("speech_end_s")
+            if reference_speech_end_s is not None:
+                speech_end_s = reference_speech_end_s
+                stt_metrics["speech_end_source"] = "metadata"
+            else:
+                speech_end_s = result.get("speech_end_s")
+                stt_metrics["speech_end_source"] = "stt_word_timings"
             stt_metrics["final_t"] = time.perf_counter()
             stt_metrics["speech_end_t"] = audio_source.speech_end_t(speech_end_s)
             stt_metrics["speech_end_s"] = speech_end_s
@@ -1056,8 +1094,9 @@ def main():
             wav_path = None
             if args.input_mode == "mic":
                 item_name = "live_mic"
-                # Live speech has nothing that says what it was supposed to be.
-                item_filename, ori_text = None, None
+                # Live speech has nothing describing it in advance: no text it
+                # was supposed to be, and no measured end to anchor on.
+                item_filename, ori_text, ref_speech_end_s = None, None, None
                 user_wav = os.path.join(run_dir, f"user_input_{item_index}_{item_name}.wav")
                 audio_source = MicAudioSource(
                     save_path=user_wav,
@@ -1072,7 +1111,9 @@ def main():
 
                 item_name = audio_file.stem
                 item_filename = audio_file.name
-                ori_text = ground_truth_text(audio_path)
+                metadata = metadata_for(audio_path)
+                ori_text = ground_truth_text(metadata)
+                ref_speech_end_s = reference_speech_end_s(metadata)
                 print(f"[INFO] Processing audio file: {audio_file} (pacing: {args.audio_pacing})")
 
                 user_wav = os.path.join(run_dir, f"user_input_{item_index}_{audio_file.name}")
@@ -1122,7 +1163,7 @@ def main():
             stt_t = threading.Thread(
                 target=stt_worker,
                 args=(stt_engine, audio_source, mailbox, stt_metrics,
-                      trigger_on_endpoint),
+                      trigger_on_endpoint, ref_speech_end_s),
                 daemon=True,
             )
             llm_t = threading.Thread(
@@ -1194,6 +1235,11 @@ def main():
             # call the utterance over. Too little and the engine only finalizes
             # because the file ran out, a signal a live microphone never gets.
             speech_end_s = stt_metrics.get("speech_end_s")
+            # Which reading of the end of speech everything anchored on. Runs
+            # that differ here are measuring from different instants, so the
+            # figures must not be pooled across them.
+            if stt_metrics.get("speech_end_source"):
+                stt_extra["speech_end_source"] = stt_metrics["speech_end_source"]
             if speech_end_s is not None and input_duration_ms > 0:
                 trailing_silence_ms = input_duration_ms - int(speech_end_s * 1000)
                 stt_extra["trailing_silence_ms"] = trailing_silence_ms
