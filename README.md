@@ -191,7 +191,22 @@ The CSV contains:
 - A recording carries silence past its last word.
 - An endpointer has to hear that silence before it can decide the utterance is over, so a microphone keeps delivering audio the whole time it deliberates.
 
-The anchor therefore comes from the STT's own word timings, which both engines report. `extra_json` on the `stt` row carries `trailing_silence_ms`, the gap between the last word and the end of the audio.
+The anchor therefore comes from a `speech_end_ms` column in the `metadata.csv`
+beside the audio, where there is one: a VAD's reading of where the speech stops,
+measured on the normalized mono 16 kHz audio the pipeline feeds the STT. Failing
+that it falls back to the STT's own word timings, which both engines report.
+`extra_json` on the `stt` row names which was used, in `speech_end_source`, and
+carries `trailing_silence_ms`, the gap between that instant and the end of the
+audio.
+
+The measured anchor is the better of the two, and not only because it is more
+precise. A recognizer's word timings are a by-product of decoding: where it
+loses the tail of an utterance, its last word lands far too early and the
+reported latency is inflated by the difference. Across the 120 recordings under
+`audios/`, Vosk's last-word end sits within 30 ms of the VAD's reading for half
+of them but runs more than 1.3 s early for the worst tenth. Runs anchored
+differently are measuring from different instants and must not be pooled, which
+is what `speech_end_source` is there to make visible.
 
 `stt_endpoint_delay` measures from the end of speech to the finished transcript. On file input that is the flush once the stream ends; on a microphone it is the endpointer waiting out the silence, which is usually the largest single component of what a user perceives.
 
@@ -483,7 +498,7 @@ recorded at all.
 | **What it measures** | Wall-clock time in the STT worker, from its start to the finalized transcript. Under `fast` pacing that is the net decode cost. Under `realtime` pacing, or on a microphone, it also contains the wait for the audio to arrive, since the worker cannot outrun the speaker. |
 | **Measurement point** | Before → after the transcription loop. |
 | **duration_ms** | STT worker wall-clock time. |
-| **extra_json** | `input_duration_ms` – length of input audio (ms); `stt_rtf` – `stt / input_duration` (a genuine real-time factor only under `fast` pacing; under `realtime` it exceeds 1 because the wait is included); `trailing_silence_ms` – gap between the last recognized word and the end of the audio. |
+| **extra_json** | `input_duration_ms` – length of input audio (ms); `stt_rtf` – `stt / input_duration` (a genuine real-time factor only under `fast` pacing; under `realtime` it exceeds 1 because the wait is included); `trailing_silence_ms` – gap between the end of speech and the end of the audio; `speech_end_source` – `metadata` where a `speech_end_ms` column supplied the anchor, `stt_word_timings` where the engine's own timings did. |
 
 ---
 
@@ -514,19 +529,21 @@ recorded at all.
 | | |
 |---|---|
 | **What it measures** | The metric that matters from a user's perspective: how long they wait, after they stop talking, before hearing the first word back. |
-| **Measurement point** | Directly measured, from the end of the speech to the first synthesized chunk being ready. The end of the speech comes from the STT's own word timings, not from the end of the file and not from the point the STT finalizes. |
+| **Measurement point** | Directly measured, from the end of the speech to the first synthesized chunk being ready. The end of the speech comes from the metadata's `speech_end_ms` where there is one and the STT's own word timings otherwise — not from the end of the file and not from the point the STT finalizes. |
 | **duration_ms** | `tts_first_chunk_t − speech_end_t` |
 | **extra_json** | – |
-| **Blank when** | The instant is unknowable: `fast` pacing (no offset in the audio maps to a wall-clock time), or the engine reported no word timings. |
+| **Blank when** | The instant is unknowable: `fast` pacing (no offset in the audio maps to a wall-clock time), or nothing located the end of speech — neither a `speech_end_ms` in the metadata nor word timings from the engine. |
 
 Decomposes as `stt_endpoint_delay + llm_ttfc + tts_first_chunk`, to within a few ms.
 Note that `stt` is **not** a term: under realtime pacing most of it happens before
 the speaker stops.
 
-The anchor is only as good as the engine's timestamps. Against an independent
-energy-based reference on the same audio, Vosk's last-word end runs ~57 ms late and
-Whisper's last-segment end ~252 ms late — and a *later* anchor shortens the engine's
-own `ttfa`. Comparisons across engines carry that bias.
+Where the anchor falls back to the engine's own timestamps it is only as good as
+they are. Against an independent energy-based reference on the same audio,
+Vosk's last-word end runs ~57 ms late and Whisper's last-segment end ~252 ms
+late — and a *later* anchor shortens the engine's own `ttfa`, so comparisons
+across engines carry that bias. Supplying `speech_end_ms` removes it: both
+engines are then measured from the same instant, one neither of them chose.
 
 ---
 
@@ -535,7 +552,7 @@ own `ttfa`. Comparisons across engines carry that bias.
 | | |
 |---|---|
 | **What it measures** | How long the STT took to decide the utterance was over and produce the text. On a live microphone this is the endpointer waiting out the trailing silence, usually the largest single component of what a user perceives. |
-| **Measurement point** | End of speech (from word timings) → the finalized result arriving. |
+| **Measurement point** | End of speech (from the metadata's `speech_end_ms`, or the engine's word timings) → the finalized result arriving. |
 | **duration_ms** | `stt_final_t − speech_end_t` |
 | **extra_json** | – (shares the `stt` row's resource snapshot) |
 | **Blank when** | Same conditions as `ttfa`. |
@@ -642,4 +659,4 @@ warm figure.
 | `llm_ttfc >= llm_eval` | ❌ Not always! TTFC measures until the first sentence arrives, eval is the generation time of **all** tokens. For short responses TTFC ≈ eval; for long responses TTFC < eval. |
 | `tokens_per_sec ≈ eval_tokens / (llm_eval / 1000)` | ✅ By definition |
 | `stt_rtf = stt / input_duration_ms` | ✅ By definition — but only a real-time factor under `fast` pacing |
-| `ttfa` and `stt_endpoint_delay` present | ❌ Only under `realtime` pacing or mic input, and only when the engine reports word timings |
+| `ttfa` and `stt_endpoint_delay` present | ❌ Only under `realtime` pacing or mic input, and only when something located the end of speech — the metadata's `speech_end_ms` or the engine's word timings |
