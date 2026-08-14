@@ -411,6 +411,106 @@ The setting applies only to file input with realtime pacing. Mic mode always tri
 
 Under `endpoint`, a second end-of-speech signal within one input carries **everything recognized so far**, not just the new sentence, and supersedes the answer already in flight. An endpointer that fires while the speaker is only drawing breath would otherwise have the LLM answer half a sentence. Note that this is not conversation memory: each request to Ollama is independent, carries no `context` and no message history, and the assistant's own previous replies are never fed back.
 
+## Aggregating a run
+
+`aggregate_logs.py` turns the CSVs into a report. **One recording is one
+measurement**, so a run over the 120 files under `audios/` is a sample of 120,
+and everything the report says about spread and precision follows from that
+count rather than from how many runs were selected.
+
+```bash
+python aggregate_logs.py -d outputs/20260814_101500 -c 1 --warmup 1
+```
+
+It writes a formatted table, a TSV for spreadsheets, and with `-j` a JSON
+carrying the per-recording values for reanalysis elsewhere. The report covers
+the distribution of each stage, the precision of each estimate, the tail
+quantiles, a per-run breakdown, and the resource levels.
+
+Useful flags:
+
+| flag | what it does |
+|---|---|
+| `--warmup N` | drops the first N recordings of each run. The first pays for whatever loads lazily — in the logged runs its `llm_ttfc` lands at roughly twice the median. That is a cost of starting, not of answering |
+| `--percentiles` | which quantiles to report, default `50,90,95` |
+| `--confidence` | the level for every interval, default `0.95` |
+| `--compare PATH` | a baseline run to test against |
+| `--primary STAGE` | the stage the comparison is about, exempted from the multiplicity correction |
+
+### The median, not the mean
+
+The median is the figure to quote. A latency sample is bounded below and has a
+long right tail, so its mean sits above most of what was actually measured and
+one slow recording moves it while leaving the other 119 exactly as they were.
+
+Each estimate carries a confidence interval. The median's is **distribution-free**
+— it comes from which order statistics bracket the true median, which holds
+whatever shape the data has — and the mean's is a seeded percentile bootstrap,
+so the report does not change between two runs over the same logs.
+
+The `+/-` column is the half-width of the median's interval as a fraction of the
+median: the precision the run bought. **A difference smaller than it is not
+resolvable from that run**, however many decimal places the average has.
+
+### What 120 recordings is enough for
+
+| quantity | at n = 120 |
+|---|---|
+| median | ±7–12% of its value. Solid |
+| p90 | ±16%. Usable |
+| p95 | ±22%. Reportable, but the interval spans the 109th to the 119th of 120 observations |
+| p99 | **not estimable** — a distribution-free interval for it needs 368 recordings, so it is not offered |
+
+For comparing two runs, what matters is whether both sides ran over the *same*
+recordings. They pair up by filename, and the difference is then taken recording
+by recording, which cancels everything about a file that has nothing to do with
+the change — its length, its noise, how hard it is to recognize. The gain is
+not marginal:
+
+| real shift | paired, 120 each | unpaired, 120 each |
+|---|---|---|
+| 100 ms (≈4%) | 96% detected | 12% |
+| 250 ms | 100% | 40% |
+| 400 ms | 100% | 76% |
+
+So **120 recordings resolves a shift of roughly 100 ms, or 4%, when both sides
+run over the same folder**, and little short of half a second when they do not.
+The `Detectable` column states this per stage from the spread actually observed:
+a measured difference well under it is not evidence of no change, it is a sample
+that could not have shown one.
+
+### Comparing two runs
+
+```bash
+python aggregate_logs.py -d outputs/20260814_101500 --compare outputs/20260814_090000 --primary ttfa --warmup 1
+```
+
+The test is the **Wilcoxon signed-rank** on the paired differences, and the
+reported shift is the Hodges–Lehmann estimate of the median difference, with an
+interval from the same rank distribution. A negative shift means the current run
+is faster. Where the two sides share no filenames it falls back to the rank-sum
+test over independent samples and says so.
+
+Eleven stages tested at once is eleven chances to be unlucky, so `p (Holm)`
+holds the probability of *any* false positive across the family at 5%; read that
+column, not the raw `p`. The cost is real — an effect at p = 0.006 need not
+survive it — which is what `--primary` is for: naming the stage the experiment
+is about, **before seeing the result**, buys the right to read it at full
+strength. Picking the winner afterwards does not.
+
+### The limit worth knowing
+
+Both sides are one set of runs on one machine. The intervals describe how much
+the *recordings* varied, and say nothing about how much the machine varies from
+morning to morning — thermal state, what else was running, which weights were
+still cached. A significant difference between two single runs is a difference
+between those two runs, everything else that changed with them included.
+
+To attribute it to the code, run each side more than once and interleave them.
+Passing several logs per side does exactly this, and the per-run breakdown is
+there to be read first: if the spread across those rows rivals the difference
+under investigation, the pooled interval is understating it.
+
 ## Notes
 
 - CPU/RAM stats require `psutil`; if unavailable, those fields stay blank.
