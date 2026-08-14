@@ -580,7 +580,8 @@ def format_report(analysis: Analysis) -> str:
                      interval_text(median_ci), relative,
                      number(summary.mean), mean_ci])
     mean_note = (f"The mean's is a percentile bootstrap over {analysis.resamples} resamples, "
-                 f"seeded so the report does not move."
+                 f"seeded so the report does not move; it needs "
+                 f"{rstat.MIN_N_FOR_BOOTSTRAP} recordings to mean anything."
                  if analysis.resamples else
                  "The mean carries no interval here: --bootstrap 0 turned the resampling off.")
     section(f"ESTIMATE PRECISION ({confidence_label} confidence intervals, ms)",

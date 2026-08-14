@@ -34,6 +34,19 @@ DEFAULT_SEED = 20260814
 # is not worth printing.
 MIN_PAIRS_FOR_SIGNED_RANK = 6
 
+# The percentile bootstrap runs narrow on small samples: it can only resample
+# the values it was given, and a handful of them carry no information about the
+# tail they were drawn from. Measured coverage of a nominal 95% interval over a
+# lognormal like the logged latencies, 1500 trials each:
+#
+#     n =   4     6     8    10    15    20    30    60   120
+#         0.77  0.83  0.85  0.88  0.91  0.90  0.93  0.93  0.94
+#
+# An interval claiming 95% and delivering 77% is worse than no interval, so
+# below this the mean simply goes without one. Even above it the figure runs a
+# little narrow, which is why the median's exact interval is the one to quote.
+MIN_N_FOR_BOOTSTRAP = 20
+
 
 @dataclass
 class Interval:
@@ -203,10 +216,11 @@ def bootstrap_interval(values: Sequence[float],
 
     Used for the mean, where the skew of a latency sample makes the textbook
     t interval lean the wrong way. Returns an empty interval when resampling
-    is switched off or the sample is too small to resample meaningfully.
+    is switched off, or when the sample is smaller than MIN_N_FOR_BOOTSTRAP
+    and the interval would claim more confidence than it delivers.
     """
     n = len(values)
-    if n < 3 or resamples < 100:
+    if n < MIN_N_FOR_BOOTSTRAP or resamples < 100:
         return Interval(None, None)
 
     rng = random.Random(seed)
