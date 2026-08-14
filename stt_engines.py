@@ -33,6 +33,18 @@ except ImportError:
 class BaseSTTEngine(ABC):
     """Abstract base class for speech-to-text engines."""
 
+    def warmup(self) -> None:
+        """Prepare whatever the next stream needs, ahead of any timed span.
+
+        Called before each item, outside every measurement window, so that
+        per-stream setup does not land in the figures for the stage that
+        follows it. The default does nothing: an engine only overrides this
+        when it has per-stream state expensive enough to show up.
+
+        Idempotent, and skipping it only costs speed, never correctness --
+        transcribe_stream sets up whatever it was not handed.
+        """
+
     @abstractmethod
     def transcribe_stream(self, chunks: Iterable[bytes]) -> Iterator[dict]:
         """Transcribe a stream of PCM chunks and yield results incrementally.
@@ -159,19 +171,44 @@ class VoskEngine(BaseSTTEngine):
                 model_path, os.path.join(self._workdir.name, "model"),
                 tuple(ms / 1000.0 for ms in endpoint_silence_ms))
         self._model = Model(model_path)
+        self._rec = None
+        self.warmup()
+
+    def warmup(self) -> None:
+        """Build the recognizer the next stream will decode with.
+
+        Loading the model is the one-off cost; constructing a recognizer over
+        it is not. Each one allocates its own decoder state and measures at
+        65-100 ms, every time, on every file. Left inside transcribe_stream it
+        runs before the first chunk is ever pulled -- generators being lazy, the
+        body starts on the caller's first next(), which is already inside the
+        span reported as stt_ms -- so every recording carried that much of a
+        fixed offset for work that is not recognition.
+        """
+        if self._rec is None:
+            rec = KaldiRecognizer(self._model, SAMPLE_RATE)
+            rec.SetWords(True)
+            self._rec = rec
 
     def transcribe_stream(self, chunks: Iterable[bytes]) -> Iterator[dict]:
         """Yield partial and final results as audio chunks arrive.
 
-        A fresh KaldiRecognizer is created per call, so no explicit reset is
-        needed between utterances or files.
+        Decodes with the recognizer warmup() prepared and leaves the engine
+        without one, so the next stream is built fresh rather than inheriting
+        this stream's state.
+
+        Fresh rather than Vosk's much cheaper Reset(): a reset recognizer keeps
+        counting time from the first sample it was ever given, so word times --
+        and with them speech_end_s, which anchors TTFA -- would come back offset
+        by every file decoded before this one. The sweep tool relies on that
+        same carry-over across endpoint firings (see vosk_endpoint_sweep.decode).
 
         AcceptWaveform returning True is Vosk's endpointer firing: it has seen
         enough trailing silence to call the utterance over. That happens mid
         stream and is what drives turn-taking on a live microphone.
         """
-        rec = KaldiRecognizer(self._model, SAMPLE_RATE)
-        rec.SetWords(True)
+        self.warmup()
+        rec, self._rec = self._rec, None
 
         for data in chunks:
             if rec.AcceptWaveform(data):
