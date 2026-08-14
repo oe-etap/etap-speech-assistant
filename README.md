@@ -7,7 +7,7 @@ Input comes either from pre-recorded English audio files or from a live micropho
 ## Features
 
 - Configuration via YAML files (`--config`) or CLI arguments
-- Logs conversation transcripts (STT and LLM text) to `transcripts.jsonl` and `transcripts.yaml`
+- Logs conversation transcripts to `transcripts.jsonl` and `transcripts.yaml`, carrying what the recording was supposed to say next to what the STT heard
 - Saves the exact runtime configuration to `config_used.yaml`
 - File input via `--audio file1.wav file2.mp3 ...`, or live capture via `--input-mode mic`
 - File input can be paced at 1x speed (`--audio-pacing realtime`) so that STT overlaps with the speech exactly as it would on a microphone — this is what makes file-based latency numbers carry over to a live deployment
@@ -159,7 +159,19 @@ Each run creates `outputs/<YYYYMMDD_HHMMSS>/` containing:
 - Copied input files as `user_input_<n>_<name>`
 - Generated assistant responses as `assistant_<n>_<input-stem>.wav`
 - `config_used.yaml`: The exact runtime configuration used for the run
-- `transcripts.jsonl` and `transcripts.yaml`: Conversation logs containing the recognized STT text and the LLM response
+- `transcripts.jsonl` and `transcripts.yaml`: one record per utterance, holding the input's `filename`, the `ori_text` it was supposed to say, the `stt_text` actually recognized and the `llm_text` answered:
+
+  ```yaml
+  - filename: 00004.wav
+    ori_text: What is the name of the campus tv station?
+    stt_text: now what does the name of the campus tv station
+    llm_text: ...
+  ```
+
+  `ori_text` comes from a `metadata.csv` sitting beside the audio, joined on its
+  `filename` column and read from its `question` column — the layout the corpus
+  under `audios/` ships in. Recordings with no such file, no matching row, or a
+  live microphone get `null` instead; nothing else changes.
 - `latency_log_<timestamp>.csv`
 
 The CSV contains:

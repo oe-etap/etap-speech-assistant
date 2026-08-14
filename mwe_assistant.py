@@ -172,6 +172,42 @@ TRIGGER_END_OF_FILE = "end-of-file"  # the input running out
 
 
 # ---------- Helpers ----------
+# What a recording was supposed to say, for the transcript log to sit next to
+# what the STT heard. It comes from a metadata.csv beside the audio, joined on
+# the filename -- the layout the corpus ships in. One CSV serves every recording
+# in its directory, so it is read once per directory rather than once per file.
+_ground_truth_by_dir = {}
+
+
+def read_ground_truth(directory):
+    """`filename` -> `question` from `<directory>/metadata.csv`, or empty."""
+    path = os.path.join(directory, "metadata.csv")
+    try:
+        with open(path, newline="", encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+    except OSError:
+        return {}
+    except csv.Error as e:
+        print(f"[WARN] {path} could not be read: {e}")
+        return {}
+
+    if not rows or not {"filename", "question"} <= rows[0].keys():
+        if rows:
+            print(f"[WARN] {path} has no 'filename' and 'question' columns; "
+                  f"transcripts will carry no original text")
+        return {}
+    print(f"[INFO] Original text for {len(rows)} recordings from {path}")
+    return {r["filename"]: r["question"] for r in rows if r.get("filename")}
+
+
+def ground_truth_text(audio_path):
+    """What this recording was supposed to say, or None if nothing says so."""
+    directory = os.path.dirname(os.path.abspath(audio_path))
+    if directory not in _ground_truth_by_dir:
+        _ground_truth_by_dir[directory] = read_ground_truth(directory)
+    return _ground_truth_by_dir[directory].get(os.path.basename(audio_path))
+
+
 def is_mono_16k_pcm(path):
     """Check if a file is already mono 16kHz 16-bit PCM WAV."""
     try:
@@ -1020,6 +1056,8 @@ def main():
             wav_path = None
             if args.input_mode == "mic":
                 item_name = "live_mic"
+                # Live speech has nothing that says what it was supposed to be.
+                item_filename, ori_text = None, None
                 user_wav = os.path.join(run_dir, f"user_input_{item_index}_{item_name}.wav")
                 audio_source = MicAudioSource(
                     save_path=user_wav,
@@ -1033,6 +1071,8 @@ def main():
                     raise FileNotFoundError(audio_path)
 
                 item_name = audio_file.stem
+                item_filename = audio_file.name
+                ori_text = ground_truth_text(audio_path)
                 print(f"[INFO] Processing audio file: {audio_file} (pacing: {args.audio_pacing})")
 
                 user_wav = os.path.join(run_dir, f"user_input_{item_index}_{audio_file.name}")
@@ -1293,6 +1333,8 @@ def main():
 
             # --- Transcript Logging ---
             transcript_record = {
+                "filename": item_filename,
+                "ori_text": ori_text,
                 "stt_text": user_text,
                 "llm_text": full_reply,
             }
