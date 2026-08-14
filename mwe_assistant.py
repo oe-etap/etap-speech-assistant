@@ -77,11 +77,94 @@ GPU_SAMPLE_INTERVAL_S = 1.0
 # How long to wait for the pipeline workers to drain before reading their metrics
 WORKER_SHUTDOWN_TIMEOUT_S = 10.0
 
-# Silence an endpointer needs after the last word before it calls an utterance
-# over. Measured against vosk-model-small-en-us-0.15, which fires at ~1100 ms
-# and not at all below it. Input files with less than this never exercise the
-# endpointer, so their latency figures do not carry over to live input.
-MIN_TRAILING_SILENCE_MS = 1200
+# How long Vosk waits after the last word before calling an utterance over.
+#
+# Swept over 833 HeySQuAD recordings by vosk_endpoint_sweep.py, against
+# vosk-model-small-en-us-0.15. Below 600 ms the endpointer starts firing inside
+# sentences -- 0.69% of utterances at 500 ms, 2.95% at 300 ms -- and each of
+# those sends half a question to the LLM, whose answer is then thrown away when
+# the rest of the words arrive. Above 600 ms nothing improves: the one recording
+# still split at 600 ms is a false start ("now", 1.7 s, then the question) that
+# survives 1500 ms too.
+#
+# One number for every utterance is a deliberate simplification, and it is not
+# free. The shipped configuration instead gates three waits on how complete the
+# words already sound, which buys 220 ms on the fifth of utterances where the
+# decoder is sure -- at three times the split rate, and 40 ms slower on average
+# because its ceiling is 1.0 s. `500/600/600` is that mechanism with the ceiling
+# brought down, and beats the shipped settings outright; it stays available
+# rather than default because a split can be heard, the answer having often
+# started playing before the rest of the sentence arrives to retract it.
+#
+# Read on a different corpus with care. These are read-aloud questions; a
+# speaker composing a sentence as they go pauses longer.
+DEFAULT_ENDPOINT_SILENCE_MS = (600, 600, 600)
+
+
+def format_schedule(schedule):
+    """How a schedule is written back to the user and into config_used.yaml."""
+    if not max(schedule):
+        return "model default"
+    return str(schedule[0]) if len(set(schedule)) == 1 else "/".join(map(str, schedule))
+
+
+def parse_endpoint_schedule(spec):
+    """`600` for one wait, or `500/600/600` for Kaldi's rules 2, 3 and 4."""
+    parts = tuple(int(p) for p in str(spec).split("/"))
+    if len(parts) not in (1, 3):
+        raise argparse.ArgumentTypeError(f"expected N or N/N/N, got {spec!r}")
+    return parts * 3 if len(parts) == 1 else parts
+
+
+# What the endpointer costs on top of the wait itself: the recognizer's own lag
+# between the last word and the silence it scores, plus whatever is left of a
+# chunk when the threshold is crossed, since it can only fire on a chunk
+# boundary. Both terms are fitted over vosk_endpoint_sweep.py's output -- 32
+# combinations of six chunk sizes from 50 to 250 ms with 200-1500 ms waits, over
+# the 577 recordings it counts -- to
+#
+#     stt_endpoint_delay ~= wait + LAG_MS + LAG_CHUNK_SHARE * audio-chunk-ms
+#
+# fitted once for the median and once for the 99th percentile. Residuals stay
+# within 35 ms in both cases, and the chunk term is linear across every size
+# measured. Nothing here says it stays linear past 250 ms.
+ENDPOINT_LAG_MS = 280
+ENDPOINT_LAG_CHUNK_SHARE = 0.4
+ENDPOINT_P99_LAG_MS = 390
+ENDPOINT_P99_LAG_CHUNK_SHARE = 0.75
+
+# The model's own settings gate three silence lengths on decoder confidence and
+# so have no single wait to substitute here. Measured, they behave like this
+# one: 1050 ms median and 1300 ms p99 at a 250 ms chunk, both of which the
+# formulas above reproduce from 700 to within 30 ms.
+STOCK_EQUIVALENT_SILENCE_MS = 700
+
+
+def endpoint_delay_ms(endpoint_silence_ms, chunk_ms, worst_case=False):
+    """What `stt_endpoint_delay` comes out at, typically or in the tail.
+
+    A gated schedule is read at its ceiling, the wait that applies when the
+    decoder is not persuaded the utterance is over. Its faster rules only ever
+    subtract, so this is the bound the trailing-silence check needs.
+    """
+    wait_ms = max(endpoint_silence_ms) or STOCK_EQUIVALENT_SILENCE_MS
+    if worst_case:
+        return round(wait_ms + ENDPOINT_P99_LAG_MS + ENDPOINT_P99_LAG_CHUNK_SHARE * chunk_ms)
+    return round(wait_ms + ENDPOINT_LAG_MS + ENDPOINT_LAG_CHUNK_SHARE * chunk_ms)
+
+
+def min_trailing_silence_ms(args):
+    """Silence an input file needs for the endpointer to fire before it ends.
+
+    Below this the engine only finalizes because the file ran out, a signal a
+    live microphone never gets, so the run reports a latency live input would
+    never achieve. How long the endpointer takes varies from one utterance to
+    the next by around 200 ms, so this is the 99th percentile rather than the
+    median: a file cut to the median figure would fall short half the time.
+    """
+    return endpoint_delay_ms(args.vosk_endpoint_silence_ms, args.audio_chunk_ms,
+                             worst_case=True)
+
 
 # What hands an utterance to the LLM.
 TRIGGER_ENDPOINT = "endpoint"        # the STT calling the utterance over
@@ -728,6 +811,14 @@ def main():
 
     # STT options
     parser.add_argument("--vosk-model", default="./vosk/vosk-model-small-en-us-0.15", help="Path to English Vosk model dir")
+    parser.add_argument("--vosk-endpoint-silence-ms", type=parse_endpoint_schedule,
+                        default=DEFAULT_ENDPOINT_SILENCE_MS,
+                        help="Silence after the last word before Vosk calls the utterance "
+                             "over. Lower answers sooner but risks firing on a breath and "
+                             "sending half a sentence to the LLM. `0` keeps whatever the "
+                             "model ships with; `500/600/600` restores its habit of leaving "
+                             "early when the words already parse as a finished utterance. "
+                             "See vosk_endpoint_sweep.py for how the default was arrived at.")
     parser.add_argument("--whisper-model", default="small", help="faster-whisper model name")
     parser.add_argument("--whisper-device", choices=["cpu", "cuda"], default=None, help="Device for faster-whisper")
     parser.add_argument("--whisper-compute-type", default=None, help="Compute type (int8, float16, etc.)")
@@ -773,6 +864,13 @@ def main():
             parser.set_defaults(**yaml_cfg)
 
     args = parser.parse_args()
+
+    # A YAML value reaches argparse through set_defaults, which skips the `type`
+    # conversion a command line goes through, so the schedule is normalized here
+    # rather than in one of the two places it can arrive from.
+    args.vosk_endpoint_silence_ms = parse_endpoint_schedule(args.vosk_endpoint_silence_ms) \
+        if not isinstance(args.vosk_endpoint_silence_ms, tuple) \
+        else args.vosk_endpoint_silence_ms
 
     if args.input_mode == "mic":
         args.audio = ["mic"]
@@ -823,7 +921,7 @@ def main():
 
     # Initialize STT engine
     if args.stt_engine == "vosk":
-        stt_engine = VoskEngine(args.vosk_model)
+        stt_engine = VoskEngine(args.vosk_model, args.vosk_endpoint_silence_ms)
     elif args.stt_engine == "whisper":
         stt_engine = WhisperEngine(
             args.whisper_model,
@@ -866,10 +964,12 @@ def main():
         args.latency_csv = os.path.join(run_dir, f"latency_log_{timestamp}.csv")
 
     config_to_save = vars(args).copy()
+    config_to_save["vosk_endpoint_silence_ms"] = format_schedule(args.vosk_endpoint_silence_ms)
 
     # Filter out settings that are not used by the selected engine
     if args.stt_engine == "whisper":
         config_to_save.pop("vosk_model", None)
+        config_to_save.pop("vosk_endpoint_silence_ms", None)
     elif args.stt_engine == "vosk":
         config_to_save.pop("whisper_model", None)
         config_to_save.pop("whisper_device", None)
@@ -1057,13 +1157,17 @@ def main():
             if speech_end_s is not None and input_duration_ms > 0:
                 trailing_silence_ms = input_duration_ms - int(speech_end_s * 1000)
                 stt_extra["trailing_silence_ms"] = trailing_silence_ms
+                needed_ms = min_trailing_silence_ms(args)
                 if (args.input_mode == "file"
                         and args.audio_pacing == PACING_REALTIME
-                        and trailing_silence_ms < MIN_TRAILING_SILENCE_MS):
+                        and args.stt_engine == "vosk"   # the only engine that endpoints
+                        and trailing_silence_ms < needed_ms):
                     print(f"[WARN] Only {trailing_silence_ms} ms of silence after the last "
-                          f"word; {MIN_TRAILING_SILENCE_MS} ms or more is needed for the "
-                          f"endpointer to fire. This run measures the end-of-file path, "
-                          f"which live microphone input never takes, so its TTFA is optimistic.")
+                          f"word; {needed_ms} ms or more is needed for the endpointer to "
+                          f"fire at --vosk-endpoint-silence-ms "
+                          f"{format_schedule(args.vosk_endpoint_silence_ms)}. This run "
+                          f"measures the end-of-file path, which live microphone input "
+                          f"never takes, so its TTFA is optimistic.")
 
             write_timing(writer, args, item_name, "stt", stt_ms,
                          stt_metrics.get("stats"), stt_extra)

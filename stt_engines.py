@@ -11,6 +11,10 @@ decides how fast the audio arrives.
 
 from abc import ABC, abstractmethod
 import json
+import os
+import shutil
+import tempfile
+from pathlib import Path
 from typing import Iterable, Iterator
 
 import numpy as np
@@ -51,10 +55,109 @@ class BaseSTTEngine(ABC):
         ...
 
 
+# Kaldi's endpointing rules fire on an OR. Rules 2, 3 and 4 pair a silence length
+# with a bound on the decoder's *relative cost* -- how much worse ending the
+# utterance here is than carrying on -- at 2.0, 8.0 and infinity respectively.
+# A low relative cost means the words so far already parse as a finished
+# utterance, so the shipped 0.5/0.75/1.0 s is really "leave early if it sounds
+# complete, otherwise hold on". Writing one value into all three throws that
+# signal away, because the ungated rule 4 then always fires first.
+#
+# Rule 1 (silence with nothing recognized at all) is a different question and
+# keeps its own setting; rule 5 caps utterance length and is left alone.
+_ENDPOINT_RULES = ("rule2", "rule3", "rule4")
+
+
+def write_endpoint_variant(model_path: str, dest: str, trailing_silence_s,
+                           quiet_timeout_s: float = None,
+                           max_relative_cost=None) -> str:
+    """Materialize a Vosk model with a given endpointer schedule.
+
+    `trailing_silence_s` is either one number for all three rules, flattening
+    them into a single wait, or three -- for rules 2, 3 and 4 in that order --
+    which keeps the confidence gating and only moves the thresholds.
+
+    Vosk 0.3.44 has no runtime endpointer API -- `SetEndpointerDelays` arrived
+    in a later release -- so the setting can only reach Kaldi through the
+    model's own `conf/model.conf`, which is read once at load time. The model is
+    not copied: everything but `conf/` is linked back to the original, which
+    keeps a variant to a few hundred bytes. Where the filesystem refuses links
+    (Windows without the privilege) it falls back to copying.
+
+    `max_relative_cost`, likewise one per rule, is how much worse ending the
+    utterance may be than continuing it before the rule declines to fire. Kaldi
+    defaults to 2.0, 8.0 and infinity, which is what makes the three rules
+    differ at all; tightening the first makes an early exit ask for more
+    certainty that the words already form a whole utterance.
+
+    `quiet_timeout_s` overrides rule 1, how long a silence with nothing
+    recognized in it runs before the recognizer gives up on the utterance.
+    Left alone by default.
+    """
+    if isinstance(trailing_silence_s, (int, float)):
+        trailing_silence_s = (trailing_silence_s,) * len(_ENDPOINT_RULES)
+    if len(trailing_silence_s) != len(_ENDPOINT_RULES):
+        raise ValueError(f"expected 1 or {len(_ENDPOINT_RULES)} silence lengths, "
+                         f"got {len(trailing_silence_s)}")
+    if max_relative_cost is not None and len(max_relative_cost) != len(_ENDPOINT_RULES):
+        raise ValueError(f"expected {len(_ENDPOINT_RULES)} relative costs, "
+                         f"got {len(max_relative_cost)}")
+    src, dst = Path(model_path).resolve(), Path(dest)
+    if dst.is_dir():
+        shutil.rmtree(dst)
+    (dst / "conf").mkdir(parents=True)
+
+    def link(entry: Path, target: Path):
+        try:
+            os.symlink(entry, target)
+        except (OSError, NotImplementedError):
+            (shutil.copytree if entry.is_dir() else shutil.copy2)(entry, target)
+
+    for entry in src.iterdir():
+        if entry.name != "conf":
+            link(entry, dst / entry.name)
+    for entry in (src / "conf").iterdir():
+        if entry.name != "model.conf":
+            link(entry, dst / "conf" / entry.name)
+
+    kept = [ln for ln in (src / "conf" / "model.conf").read_text().splitlines()
+            if ln.strip() and not any(f"endpoint.{r}." in ln for r in _ENDPOINT_RULES)]
+    kept += [f"--endpoint.{rule}.min-trailing-silence={seconds}"
+             for rule, seconds in zip(_ENDPOINT_RULES, trailing_silence_s)]
+    if max_relative_cost is not None:
+        kept += [f"--endpoint.{rule}.max-relative-cost={cost}"
+                 for rule, cost in zip(_ENDPOINT_RULES, max_relative_cost)]
+    if quiet_timeout_s is not None:
+        kept = [ln for ln in kept if "endpoint.rule1." not in ln]
+        kept.append(f"--endpoint.rule1.min-trailing-silence={quiet_timeout_s}")
+    (dst / "conf" / "model.conf").write_text("\n".join(kept) + "\n")
+    return str(dst)
+
+
 class VoskEngine(BaseSTTEngine):
     """Vosk-based STT engine with streaming partial/final results."""
 
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, endpoint_silence_ms=0):
+        """
+        Args:
+            model_path: English Vosk model directory.
+            endpoint_silence_ms: Silence after the last word before the
+                endpointer calls the utterance over -- one number, or three for
+                Kaldi's rules 2, 3 and 4, which keeps the shipped habit of
+                leaving early when the words already parse as a whole utterance.
+                0 leaves the model's own settings in place. Anything else is
+                applied through a temporary model variant, the value not being
+                settable at runtime.
+        """
+        if isinstance(endpoint_silence_ms, (int, float)):
+            endpoint_silence_ms = (endpoint_silence_ms,) * 3
+
+        self._workdir = None
+        if max(endpoint_silence_ms):
+            self._workdir = tempfile.TemporaryDirectory(prefix="vosk-endpoint-")
+            model_path = write_endpoint_variant(
+                model_path, os.path.join(self._workdir.name, "model"),
+                tuple(ms / 1000.0 for ms in endpoint_silence_ms))
         self._model = Model(model_path)
 
     def transcribe_stream(self, chunks: Iterable[bytes]) -> Iterator[dict]:

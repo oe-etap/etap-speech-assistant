@@ -34,7 +34,17 @@ except (ImportError, OSError):
 
 SAMPLE_RATE = 16000
 SAMPLE_WIDTH = 2  # bytes per sample (16-bit PCM)
-DEFAULT_CHUNK_MS = 250
+
+# Chunk length handed to the STT. An endpointer can only call an utterance over
+# on a chunk boundary, so this lands on the response time: about 0.4 ms per ms
+# of chunk. Measured across 50-250 ms, nothing else moves with it -- not
+# recognition accuracy, not how often the endpointer fires early, and not STT
+# CPU, which is spent per frame of audio rather than per call. See the README.
+#
+# 100 rather than 50 because the last 20 ms of the available saving doubles the
+# handoff rate, and the measurement behind "it is free" was a decode loop on an
+# idle machine, not this pipeline under load with a live microphone.
+DEFAULT_CHUNK_MS = 100
 
 PACING_REALTIME = "realtime"
 PACING_FAST = "fast"
