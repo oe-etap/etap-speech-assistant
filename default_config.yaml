@@ -12,6 +12,13 @@ out-dir: outputs
 keep-normalized: false
 input-mode: file  # 'file' or 'mic'
 
+# Aggregate the run's own latency log when it finishes, into the same folder:
+# log_averages_summary.txt, log_averages.tsv and log_averages.json. The CSV is
+# the raw material, and what the run measured is the distribution over it.
+# false leaves the folder with the CSV alone; aggregate_logs.py produces the
+# same three files from it at any later point.
+summary: true
+
 # How input files are fed to the STT engine.
 #   realtime: simulate a microphone at 1x speed, so STT overlaps with the speech.
 #             Required for ttfa and stt_endpoint_delay, which are blank without
