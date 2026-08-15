@@ -13,6 +13,7 @@ CPU/RAM/GPU snapshots.
 """
 
 import argparse
+import collections
 import csv
 import queue
 import socket
@@ -78,13 +79,20 @@ _gpu_stats = _GPU_BLANK_STATS
 # tick is what keeps this slow.
 GPU_SAMPLE_INTERVAL_S = 1.0
 
-# How often utilisation is sampled through NVML, which costs 0.45 ms a reading
-# and so can run far faster than the nvidia-smi path. There is no point: the
-# driver advances its own counter about every 1/6 s on this card, so sampling
-# faster than that returns the same reading twice. This sits just inside that
-# period, which places a window's edges within one advance of where they were
-# opened and closed.
+# How often the utilisation timeline is extended through NVML, which costs
+# under a millisecond a call. The driver produces one sample per frame, about
+# every 1/6 s, and holds them until they are collected, so this only has to run
+# often enough not to fall behind that.
 GPU_UTIL_SAMPLE_INTERVAL_S = 0.1
+
+# Silence from the driver's per-process samples that means an idle device
+# rather than a collection that arrived between two frames.
+GPU_UTIL_IDLE_GAP_S = 0.5
+
+# How much of the timeline to keep. At the driver's rate this is over an hour,
+# which covers any window a run asks about -- including e2e_response_ready,
+# which spans the whole session on a microphone.
+GPU_UTIL_HISTORY_SAMPLES = 30000
 
 # How long to wait for the pipeline workers to drain before reading their metrics
 WORKER_SHUTDOWN_TIMEOUT_S = 10.0
@@ -436,64 +444,133 @@ def _refresh_gpu_stats():
         return False
 
 
-# Utilisation integrated over time, as (instant of the last reading, percent
-# seconds accumulated up to it, the reading in force since it). None until a
-# source produces its first reading, which is what leaves the column blank
-# rather than reporting the zero of a device nobody is watching. Rebound
-# wholesale by the sampler so that readers need no lock.
-_gpu_util_state = None
+# The utilisation timeline, as (instant on this process's clock, percent). Each
+# sample describes the interval ending at its instant, which is how the driver
+# spaces its own. Appended by the sampler and read whole under the lock, since
+# a deque being appended to cannot be iterated safely.
+_gpu_util_samples = collections.deque(maxlen=GPU_UTIL_HISTORY_SAMPLES)
+_gpu_util_lock = threading.Lock()
+
+# The newest driver timestamp already collected, in the driver's own epoch
+# microseconds. Only the sampler touches it.
+_gpu_util_last_seen = 0
+
+# Whether the driver will hand over its per-process samples, decided once at
+# startup. Where it will not, the sampler falls back to the utilisation counter,
+# which is a rolling average and carries the lag that goes with it.
+_gpu_util_sampled = False
 
 
-def _accumulate_gpu_util(util):
-    """Fold one reading into the running integral of utilisation over time.
-
-    The reading is held constant until the next one arrives, which is the only
-    honest interpretation available: the driver reports a rolling average of
-    what has just happened, not an instantaneous rate.
-    """
-    global _gpu_util_state
+def _add_gpu_util_sample(instant, util):
+    """Append one point of the timeline, dropping what will not convert."""
     try:
         util = float(util)
     except (TypeError, ValueError):
-        # A driver that will not supply the field keeps the previous reading
-        # rather than pulling the average towards a zero it never measured.
         return
-    now = time.perf_counter()
-    if _gpu_util_state is None:
-        _gpu_util_state = (now, 0.0, util)
-        return
-    then, area, previous = _gpu_util_state
-    _gpu_util_state = (now, area + previous * (now - then), util)
+    with _gpu_util_lock:
+        _gpu_util_samples.append((instant, util))
 
 
-def _gpu_util_area(state):
-    """Where the integral stands right now, as (instant, percent seconds).
+def _sample_process_util():
+    """Collect the driver's own timestamped samples since the last collection.
 
-    Carried forward from the last reading at that reading's value, so a window
-    is measured between the instants it was actually opened and closed and not
-    between the sampler ticks nearest to them. Takes the state it reads rather
-    than reaching for the global twice, which is what keeps the two halves of
-    the arithmetic from coming out of different readings.
+    These are what makes a stage's figure describe that stage. The samples are
+    stamped by the driver at the instant the work happened, arrive within a
+    frame of it, and stop as soon as it does -- where the utilisation counter
+    reports a rolling average that starts late, outlives the work by seconds and
+    so lands on whichever stage happens to be running by then.
+
+    Utilisation is reported per process. Summing across them gives the device,
+    which is what this column has always described.
     """
-    now = time.perf_counter()
-    then, area, current = state
-    return now, area + current * max(0.0, now - then)
+    global _gpu_util_last_seen
+    wall, perf = time.time(), time.perf_counter()
+    try:
+        samples = pynvml.nvmlDeviceGetProcessUtilization(_nvml_handle, _gpu_util_last_seen)
+    except pynvml.NVMLError:
+        # Nothing new, which between two frames means nothing yet and over a
+        # longer silence means nothing at all: the driver emits a sample every
+        # frame for as long as any process holds a context. An empty timeline is
+        # the same answer at the start of a run, before anything has loaded.
+        if not _gpu_util_samples or perf - _gpu_util_samples[-1][0] > GPU_UTIL_IDLE_GAP_S:
+            _add_gpu_util_sample(perf, 0.0)
+        return
+
+    totals = {}
+    for sample in samples:
+        if sample.timeStamp > _gpu_util_last_seen:
+            totals[sample.timeStamp] = totals.get(sample.timeStamp, 0) + sample.smUtil
+    if not totals:
+        return
+    _gpu_util_last_seen = max(totals)
+    for stamp in sorted(totals):
+        # The driver stamps these against the wall clock; the windows they are
+        # measured into are on the monotonic one.
+        _add_gpu_util_sample(perf + (stamp / 1e6 - wall), min(100.0, totals[stamp]))
+
+
+def _supports_process_util():
+    """Whether the driver will hand over per-process utilisation samples.
+
+    'Not found' is the answer for a device with nothing running on it, which
+    says nothing about support and is why it counts as a yes here: a run asks
+    this before its own models are loaded. A driver without the feature reports
+    it as unsupported instead.
+    """
+    try:
+        pynvml.nvmlDeviceGetProcessUtilization(_nvml_handle, 0)
+    except pynvml.NVMLError as e:
+        return getattr(e, "value", None) == pynvml.NVML_ERROR_NOT_FOUND
+    except Exception:
+        return False
+    return True
 
 
 def _sample_gpu_util():
-    """Take one reading from whichever source is active and fold it in.
+    """Extend the timeline from whichever source is available.
 
     On the nvidia-smi path this also refreshes the published levels, since that
     source costs a subprocess and must stay away from the workers.
     """
-    if _nvml_handle is not None:
-        util = _nvml_value(
-            lambda: pynvml.nvmlDeviceGetUtilizationRates(_nvml_handle).gpu)
+    if _gpu_util_sampled:
+        _sample_process_util()
+    elif _nvml_handle is not None:
+        _add_gpu_util_sample(time.perf_counter(), _nvml_value(
+            lambda: pynvml.nvmlDeviceGetUtilizationRates(_nvml_handle).gpu))
     else:
         # A failed refresh keeps the previous reading.
         _refresh_gpu_stats()
-        util = _gpu_stats["gpu_util_percent"]
-    _accumulate_gpu_util(util)
+        _add_gpu_util_sample(time.perf_counter(), _gpu_stats["gpu_util_percent"])
+
+
+def gpu_util_over(window):
+    """Mean utilisation across a stage, from the samples covering it.
+
+    window is the (start, end) the stage was measured between. Each sample
+    counts for the part of its own interval that falls inside, so the figure is
+    an average over time rather than over samples.
+
+    Blank where the window is not covered: before the sampler's first reading,
+    or where it reaches further back than the retained timeline. The tail of a
+    window can outrun the samples by up to one frame, the last of them arriving
+    after the stage they describe has ended; the mean then covers the part that
+    was reported, which is the whole stage bar that frame.
+    """
+    if not window:
+        return ""
+    start, end = window
+    with _gpu_util_lock:
+        samples = list(_gpu_util_samples)
+    if len(samples) < 2 or samples[0][0] > start:
+        return ""
+
+    total, covered = 0.0, 0.0
+    for (opened, _), (closed, util) in zip(samples, samples[1:]):
+        overlap = min(closed, end) - max(opened, start)
+        if overlap > 0:
+            total += util * overlap
+            covered += overlap
+    return round(total / covered, 1) if covered > 0 else ""
 
 
 class _GpuSampler(threading.Thread):
@@ -535,7 +612,7 @@ def start_gpu_monitor():
     utilisation has to be integrated over the stage rather than probed at its
     end. Neither source being usable leaves the GPU columns blank.
     """
-    global _nvml_handle, _gpu_sampler
+    global _nvml_handle, _gpu_sampler, _gpu_util_sampled
     if _gpu_sampler is not None:
         return
 
@@ -544,6 +621,7 @@ def start_gpu_monitor():
         try:
             pynvml.nvmlInit()
             _nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            _gpu_util_sampled = _supports_process_util()
             interval = GPU_UTIL_SAMPLE_INTERVAL_S
         except Exception:
             _nvml_handle = None
@@ -566,7 +644,7 @@ def stop_gpu_monitor():
 
     In that order: the sampler reads the NVML handle on every tick.
     """
-    global _nvml_handle, _gpu_sampler, _gpu_util_state
+    global _nvml_handle, _gpu_sampler, _gpu_util_sampled, _gpu_util_last_seen
     if _gpu_sampler is not None:
         _gpu_sampler.stop()
         _gpu_sampler.join(timeout=GPU_SAMPLE_INTERVAL_S * 2)
@@ -577,7 +655,10 @@ def stop_gpu_monitor():
             pynvml.nvmlShutdown()
         except Exception:
             pass
-    _gpu_util_state = None
+    _gpu_util_sampled = False
+    _gpu_util_last_seen = 0
+    with _gpu_util_lock:
+        _gpu_util_samples.clear()
 
 
 # The Ollama server holds the model in a runner subprocess of its own, so this
@@ -777,37 +858,32 @@ def prime_cpu_percent():
 
 def _open_gpu_util_window():
     """Mark where the calling thread's utilisation window starts."""
-    state = _gpu_util_state
-    _stage_window.gpu = None if state is None else _gpu_util_area(state)
+    _stage_window.gpu = time.perf_counter()
 
 
 def _close_gpu_util_window():
-    """Mean utilisation since this thread's window opened, and reopen it.
+    """Return the window this thread just finished, and open the next one.
 
-    Blank until a window has been open across at least one reading, which is
-    what a stage that ended before the sampler said anything reports rather
-    than a mean of nothing.
+    The window rather than a figure: the samples covering its last frame have
+    not necessarily arrived yet, and the row is not written until the item is
+    over. Resolving it there costs nothing and covers the whole stage.
     """
-    state = _gpu_util_state
-    if state is None:
-        return ""
     opened = getattr(_stage_window, "gpu", None)
-    now, area = _gpu_util_area(state)
-    _stage_window.gpu = (now, area)
-    if opened is None or now <= opened[0]:
-        return ""
-    return round((area - opened[1]) / (now - opened[0]), 1)
+    now = time.perf_counter()
+    _stage_window.gpu = now
+    return None if opened is None else (opened, now)
 
 
 def collect_resource_snapshot():
     """Return the resource snapshot for the stage that has just finished.
 
     Call at a stage boundary, from the thread that ran the stage and opened its
-    window with prime_cpu_percent(). cpu_percent and gpu_util_percent then cover
-    that stage alone, and both windows reopen for whatever the thread measures
-    next. ram_percent and rss_mb are read directly, and so are the remaining GPU
-    fields, from NVML or, where that is unavailable, from the sampler's latest
-    nvidia-smi reading. Missing psutil/NVML/nvidia-smi leaves blanks.
+    window with prime_cpu_percent(). cpu_percent then covers that stage alone,
+    and gpu_util_window carries the same span for the utilisation the row is
+    written with; both reopen for whatever the thread measures next. ram_percent
+    and rss_mb are read directly, and so are the remaining GPU fields, from NVML
+    or, where that is unavailable, from the sampler's latest nvidia-smi reading.
+    Missing psutil/NVML/nvidia-smi leaves blanks.
 
     rss_mb covers this process alone, which is the pipeline without its LLM: the
     model lives in the Ollama server's runner and is accounted for separately by
@@ -833,8 +909,9 @@ def collect_resource_snapshot():
         stats.update(_read_gpu_stats_nvml())
     else:
         stats.update(_gpu_stats)
-    # Last, since it is the one GPU field the sources above do not carry.
-    stats["gpu_util_percent"] = _close_gpu_util_window()
+    # Not a reading but the span to average one over, resolved when the row is
+    # written; see _close_gpu_util_window().
+    stats["gpu_util_window"] = _close_gpu_util_window()
     return stats
 
 
@@ -880,7 +957,7 @@ def write_timing(writer, args, item, stage, duration_ms, stats=None, extra=None)
         "llm_rss_mb": stats.get("llm_rss_mb", ""),
         "llm_vram_mb": stats.get("llm_vram_mb", ""),
         "llm_model_vram_mb": stats.get("llm_model_vram_mb", ""),
-        "gpu_util_percent": stats.get("gpu_util_percent", ""),
+        "gpu_util_percent": gpu_util_over(stats.get("gpu_util_window")),
         "gpu_mem_used_mb": stats.get("gpu_mem_used_mb", ""),
         "gpu_mem_total_mb": stats.get("gpu_mem_total_mb", ""),
         "gpu_name": stats.get("gpu_name", ""),

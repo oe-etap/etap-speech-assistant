@@ -696,8 +696,8 @@ def format_report(analysis: Analysis) -> str:
             "Each value is averaged over the stage of its own row. Both figures are",
             "machine-wide, so concurrent stages share the same load and the numbers",
             "cannot be added up; e2e_response_ready already spans the whole item.",
-            "GPU utilisation carries the driver's own lag, which outlasts the work",
-            "and so reaches rows whose stage only overlapped it.",
+            "The stages overlap, so GPU utilisation on a stage run by a component",
+            "that does not touch the card is the LLM still generating underneath it.",
         ])
 
     # ----- 7. Pooled resources -----
