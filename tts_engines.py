@@ -12,9 +12,11 @@ import subprocess
 
 import numpy as np
 try:
+    from piper.config import PiperConfig
     from piper.voice import PiperVoice
     _HAS_PIPER_API = True
 except ImportError:
+    PiperConfig = None
     PiperVoice = None
     _HAS_PIPER_API = False
 
@@ -69,7 +71,8 @@ class PiperEngine(BaseTTSEngine):
     """Piper TTS engine with Python API and CLI executable fallback."""
 
     def __init__(self, voice_path: str, exe_path: str = None,
-                 use_exe: bool = False, device: str = "cpu"):
+                 use_exe: bool = False, device: str = "cpu",
+                 num_threads: int = None):
         """Initialize the Piper engine.
 
         Args:
@@ -79,6 +82,10 @@ class PiperEngine(BaseTTSEngine):
             device: "cpu" or "cuda", the ONNX Runtime execution provider the
                 voice model runs on. Ignored when use_exe is True, which has
                 no way to select one.
+            num_threads: ONNX Runtime intra-op thread count for the CPU
+                provider. None leaves ONNX Runtime its own default, which also
+                pins every thread to one core -- see _load_voice(). Ignored on
+                cuda, where the pool only feeds the GPU.
 
         Raises:
             FileNotFoundError: If the mandatory .onnx.json sidecar config is missing.
@@ -88,6 +95,7 @@ class PiperEngine(BaseTTSEngine):
         self._exe_path = exe_path
         self._use_exe = use_exe
         self._device = device
+        self._num_threads = num_threads
         self._piper_voice = None
         self._sample_rate_val = self._read_sample_rate_from_config()
 
@@ -100,7 +108,7 @@ class PiperEngine(BaseTTSEngine):
             if device == "cuda":
                 self._preload_cuda_libraries()
             try:
-                self._piper_voice = PiperVoice.load(voice_path, use_cuda=(device == "cuda"))
+                self._piper_voice = self._load_voice()
             except Exception as e:
                 raise RuntimeError(f"Failed to load Piper Python API model: {e}")
 
@@ -115,8 +123,46 @@ class PiperEngine(BaseTTSEngine):
                     f"Install onnxruntime-gpu built for this GPU's compute capability "
                     f"(see requirements_gpu.txt), or run with --piper-device cpu."
                 )
+            threads = ("ONNX Runtime default, one pinned thread per core"
+                       if self._num_threads is None
+                       else f"{self._num_threads} unpinned threads")
             print(f"[INFO] Piper Python API loaded (model: {voice_path}, "
-                  f"provider: {providers[0]})")
+                  f"provider: {providers[0]}, {threads})")
+
+    def _load_voice(self):
+        """Load the voice, building the session ourselves when threads are set.
+
+        PiperVoice.load() passes a bare SessionOptions(), leaving
+        intra_op_num_threads at 0. ONNX Runtime then not only sizes the pool at
+        one thread per core but also pins each thread to a single core. On an
+        idle box that costs nothing. Under the load the first chunk actually
+        meets -- the LLM still streaming its later chunks -- a pinned thread
+        whose core is busy cannot migrate, and the whole inference waits for it:
+        the first chunk measured 226 ms pinned against 123 ms at 12 unpinned
+        threads, on 16 cores.
+
+        Setting any explicit count is what turns the pinning off; the count
+        itself is the second-order choice. Nothing here is CUDA's concern, where
+        the pool only feeds the GPU, so that path is left as it was.
+        """
+        use_cuda = self._device == "cuda"
+        if self._num_threads is None or use_cuda:
+            return PiperVoice.load(self._voice_path, use_cuda=use_cuda)
+
+        # PiperVoice.load() has no way to take session options, and calling it
+        # first would build -- and pin -- a throwaway pool before we replaced it.
+        with open(self._voice_path + ".json", "r", encoding="utf-8") as f:
+            config_dict = json.load(f)
+        sess_options = onnxruntime.SessionOptions()
+        sess_options.intra_op_num_threads = self._num_threads
+        return PiperVoice(
+            config=PiperConfig.from_dict(config_dict),
+            session=onnxruntime.InferenceSession(
+                self._voice_path,
+                sess_options=sess_options,
+                providers=["CPUExecutionProvider"],
+            ),
+        )
 
     @staticmethod
     def _preload_cuda_libraries() -> None:

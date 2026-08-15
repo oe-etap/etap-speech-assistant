@@ -1370,6 +1370,13 @@ def main():
                              "Defaults to the --mode preset. 'cuda' needs an onnxruntime-gpu "
                              "matching the GPU's compute capability, and is refused rather "
                              "than silently served from the CPU. Ignored with --piper-use-exe.")
+    parser.add_argument("--piper-num-threads", type=int, default=None,
+                        help="ONNX Runtime intra-op threads for the Piper voice model. "
+                             "Unset leaves ONNX Runtime its own default, which sizes the "
+                             "pool at one thread per core and pins each thread to a core; "
+                             "a pinned thread cannot move off a core the LLM is using, "
+                             "which costs about 100 ms on the first chunk. Any explicit "
+                             "count turns the pinning off. CPU only.")
     parser.add_argument("--coqui-voice", default="xtts_v2", help="Coqui voice model key")
     parser.add_argument("--coqui-language", default="en", help="Language code for Coqui")
     parser.add_argument("--coqui-speaker", default="Daisy Studious", help="Speaker id for Coqui")
@@ -1489,6 +1496,11 @@ def main():
         args.piper_device = "cuda" if args.mode == "gpu" else "cpu"
     if args.coqui_device is None:
         args.coqui_device = "cuda" if args.mode == "gpu" else "cpu"
+    if args.piper_num_threads is not None and args.piper_num_threads < 1:
+        # 0 is ONNX Runtime's own "pick for me", which is the pinned default
+        # this setting exists to get away from. Leaving it unset says that.
+        parser.error("--piper-num-threads must be at least 1; omit it to leave "
+                     "ONNX Runtime its default")
 
     # Any one-off setup cost happens here, before a stage is ever timed.
     start_gpu_monitor()
@@ -1536,6 +1548,7 @@ def main():
             exe_path=args.piper_exe,
             use_exe=args.piper_use_exe,
             device=args.piper_device,
+            num_threads=args.piper_num_threads,
         )
     elif args.tts_engine == "coqui":
         tts_engine = CoquiEngine(
