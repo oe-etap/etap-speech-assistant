@@ -75,15 +75,18 @@ _GPU_BLANK_STATS = {
 # thread so that readers need no lock. Unused while NVML is active.
 _gpu_stats = _GPU_BLANK_STATS
 
-# How often the nvidia-smi fallback refreshes its reading. A subprocess per
-# tick is what keeps this slow.
-GPU_SAMPLE_INTERVAL_S = 1.0
+# How often the sampler ticks, one constant per source since the two differ by
+# a factor of ten in what a reading costs. Whichever source is in use, the tick
+# extends the utilisation timeline; on the nvidia-smi path it also refreshes the
+# levels that path publishes.
+#
+# NVML costs under a millisecond a call. The driver produces one sample per
+# frame, about every 1/6 s, and holds them until they are collected, so this
+# only has to run often enough not to fall behind that.
+NVML_SAMPLE_INTERVAL_S = 0.1
 
-# How often the utilisation timeline is extended through NVML, which costs
-# under a millisecond a call. The driver produces one sample per frame, about
-# every 1/6 s, and holds them until they are collected, so this only has to run
-# often enough not to fall behind that.
-GPU_UTIL_SAMPLE_INTERVAL_S = 0.1
+# nvidia-smi is a subprocess per reading, which is what keeps this slow.
+NVIDIA_SMI_SAMPLE_INTERVAL_S = 1.0
 
 # Silence from the driver's per-process samples that means an idle device
 # rather than a collection that arrived between two frames.
@@ -589,15 +592,22 @@ class _GpuSampler(threading.Thread):
 
     def __init__(self, interval):
         super().__init__(daemon=True, name="gpu-sampler")
-        self._interval = interval
+        self.interval = interval
         self._stop_event = threading.Event()
 
     def run(self):
-        while not self._stop_event.wait(self._interval):
+        while not self._stop_event.wait(self.interval):
             _sample_gpu_util()
 
     def stop(self):
+        """Ask the thread to finish, and wait out the reading it may be taking.
+
+        The wait ends the moment the event is set, so what is left to wait for
+        is one reading -- a subprocess on the nvidia-smi path, which is the
+        source whose interval says how long that can take.
+        """
         self._stop_event.set()
+        self.join(timeout=self.interval * 2)
 
 
 _gpu_sampler = None
@@ -622,14 +632,14 @@ def start_gpu_monitor():
             pynvml.nvmlInit()
             _nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             _gpu_util_sampled = _supports_process_util()
-            interval = GPU_UTIL_SAMPLE_INTERVAL_S
+            interval = NVML_SAMPLE_INTERVAL_S
         except Exception:
             _nvml_handle = None
 
     if interval is None:
         if not _refresh_gpu_stats():
             return
-        interval = GPU_SAMPLE_INTERVAL_S
+        interval = NVIDIA_SMI_SAMPLE_INTERVAL_S
 
     # One reading before the thread starts, so that a window opened during the
     # first tick already has an integral to be measured against. The nvidia-smi
@@ -647,7 +657,6 @@ def stop_gpu_monitor():
     global _nvml_handle, _gpu_sampler, _gpu_util_sampled, _gpu_util_last_seen
     if _gpu_sampler is not None:
         _gpu_sampler.stop()
-        _gpu_sampler.join(timeout=GPU_SAMPLE_INTERVAL_S * 2)
         _gpu_sampler = None
     if _nvml_handle is not None:
         _nvml_handle = None
