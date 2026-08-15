@@ -74,8 +74,17 @@ _GPU_BLANK_STATS = {
 # thread so that readers need no lock. Unused while NVML is active.
 _gpu_stats = _GPU_BLANK_STATS
 
-# How often the nvidia-smi fallback refreshes its reading
+# How often the nvidia-smi fallback refreshes its reading. A subprocess per
+# tick is what keeps this slow.
 GPU_SAMPLE_INTERVAL_S = 1.0
+
+# How often utilisation is sampled through NVML, which costs 0.45 ms a reading
+# and so can run far faster than the nvidia-smi path. There is no point: the
+# driver advances its own counter about every 1/6 s on this card, so sampling
+# faster than that returns the same reading twice. This sits just inside that
+# period, which places a window's edges within one advance of where they were
+# opened and closed.
+GPU_UTIL_SAMPLE_INTERVAL_S = 0.1
 
 # How long to wait for the pipeline workers to drain before reading their metrics
 WORKER_SHUTDOWN_TIMEOUT_S = 10.0
@@ -362,11 +371,12 @@ def _nvml_value(read, default=""):
 
 
 def _read_gpu_stats_nvml():
-    """Read the GPU counters through NVML.
+    """Read the point-in-time GPU counters through NVML.
 
     NVML is an in-process library call rather than a subprocess, so this is
     cheap enough to run at a stage boundary. Fields the driver does not
-    support are blanked individually.
+    support are blanked individually. Utilisation is not among them: it
+    describes a span rather than an instant and is accumulated by the sampler.
     """
     stats = dict(_GPU_BLANK_STATS)
     handle = _nvml_handle
@@ -378,15 +388,12 @@ def _read_gpu_stats_nvml():
         name = name.decode("utf-8", errors="replace")
     stats["gpu_name"] = name
 
-    stats["gpu_util_percent"] = _nvml_value(
-        lambda: pynvml.nvmlDeviceGetUtilizationRates(handle).gpu)
-
     # NVML's original memory query defines `used` as total minus free, which
     # counts the framebuffer the driver reserves for itself -- 2192 MiB of the
     # 32 GB vGPU here, present with nothing running at all. nvidia-smi does not
-    # show that in its memory figure, so the two sources of this column
-    # disagreed by exactly that much until the v2 query, which reports the
-    # reservation separately, was preferred over it.
+    # show that in its memory figure, so the v2 query, which reports the
+    # reservation separately, is what keeps the two sources of this column
+    # agreeing.
     mem = None
     if hasattr(pynvml, "nvmlMemory_v2"):
         mem = _nvml_value(
@@ -429,23 +436,88 @@ def _refresh_gpu_stats():
         return False
 
 
-class _GpuSampler(threading.Thread):
-    """Background thread refreshing _gpu_stats every GPU_SAMPLE_INTERVAL_S.
+# Utilisation integrated over time, as (instant of the last reading, percent
+# seconds accumulated up to it, the reading in force since it). None until a
+# source produces its first reading, which is what leaves the column blank
+# rather than reporting the zero of a device nobody is watching. Rebound
+# wholesale by the sampler so that readers need no lock.
+_gpu_util_state = None
 
-    Used only on the nvidia-smi fallback path. Keeps the subprocess off the
-    measured pipeline: workers read the published dict instead of running
-    nvidia-smi themselves.
+
+def _accumulate_gpu_util(util):
+    """Fold one reading into the running integral of utilisation over time.
+
+    The reading is held constant until the next one arrives, which is the only
+    honest interpretation available: the driver reports a rolling average of
+    what has just happened, not an instantaneous rate.
+    """
+    global _gpu_util_state
+    try:
+        util = float(util)
+    except (TypeError, ValueError):
+        # A driver that will not supply the field keeps the previous reading
+        # rather than pulling the average towards a zero it never measured.
+        return
+    now = time.perf_counter()
+    if _gpu_util_state is None:
+        _gpu_util_state = (now, 0.0, util)
+        return
+    then, area, previous = _gpu_util_state
+    _gpu_util_state = (now, area + previous * (now - then), util)
+
+
+def _gpu_util_area(state):
+    """Where the integral stands right now, as (instant, percent seconds).
+
+    Carried forward from the last reading at that reading's value, so a window
+    is measured between the instants it was actually opened and closed and not
+    between the sampler ticks nearest to them. Takes the state it reads rather
+    than reaching for the global twice, which is what keeps the two halves of
+    the arithmetic from coming out of different readings.
+    """
+    now = time.perf_counter()
+    then, area, current = state
+    return now, area + current * max(0.0, now - then)
+
+
+def _sample_gpu_util():
+    """Take one reading from whichever source is active and fold it in.
+
+    On the nvidia-smi path this also refreshes the published levels, since that
+    source costs a subprocess and must stay away from the workers.
+    """
+    if _nvml_handle is not None:
+        util = _nvml_value(
+            lambda: pynvml.nvmlDeviceGetUtilizationRates(_nvml_handle).gpu)
+    else:
+        # A failed refresh keeps the previous reading.
+        _refresh_gpu_stats()
+        util = _gpu_stats["gpu_util_percent"]
+    _accumulate_gpu_util(util)
+
+
+class _GpuSampler(threading.Thread):
+    """Background thread keeping the utilisation integral fed.
+
+    Utilisation is the one GPU field that describes a span rather than an
+    instant: the driver reports its own rolling average over the last fraction
+    of a second, so reading it at a stage boundary describes whatever the card
+    was doing around that boundary, which for overlapping stages is a different
+    stage's work. Sampling it here, off the measured path, is what lets each row
+    report the mean over its own span instead.
+
+    On the nvidia-smi path the same tick also refreshes the published readings,
+    since that source costs a subprocess and must stay away from the workers.
     """
 
-    def __init__(self, interval=GPU_SAMPLE_INTERVAL_S):
+    def __init__(self, interval):
         super().__init__(daemon=True, name="gpu-sampler")
         self._interval = interval
         self._stop_event = threading.Event()
 
     def run(self):
         while not self._stop_event.wait(self._interval):
-            # A failed refresh keeps the previous reading.
-            _refresh_gpu_stats()
+            _sample_gpu_util()
 
     def stop(self):
         self._stop_event.set()
@@ -457,41 +529,55 @@ _gpu_sampler = None
 def start_gpu_monitor():
     """Begin collecting GPU statistics, preferring NVML over nvidia-smi.
 
-    NVML is read in process at each stage boundary. Where it is unavailable the
-    nvidia-smi fallback starts instead, kept fresh by a background thread.
-    Neither being usable leaves the GPU columns blank.
+    The point-in-time fields are read in process at each stage boundary where
+    NVML is available, and come from the sampler's published reading where the
+    nvidia-smi fallback is in use instead. Either way the sampler runs, since
+    utilisation has to be integrated over the stage rather than probed at its
+    end. Neither source being usable leaves the GPU columns blank.
     """
     global _nvml_handle, _gpu_sampler
-    if _nvml_handle is not None or _gpu_sampler is not None:
+    if _gpu_sampler is not None:
         return
 
+    interval = None
     if _HAS_PYNVML:
         try:
             pynvml.nvmlInit()
             _nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            return
+            interval = GPU_UTIL_SAMPLE_INTERVAL_S
         except Exception:
             _nvml_handle = None
 
-    if not _refresh_gpu_stats():
-        return
-    _gpu_sampler = _GpuSampler()
+    if interval is None:
+        if not _refresh_gpu_stats():
+            return
+        interval = GPU_SAMPLE_INTERVAL_S
+
+    # One reading before the thread starts, so that a window opened during the
+    # first tick already has an integral to be measured against. The nvidia-smi
+    # path would otherwise leave the first second of a run unmeasurable.
+    _sample_gpu_util()
+    _gpu_sampler = _GpuSampler(interval)
     _gpu_sampler.start()
 
 
 def stop_gpu_monitor():
-    """Release NVML and stop the nvidia-smi fallback thread."""
-    global _nvml_handle, _gpu_sampler
+    """Stop the sampler and release NVML.
+
+    In that order: the sampler reads the NVML handle on every tick.
+    """
+    global _nvml_handle, _gpu_sampler, _gpu_util_state
+    if _gpu_sampler is not None:
+        _gpu_sampler.stop()
+        _gpu_sampler.join(timeout=GPU_SAMPLE_INTERVAL_S * 2)
+        _gpu_sampler = None
     if _nvml_handle is not None:
         _nvml_handle = None
         try:
             pynvml.nvmlShutdown()
         except Exception:
             pass
-    if _gpu_sampler is not None:
-        _gpu_sampler.stop()
-        _gpu_sampler.join(timeout=GPU_SAMPLE_INTERVAL_S * 2)
-        _gpu_sampler = None
+    _gpu_util_state = None
 
 
 # The Ollama server holds the model in a runner subprocess of its own, so this
@@ -665,14 +751,22 @@ def read_llm_memory():
     return stats
 
 
+# Where each worker's utilisation window was opened, keyed by thread the way
+# psutil keys its own cpu_percent state, so that concurrent stages do not close
+# each other's windows.
+_stage_window = threading.local()
+
+
 def prime_cpu_percent():
-    """Open a CPU measurement window on the calling thread.
+    """Open the rate measurement windows on the calling thread.
 
     psutil.cpu_percent(interval=None) reports load since the calling thread's
-    own previous call, its state being keyed by thread id. Call this when a
-    stage starts; the snapshot taken when that stage ends then covers exactly
-    that stage.
+    own previous call, its state being keyed by thread id. GPU utilisation is
+    given the same treatment against the sampler's integral, so both columns
+    describe the same span. Call this when a stage starts; the snapshot taken
+    when that stage ends then covers exactly that stage.
     """
+    _open_gpu_util_window()
     if not _HAS_PSUTIL:
         return
     try:
@@ -681,14 +775,39 @@ def prime_cpu_percent():
         pass
 
 
+def _open_gpu_util_window():
+    """Mark where the calling thread's utilisation window starts."""
+    state = _gpu_util_state
+    _stage_window.gpu = None if state is None else _gpu_util_area(state)
+
+
+def _close_gpu_util_window():
+    """Mean utilisation since this thread's window opened, and reopen it.
+
+    Blank until a window has been open across at least one reading, which is
+    what a stage that ended before the sampler said anything reports rather
+    than a mean of nothing.
+    """
+    state = _gpu_util_state
+    if state is None:
+        return ""
+    opened = getattr(_stage_window, "gpu", None)
+    now, area = _gpu_util_area(state)
+    _stage_window.gpu = (now, area)
+    if opened is None or now <= opened[0]:
+        return ""
+    return round((area - opened[1]) / (now - opened[0]), 1)
+
+
 def collect_resource_snapshot():
     """Return the resource snapshot for the stage that has just finished.
 
     Call at a stage boundary, from the thread that ran the stage and opened its
-    window with prime_cpu_percent(); cpu_percent then covers that stage alone.
-    ram_percent and rss_mb are read directly, the GPU fields come from NVML or,
-    where that is unavailable, from the background nvidia-smi sampler. Missing
-    psutil/NVML/nvidia-smi leaves blanks.
+    window with prime_cpu_percent(). cpu_percent and gpu_util_percent then cover
+    that stage alone, and both windows reopen for whatever the thread measures
+    next. ram_percent and rss_mb are read directly, and so are the remaining GPU
+    fields, from NVML or, where that is unavailable, from the sampler's latest
+    nvidia-smi reading. Missing psutil/NVML/nvidia-smi leaves blanks.
 
     rss_mb covers this process alone, which is the pipeline without its LLM: the
     model lives in the Ollama server's runner and is accounted for separately by
@@ -714,6 +833,8 @@ def collect_resource_snapshot():
         stats.update(_read_gpu_stats_nvml())
     else:
         stats.update(_gpu_stats)
+    # Last, since it is the one GPU field the sources above do not carry.
+    stats["gpu_util_percent"] = _close_gpu_util_window()
     return stats
 
 
