@@ -164,7 +164,10 @@ class OllamaEngine:
     def __init__(self, model: str, url: str, system_prompt: str = None,
                  stop_tokens: list = None, max_tokens: int = 150,
                  temperature: float = 0.7, seed: int = None,
-                 chunk_max_chars: int = DEFAULT_CHUNK_MAX_CHARS):
+                 chunk_max_chars: int = DEFAULT_CHUNK_MAX_CHARS,
+                 num_ctx: int = None, keep_alive: str = None,
+                 num_gpu: int = None, num_batch: int = None,
+                 num_thread: int = None):
         """Initialize the Ollama engine.
 
         Args:
@@ -178,6 +181,19 @@ class OllamaEngine:
                 reproducible, which is what an A/B comparison needs: response
                 length varies enough between runs to hide the effect under test.
             chunk_max_chars: Safety-net chunk length passed to TextChunker.
+            num_ctx: KV cache size in tokens. None follows the server default,
+                which is chosen from the amount of VRAM present and is far
+                larger than a single-turn exchange needs.
+            keep_alive: How long the server holds the model in VRAM after a
+                request, in Ollama's duration syntax ("30m", "-1" for forever).
+                None follows the server default of 5 minutes.
+            num_gpu: Layers to offload to the GPU. None lets the server fit the
+                model itself; 99 forces every layer, turning a model that does
+                not fit into a loud failure instead of a quiet CPU spill.
+            num_batch: Prompt-processing batch size. None follows the server.
+            num_thread: CPU threads for the runner. None follows the server,
+                which takes one per core and so competes with the STT and TTS
+                stages for them.
         """
         self._model = model
         self._url = url
@@ -187,9 +203,75 @@ class OllamaEngine:
         self._temperature = temperature
         self._seed = seed
         self._chunk_max_chars = chunk_max_chars
+        self._num_ctx = num_ctx
+        self._keep_alive = keep_alive
+        self._num_gpu = num_gpu
+        self._num_batch = num_batch
+        self._num_thread = num_thread
         self._session = requests.Session()
         self._current_response = None
         self._cancel_requested = False
+
+    def _runner_options(self) -> dict:
+        """Return the options that decide how the model is loaded.
+
+        These reach llama-server as command line flags, so the server has no way
+        to change one without tearing the model down and loading it again. Every
+        request the engine sends therefore carries the same set, warmup included;
+        a warmup that omitted them would load the model under the server's defaults
+        and move the reload into the first utterance of the run, which is the outlier
+        warmup() exists to prevent.
+        """
+        options = {}
+        if self._num_ctx is not None:
+            options["num_ctx"] = self._num_ctx
+        if self._num_gpu is not None:
+            options["num_gpu"] = self._num_gpu
+        if self._num_batch is not None:
+            options["num_batch"] = self._num_batch
+        if self._num_thread is not None:
+            options["num_thread"] = self._num_thread
+        return options
+
+    def _build_request(self, prompt: str, options: dict, stream: bool) -> dict:
+        """Assemble a request body, folding in the load-time options."""
+        body = {
+            "model": self._model,
+            "prompt": prompt,
+            "stream": stream,
+            "options": {**self._runner_options(), **options},
+        }
+        if self._keep_alive is not None:
+            body["keep_alive"] = self._keep_alive
+        return body
+
+    def placement(self) -> dict:
+        """Report how the loaded model is split between GPU and CPU.
+
+        Returns a dict with "vram_fraction", "size_bytes" and "size_vram_bytes",
+        or None when the server cannot be asked or is not holding this model.
+
+        Worth checking because a model that does not fit is not an error to
+        Ollama: it silently runs the overflowing layers on the CPU. That is a run
+        whose numbers describe a configuration nobody meant to measure, and nothing in the response says so.
+        """
+        try:
+            base = self._url.rsplit("/api/", 1)[0]
+            r = self._session.get(f"{base}/api/ps", timeout=10)
+            r.raise_for_status()
+            for entry in r.json().get("models", []):
+                if entry.get("name") != self._model and entry.get("model") != self._model:
+                    continue
+                size = entry.get("size", 0)
+                size_vram = entry.get("size_vram", 0)
+                return {
+                    "size_bytes": size,
+                    "size_vram_bytes": size_vram,
+                    "vram_fraction": (size_vram / size) if size else 0.0,
+                }
+        except Exception:
+            return None
+        return None
 
     def _build_prompt(self, user_text: str) -> str:
         """Wrap the recognized text in the framing the model is asked to answer.
@@ -212,13 +294,17 @@ class OllamaEngine:
         be: only its own words are new. Without it the first request pays to
         evaluate the whole system prompt, which shows up as an outlier several
         times the size of every other measurement in the run.
+
+        The load-time options travel with it for the same reason; see
+        _runner_options().
         """
         try:
-            self._session.post(self._url, json={
-                "model": self._model,
-                "prompt": self._build_prompt(""),
-                "options": {"num_predict": 1}
-            }, timeout=120)
+            self._session.post(
+                self._url,
+                json=self._build_request(self._build_prompt(""),
+                                         {"num_predict": 1}, stream=False),
+                timeout=120,
+            )
         except Exception as e:
             print(f"[WARN] Failed to warmup Ollama: {e}")
 
@@ -281,12 +367,11 @@ class OllamaEngine:
             if self._seed is not None:
                 options["seed"] = self._seed
 
-            r = self._session.post(self._url, json={
-                "model": self._model,
-                "prompt": prompt,
-                "stream": True,
-                "options": options,
-            }, stream=True, timeout=120)
+            r = self._session.post(
+                self._url,
+                json=self._build_request(prompt, options, stream=True),
+                stream=True, timeout=120,
+            )
             # Assign before raise_for_status() so cancel() can close a response
             # that is still starting up.
             self._current_response = r
