@@ -97,6 +97,30 @@ piper-use-exe: false
 # on the CPU instead; that is refused here rather than logged as a GPU run.
 piper-device: cpu
 
+# ONNX Runtime intra-op threads for the Piper voice model, on CPU.
+#
+# Piper is already parallel without this: left alone, ONNX Runtime sizes the
+# pool at one thread per core -- 15 here, and `tts_first_chunk` runs the box at
+# 93% CPU. What it also does, and only when the count is left at its default, is
+# pin each of those threads to a single core.
+#
+# On an idle box the pinning costs nothing. The first chunk is not synthesized on
+# an idle box: the LLM is still generating the rest of the answer underneath it,
+# and a pinned thread whose core is busy cannot migrate, so the inference waits
+# for its slowest thread. Measured under a streaming phi3:mini, first chunk
+# averaged over the four basic files: 226 ms pinned, 170 ms at 16 unpinned
+# threads, 123 ms at 12. Idle, the same three are within 2 ms of each other --
+# which is why this never showed up in a microbenchmark.
+#
+# Setting any explicit count is what turns the pinning off; the count is the
+# smaller half of the win. 12 is three quarters of this box's 16 cores, leaving
+# room for the LLM's streaming thread and the STT. On a different core count,
+# scale it rather than keeping 12 -- and re-measure under load, not idle.
+#
+# Unset leaves ONNX Runtime its default, pinning included. Ignored on cuda,
+# where the pool only feeds the GPU.
+piper-num-threads: 12
+
 coqui-voice: "xtts_v2"
 coqui-language: "en"
 coqui-speaker: "Daisy Studious"

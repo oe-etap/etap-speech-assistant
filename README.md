@@ -166,6 +166,7 @@ Engines:
 - `--piper-voice PATH`: English Piper `.onnx` voice
 - `--piper-use-exe`: call the Piper CLI instead of the Python API (slower, spawns a subprocess per chunk)
 - `--piper-device {cpu,cuda}`: execution provider for the Piper voice model, following `--mode` when unset. What it buys depends on how long the chunk is, and on the four sample recordings it did not move `ttfa` outside the noise; see [Piper on the GPU](#piper-on-the-gpu)
+- `--piper-num-threads N`: ONNX Runtime intra-op threads for the voice model, default `12` in `default_config.yaml` and unset on the command line. Piper is already parallel without it; what setting it does is stop ONNX Runtime pinning each thread to a core, worth 122 ms of `tts_first_chunk`. CPU only; see [Piper's threads on the CPU](#pipers-threads-on-the-cpu)
 - `--coqui-voice NAME`: default `xtts_v2`
 - `--coqui-language CODE`: default `en`
 - `--coqui-speaker NAME`: default `Daisy Studious`
@@ -507,6 +508,99 @@ The setting applies only to file input with realtime pacing. Mic mode always tri
 
 Under `endpoint`, a second end-of-speech signal within one input carries **everything recognized so far**, not just the new sentence, and supersedes the answer already in flight. An endpointer that fires while the speaker is only drawing breath would otherwise have the LLM answer half a sentence. Note that this is not conversation memory: each request to Ollama is independent, carries no `context` and no message history, and the assistant's own previous replies are never fed back.
 
+### Piper's threads on the CPU
+
+Piper on the CPU is already parallel, and nothing had to be done to make it so.
+`PiperVoice.load()` hands ONNX Runtime a bare `SessionOptions()`, which leaves
+`intra_op_num_threads` at 0, and ONNX Runtime reads that as one thread per core:
+a **15-thread pool** on this 16-core box, running the machine at **93.9% CPU**
+through `tts_first_chunk`. Nothing in the environment caps it — no
+`OMP_NUM_THREADS`, no affinity mask on the process.
+
+Nor is there room above that. Forcing the count on an idle box, mean over the
+four first chunks of the basic recordings, median of nine each:
+
+| intra-op threads | first chunk |
+|---|---|
+| 2 | 233 ms |
+| 4 | 165 ms |
+| 8 | 138 ms |
+| 12 | 127 ms |
+| 16 | 120 ms |
+| default | 121 ms |
+
+Sixteen cores buy 1.9x. Why the scaling is that sublinear was not investigated;
+what matters here is that the default already sits at the top of the curve, so
+there is no thread count above it left to ask for.
+
+**What the default does that is worth changing is not the count. It is that
+leaving the count unset also pins each thread to one core.** Read the pool's
+affinity masks and the two cases are plainly different: unset gives fifteen
+threads whose `Cpus_allowed_list` reads `1`, `2`, `3` … one core apiece, fifteen
+distinct masks. Ask for 16 and the pool is the same fifteen threads, every one
+of them listing `0-15`; ask for 12 and it is eleven threads, likewise `0-15`.
+
+Pinning is free on an idle box, which is why the table above shows nothing. The
+first chunk is never synthesized on an idle box: the LLM is still generating the
+rest of the answer underneath it. A pinned thread whose core is busy cannot
+migrate, and the inference waits for its slowest thread. Under a streaming
+phi3:mini, ten alternating passes of nine repetitions, one process per
+condition so no other pool is alive during a measurement:
+
+| intra-op threads | first chunk under load | idle |
+|---|---|---|
+| default (pinned) | 226 ms | 121 ms |
+| 16 (unpinned) | 170 ms | 120 ms |
+| 12 (unpinned) | **123 ms** | 127 ms |
+
+The three idle figures are within 7 ms of each other. That is why this never
+showed up in a microbenchmark, and it is the reason the section exists: the
+stage is only ever run in the condition the microbenchmark does not reproduce.
+
+Spinning is not the mechanism, though it looks like a candidate. Setting
+`session.intra_op.allow_spinning` to 0 converges all three conditions to about
+200 ms, so the 12-thread result *depends* on spinning rather than suffering from
+it — a spinning thread that can migrate finds an idle core, and a pinned one
+spins on a core it cannot leave.
+
+#### What the threads come to end to end
+
+Four recordings, one run each, `piper-num-threads` unset against 12. Unusually,
+these two runs **are** paired: Ollama returned byte-identical answers on all four
+recordings, so the TTS was handed the same text both times and
+`tts_first_chunk` is a controlled comparison rather than the hazard described in
+[What this measurement cannot tell you](#what-this-measurement-cannot-tell-you).
+
+| recording | first chunk | default (pinned) | 12 threads |
+|---|---|---|---|
+| 1 | 69 chars | 385 ms | **308 ms** |
+| 2 | 46 chars | 317 ms | **178 ms** |
+| 3 | 28 chars | 307 ms | **201 ms** |
+| 4 | 39 chars | 259 ms | **137 ms** |
+| **`tts_first_chunk`** (p50) | | **312 ms** | **190 ms** |
+| **`ttfa`** (p50) | | **1566 ms** | **1463 ms** |
+
+Every recording improved, by 77 to 139 ms. `ttfa` improved on three of the four;
+recording 3 went the other way by 65 ms because its `llm_ttfc` jumped 175 ms in
+the second run, which is ordinary LLM variance and not something the TTS did —
+its own first chunk still fell 106 ms. `stt_endpoint_delay` moved by 2 ms or
+less on every recording, as it should have.
+
+CPU through the stage falls from **93.9% to 79.7%**, so this is faster *and*
+leaves more of the machine alone. That matters more than it looks: the pinned
+pool's real cost is that it will not yield a core to the LLM's streaming thread
+or to the STT, and mic mode with barge-in has the STT decoding throughout.
+
+Four recordings and one run each, so read `ttfa` as roughly 100 ms rather than
+as 103. The `tts_first_chunk` result is firmer — it moved the same way on 4 of 4
+recordings with identical input text, and the isolated benchmark above predicted
+the size of it from a different direction.
+
+`12` is three quarters of this box's 16 cores, chosen to leave room for the
+LLM's streaming thread and the STT. On a different core count, scale it rather
+than keeping the number, and re-measure under load — an idle sweep will report
+that it does not matter.
+
 ### Piper on the GPU
 
 Piper is a VITS model in ONNX, so `--piper-device cuda` moves it to the
@@ -652,9 +746,18 @@ improving 16% per second of speech produced. And the spread of
 critical path, a predictable 260 ms may be worth more than something averaging
 342 ms and reaching 462.
 
-The setting that would actually move `ttfa` is not the device. It is the length
-of the first chunk, which `short-opener.txt` and `--tts-chunk-max-chars` already
-control, and which the CPU is better at.
+Two settings would actually move `ttfa`, and neither is the device. One is the
+length of the first chunk, which `short-opener.txt` and `--tts-chunk-max-chars`
+already control, and which the CPU is better at. The other is
+`--piper-num-threads`, which took 122 ms off `tts_first_chunk` on the CPU
+without touching the GPU at all; see [Piper's threads on the
+CPU](#pipers-threads-on-the-cpu).
+
+Every CPU figure in this section was measured with the threads left at the
+pinned default, so the CPU column here is the slower of the two CPU
+configurations. The device comparison has not been re-run against
+`--piper-num-threads 12`, and on the shorter chunks — the ones `ttfa` waits on —
+it would narrow.
 
 ### Coqui XTTS-v2
 
