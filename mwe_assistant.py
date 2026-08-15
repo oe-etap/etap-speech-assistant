@@ -13,8 +13,10 @@ CPU/RAM/GPU snapshots.
 """
 
 import argparse
+import collections
 import csv
 import queue
+import socket
 import threading
 import yaml
 import json
@@ -25,6 +27,7 @@ import time
 import wave
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import soundfile as sf
 try:
@@ -72,8 +75,27 @@ _GPU_BLANK_STATS = {
 # thread so that readers need no lock. Unused while NVML is active.
 _gpu_stats = _GPU_BLANK_STATS
 
-# How often the nvidia-smi fallback refreshes its reading
-GPU_SAMPLE_INTERVAL_S = 1.0
+# How often the sampler ticks, one constant per source since the two differ by
+# a factor of ten in what a reading costs. Whichever source is in use, the tick
+# extends the utilisation timeline; on the nvidia-smi path it also refreshes the
+# levels that path publishes.
+#
+# NVML costs under a millisecond a call. The driver produces one sample per
+# frame, about every 1/6 s, and holds them until they are collected, so this
+# only has to run often enough not to fall behind that.
+NVML_SAMPLE_INTERVAL_S = 0.1
+
+# nvidia-smi is a subprocess per reading, which is what keeps this slow.
+NVIDIA_SMI_SAMPLE_INTERVAL_S = 1.0
+
+# Silence from the driver's per-process samples that means an idle device
+# rather than a collection that arrived between two frames.
+GPU_UTIL_IDLE_GAP_S = 0.5
+
+# How much of the timeline to keep. At the driver's rate this is over an hour,
+# which covers any window a run asks about -- including e2e_response_ready,
+# which spans the whole session on a microphone.
+GPU_UTIL_HISTORY_SAMPLES = 30000
 
 # How long to wait for the pipeline workers to drain before reading their metrics
 WORKER_SHUTDOWN_TIMEOUT_S = 10.0
@@ -360,11 +382,12 @@ def _nvml_value(read, default=""):
 
 
 def _read_gpu_stats_nvml():
-    """Read the GPU counters through NVML.
+    """Read the point-in-time GPU counters through NVML.
 
     NVML is an in-process library call rather than a subprocess, so this is
     cheap enough to run at a stage boundary. Fields the driver does not
-    support are blanked individually.
+    support are blanked individually. Utilisation is not among them: it
+    describes a span rather than an instant and is accumulated by the sampler.
     """
     stats = dict(_GPU_BLANK_STATS)
     handle = _nvml_handle
@@ -376,10 +399,18 @@ def _read_gpu_stats_nvml():
         name = name.decode("utf-8", errors="replace")
     stats["gpu_name"] = name
 
-    stats["gpu_util_percent"] = _nvml_value(
-        lambda: pynvml.nvmlDeviceGetUtilizationRates(handle).gpu)
-
-    mem = _nvml_value(lambda: pynvml.nvmlDeviceGetMemoryInfo(handle), None)
+    # NVML's original memory query defines `used` as total minus free, which
+    # counts the framebuffer the driver reserves for itself -- 2192 MiB of the
+    # 32 GB vGPU here, present with nothing running at all. nvidia-smi does not
+    # show that in its memory figure, so the v2 query, which reports the
+    # reservation separately, is what keeps the two sources of this column
+    # agreeing.
+    mem = None
+    if hasattr(pynvml, "nvmlMemory_v2"):
+        mem = _nvml_value(
+            lambda: pynvml.nvmlDeviceGetMemoryInfo(handle, version=pynvml.nvmlMemory_v2), None)
+    if mem is None:
+        mem = _nvml_value(lambda: pynvml.nvmlDeviceGetMemoryInfo(handle), None)
     if mem is not None:
         stats["gpu_mem_used_mb"] = round(mem.used / (1024 * 1024))
         stats["gpu_mem_total_mb"] = round(mem.total / (1024 * 1024))
@@ -416,26 +447,167 @@ def _refresh_gpu_stats():
         return False
 
 
-class _GpuSampler(threading.Thread):
-    """Background thread refreshing _gpu_stats every GPU_SAMPLE_INTERVAL_S.
+# The utilisation timeline, as (instant on this process's clock, percent). Each
+# sample describes the interval ending at its instant, which is how the driver
+# spaces its own. Appended by the sampler and read whole under the lock, since
+# a deque being appended to cannot be iterated safely.
+_gpu_util_samples = collections.deque(maxlen=GPU_UTIL_HISTORY_SAMPLES)
+_gpu_util_lock = threading.Lock()
 
-    Used only on the nvidia-smi fallback path. Keeps the subprocess off the
-    measured pipeline: workers read the published dict instead of running
-    nvidia-smi themselves.
+# The newest driver timestamp already collected, in the driver's own epoch
+# microseconds. Only the sampler touches it.
+_gpu_util_last_seen = 0
+
+# Whether the driver will hand over its per-process samples, decided once at
+# startup. Where it will not, the sampler falls back to the utilisation counter,
+# which is a rolling average and carries the lag that goes with it.
+_gpu_util_sampled = False
+
+
+def _add_gpu_util_sample(instant, util):
+    """Append one point of the timeline, dropping what will not convert."""
+    try:
+        util = float(util)
+    except (TypeError, ValueError):
+        return
+    with _gpu_util_lock:
+        _gpu_util_samples.append((instant, util))
+
+
+def _sample_process_util():
+    """Collect the driver's own timestamped samples since the last collection.
+
+    These are what makes a stage's figure describe that stage. The samples are
+    stamped by the driver at the instant the work happened, arrive within a
+    frame of it, and stop as soon as it does -- where the utilisation counter
+    reports a rolling average that starts late, outlives the work by seconds and
+    so lands on whichever stage happens to be running by then.
+
+    Utilisation is reported per process. Summing across them gives the device,
+    which is what this column has always described.
+    """
+    global _gpu_util_last_seen
+    wall, perf = time.time(), time.perf_counter()
+    try:
+        samples = pynvml.nvmlDeviceGetProcessUtilization(_nvml_handle, _gpu_util_last_seen)
+    except pynvml.NVMLError:
+        # Nothing new, which between two frames means nothing yet and over a
+        # longer silence means nothing at all: the driver emits a sample every
+        # frame for as long as any process holds a context. An empty timeline is
+        # the same answer at the start of a run, before anything has loaded.
+        if not _gpu_util_samples or perf - _gpu_util_samples[-1][0] > GPU_UTIL_IDLE_GAP_S:
+            _add_gpu_util_sample(perf, 0.0)
+        return
+
+    totals = {}
+    for sample in samples:
+        if sample.timeStamp > _gpu_util_last_seen:
+            totals[sample.timeStamp] = totals.get(sample.timeStamp, 0) + sample.smUtil
+    if not totals:
+        return
+    _gpu_util_last_seen = max(totals)
+    for stamp in sorted(totals):
+        # The driver stamps these against the wall clock; the windows they are
+        # measured into are on the monotonic one.
+        _add_gpu_util_sample(perf + (stamp / 1e6 - wall), min(100.0, totals[stamp]))
+
+
+def _supports_process_util():
+    """Whether the driver will hand over per-process utilisation samples.
+
+    'Not found' is the answer for a device with nothing running on it, which
+    says nothing about support and is why it counts as a yes here: a run asks
+    this before its own models are loaded. A driver without the feature reports
+    it as unsupported instead.
+    """
+    try:
+        pynvml.nvmlDeviceGetProcessUtilization(_nvml_handle, 0)
+    except pynvml.NVMLError as e:
+        return getattr(e, "value", None) == pynvml.NVML_ERROR_NOT_FOUND
+    except Exception:
+        return False
+    return True
+
+
+def _sample_gpu_util():
+    """Extend the timeline from whichever source is available.
+
+    On the nvidia-smi path this also refreshes the published levels, since that
+    source costs a subprocess and must stay away from the workers.
+    """
+    if _gpu_util_sampled:
+        _sample_process_util()
+    elif _nvml_handle is not None:
+        _add_gpu_util_sample(time.perf_counter(), _nvml_value(
+            lambda: pynvml.nvmlDeviceGetUtilizationRates(_nvml_handle).gpu))
+    else:
+        # A failed refresh keeps the previous reading.
+        _refresh_gpu_stats()
+        _add_gpu_util_sample(time.perf_counter(), _gpu_stats["gpu_util_percent"])
+
+
+def gpu_util_over(window):
+    """Mean utilisation across a stage, from the samples covering it.
+
+    window is the (start, end) the stage was measured between. Each sample
+    counts for the part of its own interval that falls inside, so the figure is
+    an average over time rather than over samples.
+
+    Blank where the window is not covered: before the sampler's first reading,
+    or where it reaches further back than the retained timeline. The tail of a
+    window can outrun the samples by up to one frame, the last of them arriving
+    after the stage they describe has ended; the mean then covers the part that
+    was reported, which is the whole stage bar that frame.
+    """
+    if not window:
+        return ""
+    start, end = window
+    with _gpu_util_lock:
+        samples = list(_gpu_util_samples)
+    if len(samples) < 2 or samples[0][0] > start:
+        return ""
+
+    total, covered = 0.0, 0.0
+    for (opened, _), (closed, util) in zip(samples, samples[1:]):
+        overlap = min(closed, end) - max(opened, start)
+        if overlap > 0:
+            total += util * overlap
+            covered += overlap
+    return round(total / covered, 1) if covered > 0 else ""
+
+
+class _GpuSampler(threading.Thread):
+    """Background thread keeping the utilisation integral fed.
+
+    Utilisation is the one GPU field that describes a span rather than an
+    instant: the driver reports its own rolling average over the last fraction
+    of a second, so reading it at a stage boundary describes whatever the card
+    was doing around that boundary, which for overlapping stages is a different
+    stage's work. Sampling it here, off the measured path, is what lets each row
+    report the mean over its own span instead.
+
+    On the nvidia-smi path the same tick also refreshes the published readings,
+    since that source costs a subprocess and must stay away from the workers.
     """
 
-    def __init__(self, interval=GPU_SAMPLE_INTERVAL_S):
+    def __init__(self, interval):
         super().__init__(daemon=True, name="gpu-sampler")
-        self._interval = interval
+        self.interval = interval
         self._stop_event = threading.Event()
 
     def run(self):
-        while not self._stop_event.wait(self._interval):
-            # A failed refresh keeps the previous reading.
-            _refresh_gpu_stats()
+        while not self._stop_event.wait(self.interval):
+            _sample_gpu_util()
 
     def stop(self):
+        """Ask the thread to finish, and wait out the reading it may be taking.
+
+        The wait ends the moment the event is set, so what is left to wait for
+        is one reading -- a subprocess on the nvidia-smi path, which is the
+        source whose interval says how long that can take.
+        """
         self._stop_event.set()
+        self.join(timeout=self.interval * 2)
 
 
 _gpu_sampler = None
@@ -444,51 +616,247 @@ _gpu_sampler = None
 def start_gpu_monitor():
     """Begin collecting GPU statistics, preferring NVML over nvidia-smi.
 
-    NVML is read in process at each stage boundary. Where it is unavailable the
-    nvidia-smi fallback starts instead, kept fresh by a background thread.
-    Neither being usable leaves the GPU columns blank.
+    The point-in-time fields are read in process at each stage boundary where
+    NVML is available, and come from the sampler's published reading where the
+    nvidia-smi fallback is in use instead. Either way the sampler runs, since
+    utilisation has to be integrated over the stage rather than probed at its
+    end. Neither source being usable leaves the GPU columns blank.
     """
-    global _nvml_handle, _gpu_sampler
-    if _nvml_handle is not None or _gpu_sampler is not None:
+    global _nvml_handle, _gpu_sampler, _gpu_util_sampled
+    if _gpu_sampler is not None:
         return
 
+    interval = None
     if _HAS_PYNVML:
         try:
             pynvml.nvmlInit()
             _nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            return
+            _gpu_util_sampled = _supports_process_util()
+            interval = NVML_SAMPLE_INTERVAL_S
         except Exception:
             _nvml_handle = None
 
-    if not _refresh_gpu_stats():
-        return
-    _gpu_sampler = _GpuSampler()
+    if interval is None:
+        if not _refresh_gpu_stats():
+            return
+        interval = NVIDIA_SMI_SAMPLE_INTERVAL_S
+
+    # One reading before the thread starts, so that a window opened during the
+    # first tick already has an integral to be measured against. The nvidia-smi
+    # path would otherwise leave the first second of a run unmeasurable.
+    _sample_gpu_util()
+    _gpu_sampler = _GpuSampler(interval)
     _gpu_sampler.start()
 
 
 def stop_gpu_monitor():
-    """Release NVML and stop the nvidia-smi fallback thread."""
-    global _nvml_handle, _gpu_sampler
+    """Stop the sampler and release NVML.
+
+    In that order: the sampler reads the NVML handle on every tick.
+    """
+    global _nvml_handle, _gpu_sampler, _gpu_util_sampled, _gpu_util_last_seen
+    if _gpu_sampler is not None:
+        _gpu_sampler.stop()
+        _gpu_sampler = None
     if _nvml_handle is not None:
         _nvml_handle = None
         try:
             pynvml.nvmlShutdown()
         except Exception:
             pass
-    if _gpu_sampler is not None:
-        _gpu_sampler.stop()
-        _gpu_sampler.join(timeout=GPU_SAMPLE_INTERVAL_S * 2)
-        _gpu_sampler = None
+    _gpu_util_sampled = False
+    _gpu_util_last_seen = 0
+    with _gpu_util_lock:
+        _gpu_util_samples.clear()
+
+
+# The Ollama server holds the model in a runner subprocess of its own, so this
+# process's RSS says nothing about what the LLM costs: on a CPU run the weights
+# are the largest allocation on the machine and not one page of them appears in
+# rss_mb. These are handles on the server and its runners, kept between
+# snapshots so that a reading is a few /proc reads rather than a process scan.
+# Rebound wholesale rather than mutated, so the workers reading them need no
+# lock, as with _gpu_stats above.
+_llm_procs = []
+
+# Whether the configured server is on this machine, and so has a process here
+# to be measured at all
+_llm_local = False
+
+# When _llm_procs was last rebuilt, and how often that may be retried while the
+# set looks incomplete
+_llm_procs_scanned_at = 0.0
+LLM_PROC_RESCAN_S = 1.0
+
+# What Ollama says the loaded model itself occupies on the GPU. Read once at
+# startup: /api/ps is an HTTP round trip and has no business on a stage
+# boundary. It is the smaller of the two VRAM figures -- see _read_llm_vram_mb.
+_llm_model_vram_mb = ""
+
+
+def _is_local_url(url):
+    """Whether the URL addresses this machine, and so a process we could find."""
+    host = (urlparse(url).hostname or "").lower()
+    if host in ("", "localhost", "::1", "0.0.0.0"):
+        return True
+    return host.startswith("127.") or host == socket.gethostname().lower()
+
+
+def _find_ollama_server():
+    """Return the local `ollama serve` process, or None where it is not unambiguous.
+
+    A scan of every process, which is why this is kept away from the stage
+    boundaries. The listening port would identify the server exactly and cannot
+    be used: mapping a socket to the process holding it needs read access to
+    that process's descriptors, and the packaged service runs as its own user.
+    More than one server is therefore indistinguishable, and reporting the
+    memory of the wrong one is worse than reporting none.
+    """
+    servers = []
+    for proc in psutil.process_iter(["name", "cmdline"]):
+        cmdline = proc.info["cmdline"] or []
+        if len(cmdline) < 2 or cmdline[1] != "serve":
+            continue
+        if (proc.info["name"] or "").lower() != "ollama" and os.path.basename(cmdline[0]) != "ollama":
+            continue
+        servers.append(proc)
+    return servers[0] if len(servers) == 1 else None
+
+
+def _rebuild_llm_procs():
+    """Find the Ollama server and the runner processes holding the model."""
+    global _llm_procs, _llm_procs_scanned_at
+    _llm_procs_scanned_at = time.monotonic()
+    server = _find_ollama_server()
+    if server is None:
+        _llm_procs = []
+        return
+    try:
+        _llm_procs = [server, *server.children(recursive=True)]
+    except psutil.Error:
+        _llm_procs = []
+
+
+def _sum_llm_rss():
+    """Total RSS over the cached handles, forgetting the ones that have died.
+
+    Returns (bytes, processes read). Summing across processes counts pages
+    shared between them twice; the server is tens of MB against a runner's
+    gigabytes, and the figure that would not double count -- PSS -- needs the
+    ptrace access the packaged service does not grant to the user running this.
+    """
+    global _llm_procs
+    total, alive = 0, []
+    for proc in _llm_procs:
+        try:
+            total += proc.memory_info().rss
+            alive.append(proc)
+        except psutil.Error:
+            pass
+    _llm_procs = alive
+    return total, len(alive)
+
+
+def start_llm_memory_monitor(url, placement):
+    """Begin accounting for the memory the LLM holds outside this process.
+
+    Call once the model is loaded: the runner holding the weights is started by
+    the first request, so before warmup() there is nothing there to find.
+    placement is report_llm_placement()'s reading of /api/ps, or None where the
+    server could not be asked.
+    """
+    global _llm_local, _llm_model_vram_mb
+    if placement is not None:
+        _llm_model_vram_mb = round(placement["size_vram_bytes"] / (1024 * 1024))
+    _llm_local = _HAS_PSUTIL and _is_local_url(url)
+    if not _llm_local:
+        return
+    _rebuild_llm_procs()
+    if not _llm_procs:
+        print("[WARN] No single local 'ollama serve' process to attribute memory "
+              "to; llm_rss_mb will be blank")
+    elif len(_llm_procs) < 2:
+        # The server on its own, with no runner under it -- which is what a
+        # server inside a container looks like from out here, its children
+        # living in a pid namespace of their own.
+        print("[WARN] Found the Ollama server but no runner beneath it; "
+              "llm_rss_mb will not account for the model")
+
+
+def _read_llm_vram_mb():
+    """GPU memory the driver attributes to the LLM's processes.
+
+    Read from NVML over the same pids llm_rss_mb sums, so the two describe the
+    same processes. This is the larger of the two VRAM figures and the one
+    nvidia-smi shows: a runner that has loaded a 2467 MiB model appears here at
+    2992 MiB, the difference being the CUDA context, the kernels and the
+    libraries the runtime brings with it. llm_model_vram_mb carries what Ollama
+    says the model alone occupies, which is what decides whether it fits.
+
+    Blank where NVML is not the source of the GPU columns, or where the driver
+    will not attribute memory per process -- which happens on some cards and
+    under some virtualization, and cannot be told apart from an idle GPU.
+    """
+    if _nvml_handle is None:
+        return ""
+    procs = _nvml_value(lambda: pynvml.nvmlDeviceGetComputeRunningProcesses(_nvml_handle), None)
+    if not procs:
+        return ""
+    pids = {proc.pid for proc in _llm_procs}
+    ours = [proc for proc in procs if proc.pid in pids]
+    if any(proc.usedGpuMemory is None for proc in ours):
+        return ""
+    # No entry for our pids is a model that is not on the GPU at all, which is
+    # zero rather than unknown: the driver answered, and did not name them.
+    return round(sum(proc.usedGpuMemory for proc in ours) / (1024 * 1024))
+
+
+def read_llm_memory():
+    """What the LLM holds, in host RAM and on the GPU, as snapshot fields.
+
+    llm_rss_mb covers the Ollama server and the runners holding the model, and
+    is blank where the server is not on this machine or no process here could be
+    identified as it.
+    """
+    stats = {
+        "llm_rss_mb": "",
+        "llm_vram_mb": "",
+        "llm_model_vram_mb": _llm_model_vram_mb,
+    }
+    if not _llm_local:
+        return stats
+
+    total, alive = _sum_llm_rss()
+    # A runner is torn down when keep_alive expires, and the next request starts
+    # a fresh one under a new pid. Both halves of that appear here as a set with
+    # no runner left in it, and only a scan recovers it. Rate limited because a
+    # model that is not resident stays that way until something asks for it, and
+    # a scan at every stage boundary would be paid for in the latency figures.
+    if alive < 2 and time.monotonic() - _llm_procs_scanned_at >= LLM_PROC_RESCAN_S:
+        _rebuild_llm_procs()
+        total, alive = _sum_llm_rss()
+    if alive:
+        stats["llm_rss_mb"] = round(total / (1024 * 1024), 1)
+        stats["llm_vram_mb"] = _read_llm_vram_mb()
+    return stats
+
+
+# Where each worker's utilisation window was opened, keyed by thread the way
+# psutil keys its own cpu_percent state, so that concurrent stages do not close
+# each other's windows.
+_stage_window = threading.local()
 
 
 def prime_cpu_percent():
-    """Open a CPU measurement window on the calling thread.
+    """Open the rate measurement windows on the calling thread.
 
     psutil.cpu_percent(interval=None) reports load since the calling thread's
-    own previous call, its state being keyed by thread id. Call this when a
-    stage starts; the snapshot taken when that stage ends then covers exactly
-    that stage.
+    own previous call, its state being keyed by thread id. GPU utilisation is
+    given the same treatment against the sampler's integral, so both columns
+    describe the same span. Call this when a stage starts; the snapshot taken
+    when that stage ends then covers exactly that stage.
     """
+    _open_gpu_util_window()
     if not _HAS_PSUTIL:
         return
     try:
@@ -497,19 +865,44 @@ def prime_cpu_percent():
         pass
 
 
+def _open_gpu_util_window():
+    """Mark where the calling thread's utilisation window starts."""
+    _stage_window.gpu = time.perf_counter()
+
+
+def _close_gpu_util_window():
+    """Return the window this thread just finished, and open the next one.
+
+    The window rather than a figure: the samples covering its last frame have
+    not necessarily arrived yet, and the row is not written until the item is
+    over. Resolving it there costs nothing and covers the whole stage.
+    """
+    opened = getattr(_stage_window, "gpu", None)
+    now = time.perf_counter()
+    _stage_window.gpu = now
+    return None if opened is None else (opened, now)
+
+
 def collect_resource_snapshot():
     """Return the resource snapshot for the stage that has just finished.
 
     Call at a stage boundary, from the thread that ran the stage and opened its
-    window with prime_cpu_percent(); cpu_percent then covers that stage alone.
-    ram_percent and rss_mb are read directly, the GPU fields come from NVML or,
-    where that is unavailable, from the background nvidia-smi sampler. Missing
-    psutil/NVML/nvidia-smi leaves blanks.
+    window with prime_cpu_percent(). cpu_percent then covers that stage alone,
+    and gpu_util_window carries the same span for the utilisation the row is
+    written with; both reopen for whatever the thread measures next. ram_percent
+    and rss_mb are read directly, and so are the remaining GPU fields, from NVML
+    or, where that is unavailable, from the sampler's latest nvidia-smi reading.
+    Missing psutil/NVML/nvidia-smi leaves blanks.
+
+    rss_mb covers this process alone, which is the pipeline without its LLM: the
+    model lives in the Ollama server's runner and is accounted for separately by
+    the llm_ fields.
     """
     stats = {
         "cpu_percent": "",
         "ram_percent": "",
         "rss_mb": "",
+        **read_llm_memory(),
     }
 
     if _HAS_PSUTIL:
@@ -525,6 +918,9 @@ def collect_resource_snapshot():
         stats.update(_read_gpu_stats_nvml())
     else:
         stats.update(_gpu_stats)
+    # Not a reading but the span to average one over, resolved when the row is
+    # written; see _close_gpu_util_window().
+    stats["gpu_util_window"] = _close_gpu_util_window()
     return stats
 
 
@@ -567,7 +963,10 @@ def write_timing(writer, args, item, stage, duration_ms, stats=None, extra=None)
         "cpu_percent": stats.get("cpu_percent", ""),
         "ram_percent": stats.get("ram_percent", ""),
         "rss_mb": stats.get("rss_mb", ""),
-        "gpu_util_percent": stats.get("gpu_util_percent", ""),
+        "llm_rss_mb": stats.get("llm_rss_mb", ""),
+        "llm_vram_mb": stats.get("llm_vram_mb", ""),
+        "llm_model_vram_mb": stats.get("llm_model_vram_mb", ""),
+        "gpu_util_percent": gpu_util_over(stats.get("gpu_util_window")),
         "gpu_mem_used_mb": stats.get("gpu_mem_used_mb", ""),
         "gpu_mem_total_mb": stats.get("gpu_mem_total_mb", ""),
         "gpu_name": stats.get("gpu_name", ""),
@@ -890,11 +1289,14 @@ def report_llm_placement(llm_engine, model_name):
     A model that does not fit is not an error to Ollama: the layers that overflow
     run on the CPU, with nothing in the log to say so. It is only reported, since a
     partly-offloaded model is a configuration somebody may well mean to measure.
+
+    Returns the reading, which is also where llm_vram_mb comes from, or None
+    where the server could not be asked.
     """
     placement = llm_engine.placement()
     if placement is None:
         print("[WARN] Could not read Ollama's model placement; GPU residency unverified")
-        return
+        return None
 
     fraction = placement["vram_fraction"]
     size_gb = placement["size_bytes"] / 1e9
@@ -904,6 +1306,7 @@ def report_llm_placement(llm_engine, model_name):
         print(f"[WARN] {(1 - fraction) * 100:.0f}% of {model_name} is on the CPU. "
               f"Generation runs several times slower than a GPU-resident model. "
               f"Lower --llm-num-ctx, free VRAM, or pick a smaller model.")
+    return placement
 
 
 # ---------- Main ----------
@@ -1123,7 +1526,8 @@ def main():
         num_thread=args.llm_num_thread,
     )
     llm_engine.warmup()
-    report_llm_placement(llm_engine, args.ollama_model)
+    placement = report_llm_placement(llm_engine, args.ollama_model)
+    start_llm_memory_monitor(args.ollama_url, placement)
 
     # Initialize TTS engine
     if args.tts_engine == "piper":
@@ -1184,7 +1588,8 @@ def main():
         "ts_iso", "mode", "stt_engine", "tts_engine",
         "input_mode", "audio_pacing", "utterance_trigger",
         "item", "stage", "duration_ms",
-        "cpu_percent", "ram_percent", "rss_mb",
+        "cpu_percent", "ram_percent", "rss_mb", "llm_rss_mb",
+        "llm_vram_mb", "llm_model_vram_mb",
         "gpu_util_percent", "gpu_mem_used_mb", "gpu_mem_total_mb", "gpu_name",
         "extra_json",
     ]

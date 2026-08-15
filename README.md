@@ -26,6 +26,7 @@ Input comes either from pre-recorded English audio files or from a live micropho
 - `ttfa`: time from the speaker stopping to the first audio out — the figure a user actually perceives
 - `e2e_response_ready`: wall-clock span of the whole item
 - Best-effort resource stats in CSV: CPU %, RAM %, process RSS, and NVIDIA GPU utilization/memory when available
+- The LLM is counted where it actually lives: the model sits in the Ollama server's runner process, not in this one, so its RAM and its VRAM are logged separately from the pipeline's own — see [What the LLM holds](#what-the-llm-holds)
 
 ## Requirements
 
@@ -201,9 +202,83 @@ The CSV contains:
 - `duration_ms`: stage duration in milliseconds
 - `input_mode`, `audio_pacing`, `utterance_trigger`: how the audio reached the pipeline and what released it to the LLM. Which stages carry a value, and what they include, depends on these, so runs that differ in them must not be pooled. `utterance_trigger` records the behaviour that applied, not the setting that was requested.
 - `cpu_percent`: average system-wide CPU load over the stage the row belongs to
-- `ram_percent`, `rss_mb`: system RAM in use and this process's resident set, read at the moment the stage finished
-- `gpu_util_percent`, `gpu_mem_used_mb`, `gpu_mem_total_mb`, `gpu_name`
+- `gpu_util_percent`: average device-wide GPU utilisation over that same stage, sampled throughout it rather than read at its end — see [Utilisation is a span, not an instant](#utilisation-is-a-span-not-an-instant)
+- `ram_percent`, `rss_mb`: system RAM in use and this process's resident set, read at the moment the stage finished. `rss_mb` is the pipeline without its LLM: STT, TTS and the script itself
+- `llm_rss_mb`, `llm_vram_mb`, `llm_model_vram_mb`: what the LLM holds, which is in neither of the above — see [What the LLM holds](#what-the-llm-holds)
+- `gpu_mem_used_mb`, `gpu_mem_total_mb`, `gpu_name`: device-wide memory and the card it came from, read at the moment the stage finished
 - `extra_json`: additional metadata, including input duration and output path where relevant
+
+### Utilisation is a span, not an instant
+
+Every other resource column is a level, and a level can be read at the moment a
+stage ends. Utilisation is a rate, and the pipeline's stages overlap by design:
+under the `endpoint` trigger the LLM starts answering while the STT worker is
+still draining the rest of the audio, so the instant a stage ends is routinely
+an instant belonging to a different stage's work.
+
+`gpu_util_percent` is therefore averaged over the stage rather than read at its
+end. The driver keeps per-process utilisation samples, one per frame, each
+stamped with the instant it describes; a sampler thread collects them off the
+measured path, and a row is the time-weighted mean of the samples covering its
+own span. That span is the one `cpu_percent` covers, opened by the same call
+when the stage starts. Rows are resolved when they are written rather than when
+the stage ends, by which time the samples for its last frame have arrived.
+
+Two things follow, and both are visible in a normal run:
+
+- **The frame is the resolution.** A stage shorter than one frame — around
+  1/6 s, `llm_prompt_eval` and `llm_first_chunk_fill` among them — reports the
+  frame it fell inside, which covers more than the stage did.
+- **Overlap is real, not an artifact.** `tts_first_chunk` shows GPU load while
+  Piper runs on the CPU, because the LLM is still generating the rest of the
+  answer underneath it. The column says what the device was doing while a stage
+  ran, which is not the same as what that stage asked of it.
+
+Where a driver will not supply per-process samples, the sampler falls back to
+the plain utilisation counter. That counter is a rolling average: it starts late
+and outlives the work by seconds, so on the fallback a burst lands on whichever
+stage is running by the time the counter notices. The samples are what keep the
+figure on the stage that earned it.
+
+`gpu_mem_used_mb` needs none of this. It is a level, and the boundary read is
+exact.
+
+### What the LLM holds
+
+`rss_mb` is this process's resident set, and the model is not in it. Ollama runs
+as a server of its own and loads the weights into a runner subprocess under it,
+so a pipeline that has just answered with a 3.8B model reports the same RSS as
+one that has not. A CPU run of phi3:mini here: 498 MB of pipeline, and 2598 MB
+of model beside it. Three columns carry what the LLM holds:
+
+- `llm_rss_mb`: resident memory of the `ollama serve` process and the runners
+  beneath it, read by pid at every stage boundary. It is what the LLM costs in
+  host RAM, and on a CPU run it is the largest number in the file. On a GPU run
+  it does not fall to zero — 521 MB for the same model — since the runner still
+  holds a CUDA context and the mapped weight file.
+- `llm_vram_mb`: GPU memory the driver attributes to those same processes, read
+  from NVML by pid. This is the figure `nvidia-smi` shows against the
+  `llama-server` process, and the one to size a card from.
+- `llm_model_vram_mb`: `size_vram` from Ollama's `/api/ps`, the model's own
+  share, read once when the run starts. It is what decides whether the model
+  fits, and the smaller of the two VRAM figures: phi3:mini measured 2467 MB of model
+  inside a process holding 2992 MB, the 525 MB difference being the CUDA
+  context, the kernels and the libraries the runtime loads beside it.
+
+`rss_mb` and `llm_rss_mb` are separate processes and add up. `llm_vram_mb` is
+part of `gpu_mem_used_mb` and does not, and `llm_model_vram_mb` is in turn part
+of `llm_vram_mb`.
+
+A column is blank where the figure cannot be had rather than filled with a
+number that would be wrong. `llm_rss_mb`: the server is not on this machine,
+psutil is missing, or no single local `ollama serve` can be identified — a
+server inside a container keeps its runner in a pid namespace of its own, so
+only the server's few tens of MB are visible from outside it, and the run says
+so when it starts. `llm_vram_mb`: the GPU columns are coming from `nvidia-smi`
+rather than NVML, or the driver will not attribute memory per process, which an
+idle GPU cannot be told apart from. `llm_model_vram_mb`: `/api/ps` could not be
+reached. On a CPU-placed model `llm_model_vram_mb` is 0, which is the reading
+that says the model is not on the GPU at all.
 
 ### TTFA and the end of speech
 
@@ -701,7 +776,9 @@ what makes it easy to miss. A single-turn exchange needs a few hundred tokens,
 so the other 32 000 are pure exposure to that cliff.
 `report_llm_placement()` prints the split at startup and warns when it is not
 100% GPU, since a run that quietly fell off the cliff still produces a full set
-of plausible-looking numbers.
+of plausible-looking numbers. The same reading fills `llm_model_vram_mb`, and
+what the spilled part costs in RAM shows up in `llm_rss_mb` — see
+[What the LLM holds](#what-the-llm-holds).
 
 **Server settings.** Most of what gets recommended for Ollama is already the
 default in 0.32.9 — `OLLAMA_NUM_PARALLEL` is 1, flash attention is on. Two are
@@ -866,10 +943,13 @@ under investigation, the pooled interval is understating it.
 ## Notes
 
 - CPU/RAM stats require `psutil`; if unavailable, those fields stay blank.
-- Resource columns are captured by the worker that owns the stage, at the moment that stage finishes. `psutil.cpu_percent(interval=None)` reports load since its own previous call and keeps that state per thread, so each stage opens its own measurement window with a priming call when it starts.
-- A row's CPU window matches its `duration_ms` exactly for `stt`, `llm_ttft`, `llm_first_chunk_fill`, `tts_first_chunk` and `e2e_response_ready`. The rest are approximations: `llm_ttfc` is timed from the start of the request but its CPU window starts at the first token; `ttfa` reuses the `tts_first_chunk` snapshot and `stt_endpoint_delay` the `stt` one; `llm_prompt_eval` reuses the first-token snapshot, the nearest boundary to a phase that had already ended by the time Ollama reported it; `llm_eval` and `tts_total` carry the snapshot taken when their worker finished.
-- GPU stats come from NVML (`nvidia-ml-py`), read in process at each stage boundary like the CPU and RAM ones. Where NVML cannot be initialised the code falls back to `nvidia-smi`, refreshed by a background sampler once a second so its subprocess stays off the measured path; that reading can therefore be up to a second old. Individual fields the driver does not support are stored blank, as are all of them when neither source is usable.
-- `gpu_util_percent` is the driver's own rolling average over its internal sampling period (roughly 1/6 s to 1 s depending on the card), so it does not resolve stages shorter than that regardless of how it is read. `gpu_mem_used_mb` is a true point-in-time value.
+- `llm_rss_mb` sums the RSS of the server and its runners, so pages shared between them are counted twice. The exact figure, PSS, needs ptrace access the packaged service does not grant to the user running this script; the server is tens of MB against a runner's gigabytes, so the error is small. Weights are mapped from the model file rather than copied, and the mapped pages that are resident are counted — which is what they cost in RAM, reclaimable or not. The runner's own share lands within a megabyte of the `size` Ollama reports for the model once it has loaded; the column sits a few tens of MB above that, being the server's footprint and the KV cache as it fills.
+- The Ollama server is found by a scan of every process, which is why it happens once at startup and not at a stage boundary; a reading afterwards is a few `/proc` reads per process. The listening port would identify it exactly, and cannot be used: mapping a socket to the process holding it needs read access to that process's descriptors, and the packaged service runs as its own user. Two servers on one machine are therefore indistinguishable and both are left unmeasured, since reporting the wrong one is worse. The runner is re-found when it disappears — `--llm-keep-alive` expiring mid-run tears it down, and the next utterance starts a fresh one under a new pid — at most once a second, so a model that is not resident cannot turn every stage boundary into a process scan.
+- The level columns are captured by the worker that owns the stage, at the moment that stage finishes. The two rate columns cover the stage instead: `psutil.cpu_percent(interval=None)` reports load since its own previous call and keeps that state per thread, and `gpu_util_percent` is averaged over the same span from the sampler's timeline, so one call when a stage starts opens both windows and the snapshot at its end closes both.
+- A row's CPU and GPU windows match its `duration_ms` exactly for `stt`, `llm_ttft`, `llm_first_chunk_fill`, `tts_first_chunk` and `e2e_response_ready`. The rest are approximations: `llm_ttfc` is timed from the start of the request but its window starts at the first token; `ttfa` reuses the `tts_first_chunk` snapshot and `stt_endpoint_delay` the `stt` one; `llm_prompt_eval` reuses the first-token snapshot, the nearest boundary to a phase that had already ended by the time Ollama reported it; `llm_eval` and `tts_total` carry the snapshot taken when their worker finished.
+- GPU stats come from NVML (`nvidia-ml-py`). The level fields are read in process at each stage boundary like the CPU and RAM ones; utilisation is collected continuously by a background thread instead, every tenth of a second, which is often enough to keep up with a driver that produces a sample per frame. Where NVML cannot be initialised the code falls back to `nvidia-smi`, and the same thread runs it once a second so its subprocess stays off the measured path — the levels are then up to a second old and utilisation is averaged from readings that coarse. Individual fields the driver does not support are stored blank, as are all of them when neither source is usable.
+- `gpu_mem_used_mb` is read through NVML's v2 memory query, which reports the framebuffer the driver reserves for itself separately from what is allocated. The original query folds the two together — it defines `used` as total minus free, and the reservation is 2192 MiB of the 32 GB vGPU here, present with nothing running at all — while `nvidia-smi` shows only the allocated part. The v2 query is what keeps this column agreeing with `nvidia-smi` and with the fallback path.
+- `gpu_util_percent` is built from the driver's per-process samples, summed across processes so that it describes the device as it always has. Where those are unavailable it falls back to the utilisation counter, whose rolling average lags the work and outlives it by an interval that varies by card; the figure is then only as well placed as that counter. See [Utilisation is a span, not an instant](#utilisation-is-a-span-not-an-instant).
 - `e2e_response_ready` runs from the start of processing to the complete response, in every mode. On file input it therefore includes the delivery of the audio; on a microphone it covers the whole session. It is a wall-clock span, not a latency — for latency use `ttfa`.
 - `stt_rtf` is `stt` divided by the audio duration. It expresses a real-time factor only under `fast` pacing. Under `realtime` pacing `stt` includes waiting for the audio to arrive, which puts the ratio above 1 and makes it a measure of something else.
 - Response length varies enough between runs to hide whatever is under test: `llm_eval`, `tts_total` and `e2e_response_ready` all scale with it. The default `llm-temperature: 0` removes that variance, so a run repeats exactly; raising it needs an `llm-seed` to stay reproducible. `ttfa` and `stt_endpoint_delay` are unaffected either way, as both conclude before the response length is known.
