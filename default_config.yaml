@@ -121,6 +121,47 @@ system-prompt-file: "./prompts/short-opener.txt"
 
 llm-max-tokens: 150
 
+# KV cache size in tokens. Left unset, Ollama picks from the VRAM it finds --
+# 32768 on this 32 GB card -- and phi3:mini then occupies 15 GB instead of
+# 2.6 GB, qwen2.5:32b-instruct-q4_K_M 28 GB instead of 19 GB. Generation speed
+# is unchanged either way while the model fits (134.6 vs 133.4 tok/s on
+# phi3:mini, 28.0 vs 27.8 on the 32B), so this is a VRAM knob, not a speed knob.
+#
+# It becomes a speed knob at the cliff: the layers that no longer fit run on the
+# CPU -- 72.5 tok/s down to 12.5 with 70% of an 8B q4_K_M there -- and Ollama
+# reports this nowhere. The 9 GB it frees on the 32B is the margin that keeps the
+# next model up, or a second tenant on the GPU, from pushing a run over that edge.
+#
+# Budget it as system prompt + user text + llm-max-tokens. The prompts here come
+# to a few hundred tokens against 1024; a longer prompt variant needs this raised
+# with it, or llama.cpp's context shift will quietly drop the head of the system
+# prompt. 0 follows the server default.
+llm-num-ctx: 1024
+
+# How long Ollama holds the model in VRAM after a request. A reload costs about
+# 8 s for an 8B q4_K_M -- 7.6 s measured, against 0.8 s for a request that found
+# it resident -- and a reload triggered by the first utterance is paid inside
+# that utterance's latency. The server's own default of 5m expires between runs.
+#
+# Pair a long value with OLLAMA_MAX_LOADED_MODELS=1 on the server. Without it a
+# sweep leaves each model resident while the next one loads, and the next one
+# gets what VRAM is left. Empty follows the server default.
+llm-keep-alive: "30m"
+
+# Layers offloaded to the GPU. Unset lets Ollama size the offload itself, which
+# it did correctly for every model in this repo. Set 99 to force all of them:
+# a model that then does not fit fails loudly instead of half-loading onto the
+# CPU and returning numbers that look merely disappointing.
+llm-num-gpu: null
+
+# Prompt-processing batch size (server default 512) and runner CPU threads
+# (server default one per core, so 16 here). Neither is on the critical path
+# while the model is GPU-resident: prompts are far shorter than one batch, and
+# the CPU only feeds the GPU. num-thread is the more interesting of the two,
+# since those 16 threads share the box with Vosk and Piper.
+llm-num-batch: null
+llm-num-thread: null
+
 # Response length varies enough between runs to hide whatever is under test, and
 # llm_eval, tts_total and e2e_response_ready all scale with it. Greedy decoding
 # removes most of that variance -- but not all of it, and not reliably across

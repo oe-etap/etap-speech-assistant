@@ -884,6 +884,28 @@ def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics, playback=False):
                 pass
 
 
+def report_llm_placement(llm_engine, model_name):
+    """Print where Ollama put the model, and warn when it is not all on the GPU.
+
+    A model that does not fit is not an error to Ollama: the layers that overflow
+    run on the CPU, with nothing in the log to say so. It is only reported, since a
+    partly-offloaded model is a configuration somebody may well mean to measure.
+    """
+    placement = llm_engine.placement()
+    if placement is None:
+        print("[WARN] Could not read Ollama's model placement; GPU residency unverified")
+        return
+
+    fraction = placement["vram_fraction"]
+    size_gb = placement["size_bytes"] / 1e9
+    print(f"[INFO] Ollama model {model_name}: {size_gb:.1f} GB resident, "
+          f"{fraction * 100:.0f}% on GPU")
+    if fraction < 0.999:
+        print(f"[WARN] {(1 - fraction) * 100:.0f}% of {model_name} is on the CPU. "
+              f"Generation runs several times slower than a GPU-resident model. "
+              f"Lower --llm-num-ctx, free VRAM, or pick a smaller model.")
+
+
 # ---------- Main ----------
 def main():
     parser = argparse.ArgumentParser(description="Offline Speech Assistant MWE (EN, file input only)")
@@ -974,6 +996,32 @@ def main():
                         help="Sampling seed. Leave unset for non-deterministic sampling.")
     parser.add_argument("--llm-max-tokens", type=int, default=150,
                         help="Maximum number of tokens the LLM may generate")
+    parser.add_argument("--llm-num-ctx", type=int, default=1024,
+                        help="KV cache size in tokens. The server otherwise picks "
+                             "from the VRAM present, which on a 32 GB card means "
+                             "32768 -- 12 GB of cache for a single-turn exchange "
+                             "that uses a few hundred tokens. Costs nothing in "
+                             "speed while the model fits; buys the headroom that "
+                             "keeps a large one fitting. 0 follows the server.")
+    parser.add_argument("--llm-keep-alive", type=str, default="30m",
+                        help="How long Ollama holds the model in VRAM after a "
+                             "request, in its duration syntax ('30m', '-1' for "
+                             "forever). A reload costs about 8 s for an 8B q4_K_M "
+                             "and lands inside a measured utterance. Pair a long "
+                             "value with OLLAMA_MAX_LOADED_MODELS=1 so the "
+                             "previous model is evicted rather than crowding the "
+                             "next one off the GPU. Empty follows the server.")
+    parser.add_argument("--llm-num-gpu", type=int, default=None,
+                        help="Layers offloaded to the GPU. Unset lets Ollama fit "
+                             "the model itself. 99 forces every layer, which turns "
+                             "a model that does not fit into a loud failure "
+                             "instead of a quiet CPU spill several times slower.")
+    parser.add_argument("--llm-num-batch", type=int, default=None,
+                        help="Prompt-processing batch size, default 512 server-side. "
+                             "Prompts here are far shorter than one batch, so this "
+                             "is a knob for completeness rather than for latency.")
+    parser.add_argument("--llm-num-thread", type=int, default=None,
+                        help="CPU threads for the Ollama runner. Unset takes one per core.")
 
     # ---- config file handling & parse ----
     initial_parser = argparse.ArgumentParser(add_help=False)
@@ -1066,8 +1114,16 @@ def main():
         temperature=args.llm_temperature,
         seed=args.llm_seed,
         chunk_max_chars=args.tts_chunk_max_chars,
+        # 0 and "" are how a command line asks for "leave the server alone",
+        # there being no way to pass a null through argparse.
+        num_ctx=args.llm_num_ctx or None,
+        keep_alive=args.llm_keep_alive or None,
+        num_gpu=args.llm_num_gpu,
+        num_batch=args.llm_num_batch,
+        num_thread=args.llm_num_thread,
     )
     llm_engine.warmup()
+    report_llm_placement(llm_engine, args.ollama_model)
 
     # Initialize TTS engine
     if args.tts_engine == "piper":

@@ -148,6 +148,10 @@ LLM and TTS behaviour:
 - `--llm-temperature FLOAT`: sampling temperature, default `0` — greedy decoding, which removes most of the run-to-run variance in response length but does **not** make two runs identical; see [What this measurement cannot tell you](#what-this-measurement-cannot-tell-you). Raise it only with `--llm-seed` set
 - `--llm-seed INT`: sampling seed, unset by default. It does nothing at temperature `0`, and is what keeps a run reproducible above it
 - `--llm-max-tokens N`: response cap, default `150`
+- `--llm-num-ctx N`: KV cache size in tokens, default `1024`. Unset, Ollama sizes it from the VRAM present and phi3:mini occupies 15 GB instead of 2.6 GB. Costs nothing in speed while the model fits, and buys the headroom that keeps it fitting; `0` follows the server. See [Ollama](#ollama)
+- `--llm-keep-alive DURATION`: how long the model stays in VRAM, default `30m`. A reload costs about 8 s and is paid inside the utterance that triggers it. Empty follows the server
+- `--llm-num-gpu N`: layers offloaded to the GPU, unset means Ollama decides. `99` forces all of them, so a model that does not fit fails loudly rather than spilling onto the CPU
+- `--llm-num-batch N`, `--llm-num-thread N`: prompt batch size and runner CPU threads, both following the server when unset. Neither is on the critical path for a GPU-resident model
 - `--tts-chunk-max-chars N`: safety-net chunk length for the LLM → TTS handoff, default `140`. Lower = lower TTFA, higher = better prosody
 
 Engines:
@@ -676,6 +680,62 @@ through the first synthesis.
 XTTS-v2 is published under the Coqui Public Model License, which is
 non-commercial; the first load prompts for agreement and `COQUI_TOS_AGREED=1`
 accepts it non-interactively. The model download is 1.87 GB.
+
+### Ollama
+
+**Context length is a VRAM knob, not a speed knob — until it is a speed knob.**
+`OLLAMA_CONTEXT_LENGTH` defaults to a value picked from the VRAM present, which -
+for example - on 32 GB means 32768:
+
+| Model | Default ctx | `num_ctx=1024` | Generation |
+|---|---|---|---|
+| `phi3:mini` | 15 GB | 2.6 GB | 134.6 → 133.4 tok/s |
+| `qwen2.5:32b-instruct-q4_K_M` | 28 GB | 19 GB | 28.0 → 27.8 tok/s |
+
+Generation does not move, so nothing is bought directly. What is bought is
+margin. At 28 of 32 GB the 32B has 4 GB of headroom, and a model that stops
+fitting does not fail: Ollama runs the overflowing layers on the CPU and says so
+nowhere in its response. Forcing 70% of the 8B onto the CPU took it from 72.5 to
+12.5 tok/s, a factor of 5.8; a smaller spill costs proportionally less, which is
+what makes it easy to miss. A single-turn exchange needs a few hundred tokens,
+so the other 32 000 are pure exposure to that cliff.
+`report_llm_placement()` prints the split at startup and warns when it is not
+100% GPU, since a run that quietly fell off the cliff still produces a full set
+of plausible-looking numbers.
+
+**Server settings.** Most of what gets recommended for Ollama is already the
+default in 0.32.9 — `OLLAMA_NUM_PARALLEL` is 1, flash attention is on. Two are
+worth setting for a measurement box, as a drop-in so the packaged unit stays
+untouched:
+
+```bash
+sudo systemctl edit ollama
+```
+
+```ini
+[Service]
+Environment="OLLAMA_MAX_LOADED_MODELS=1"
+Environment="OLLAMA_CONTEXT_LENGTH=1024"
+```
+
+`OLLAMA_MAX_LOADED_MODELS=1` is the one that matters for a sweep. Models are held
+for `--llm-keep-alive` after a run, so without it the previous model is still
+resident when the next one loads, and the next one fits into whatever VRAM is
+left — the silent CPU spill again, arriving through the door of a perfectly
+ordinary model sequence. `OLLAMA_CONTEXT_LENGTH` duplicates `--llm-num-ctx` and
+only covers anything reaching the server from outside this script.
+
+`OLLAMA_KV_CACHE_TYPE=q8_0` is not worth it here: at 1024 tokens the cache is
+128 MiB, so halving it saves nothing that 9 GB of context reduction has not
+already saved.
+
+**Sending the load-time options on every request, warmup included, is not
+optional.** `num_ctx`, `num_gpu`, `num_batch` and `num_thread` reach llama-server
+as command line flags, so changing one tears the model down and loads it again.
+A warmup that omitted them would load under the server's defaults and move the
+reload into the run's first utterance — 7.6 s for an 8B q4_K_M, against 0.8 s
+for a request that left them alone, and precisely the outlier `warmup()` exists
+to prevent. `OllamaEngine._runner_options()` is why they travel together.
 
 ## Aggregating a run
 
