@@ -55,10 +55,17 @@ PER_STAGE_RESOURCES = {
 }
 
 # Levels that drift slowly over a run, so one pooled figure is informative.
+# The pipeline's RSS and the LLM's are separate processes and add up; the LLM's
+# VRAM is part of the device-wide figure above it, and does not. The model's own
+# share is in turn part of what its process holds, the rest being the CUDA
+# context and the runtime loaded beside it.
 POOLED_RESOURCES = {
     "ram_percent": "RAM Usage (%)",
-    "rss_mb": "RAM RSS (MB, process)",
-    "gpu_mem_used_mb": "GPU Mem Used (MB)",
+    "rss_mb": "RAM RSS (MB, pipeline)",
+    "llm_rss_mb": "RAM RSS (MB, LLM server)",
+    "gpu_mem_used_mb": "GPU Mem Used (MB, device)",
+    "llm_vram_mb": "VRAM (MB, LLM process)",
+    "llm_model_vram_mb": "VRAM (MB, LLM model)",
 }
 
 EXTRA_LABELS = {

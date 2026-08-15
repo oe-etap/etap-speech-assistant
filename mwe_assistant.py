@@ -15,6 +15,7 @@ CPU/RAM/GPU snapshots.
 import argparse
 import csv
 import queue
+import socket
 import threading
 import yaml
 import json
@@ -25,6 +26,7 @@ import time
 import wave
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import soundfile as sf
 try:
@@ -379,7 +381,18 @@ def _read_gpu_stats_nvml():
     stats["gpu_util_percent"] = _nvml_value(
         lambda: pynvml.nvmlDeviceGetUtilizationRates(handle).gpu)
 
-    mem = _nvml_value(lambda: pynvml.nvmlDeviceGetMemoryInfo(handle), None)
+    # NVML's original memory query defines `used` as total minus free, which
+    # counts the framebuffer the driver reserves for itself -- 2192 MiB of the
+    # 32 GB vGPU here, present with nothing running at all. nvidia-smi does not
+    # show that in its memory figure, so the two sources of this column
+    # disagreed by exactly that much until the v2 query, which reports the
+    # reservation separately, was preferred over it.
+    mem = None
+    if hasattr(pynvml, "nvmlMemory_v2"):
+        mem = _nvml_value(
+            lambda: pynvml.nvmlDeviceGetMemoryInfo(handle, version=pynvml.nvmlMemory_v2), None)
+    if mem is None:
+        mem = _nvml_value(lambda: pynvml.nvmlDeviceGetMemoryInfo(handle), None)
     if mem is not None:
         stats["gpu_mem_used_mb"] = round(mem.used / (1024 * 1024))
         stats["gpu_mem_total_mb"] = round(mem.total / (1024 * 1024))
@@ -481,6 +494,177 @@ def stop_gpu_monitor():
         _gpu_sampler = None
 
 
+# The Ollama server holds the model in a runner subprocess of its own, so this
+# process's RSS says nothing about what the LLM costs: on a CPU run the weights
+# are the largest allocation on the machine and not one page of them appears in
+# rss_mb. These are handles on the server and its runners, kept between
+# snapshots so that a reading is a few /proc reads rather than a process scan.
+# Rebound wholesale rather than mutated, so the workers reading them need no
+# lock, as with _gpu_stats above.
+_llm_procs = []
+
+# Whether the configured server is on this machine, and so has a process here
+# to be measured at all
+_llm_local = False
+
+# When _llm_procs was last rebuilt, and how often that may be retried while the
+# set looks incomplete
+_llm_procs_scanned_at = 0.0
+LLM_PROC_RESCAN_S = 1.0
+
+# What Ollama says the loaded model itself occupies on the GPU. Read once at
+# startup: /api/ps is an HTTP round trip and has no business on a stage
+# boundary. It is the smaller of the two VRAM figures -- see _read_llm_vram_mb.
+_llm_model_vram_mb = ""
+
+
+def _is_local_url(url):
+    """Whether the URL addresses this machine, and so a process we could find."""
+    host = (urlparse(url).hostname or "").lower()
+    if host in ("", "localhost", "::1", "0.0.0.0"):
+        return True
+    return host.startswith("127.") or host == socket.gethostname().lower()
+
+
+def _find_ollama_server():
+    """Return the local `ollama serve` process, or None where it is not unambiguous.
+
+    A scan of every process, which is why this is kept away from the stage
+    boundaries. The listening port would identify the server exactly and cannot
+    be used: mapping a socket to the process holding it needs read access to
+    that process's descriptors, and the packaged service runs as its own user.
+    More than one server is therefore indistinguishable, and reporting the
+    memory of the wrong one is worse than reporting none.
+    """
+    servers = []
+    for proc in psutil.process_iter(["name", "cmdline"]):
+        cmdline = proc.info["cmdline"] or []
+        if len(cmdline) < 2 or cmdline[1] != "serve":
+            continue
+        if (proc.info["name"] or "").lower() != "ollama" and os.path.basename(cmdline[0]) != "ollama":
+            continue
+        servers.append(proc)
+    return servers[0] if len(servers) == 1 else None
+
+
+def _rebuild_llm_procs():
+    """Find the Ollama server and the runner processes holding the model."""
+    global _llm_procs, _llm_procs_scanned_at
+    _llm_procs_scanned_at = time.monotonic()
+    server = _find_ollama_server()
+    if server is None:
+        _llm_procs = []
+        return
+    try:
+        _llm_procs = [server, *server.children(recursive=True)]
+    except psutil.Error:
+        _llm_procs = []
+
+
+def _sum_llm_rss():
+    """Total RSS over the cached handles, forgetting the ones that have died.
+
+    Returns (bytes, processes read). Summing across processes counts pages
+    shared between them twice; the server is tens of MB against a runner's
+    gigabytes, and the figure that would not double count -- PSS -- needs the
+    ptrace access the packaged service does not grant to the user running this.
+    """
+    global _llm_procs
+    total, alive = 0, []
+    for proc in _llm_procs:
+        try:
+            total += proc.memory_info().rss
+            alive.append(proc)
+        except psutil.Error:
+            pass
+    _llm_procs = alive
+    return total, len(alive)
+
+
+def start_llm_memory_monitor(url, placement):
+    """Begin accounting for the memory the LLM holds outside this process.
+
+    Call once the model is loaded: the runner holding the weights is started by
+    the first request, so before warmup() there is nothing there to find.
+    placement is report_llm_placement()'s reading of /api/ps, or None where the
+    server could not be asked.
+    """
+    global _llm_local, _llm_model_vram_mb
+    if placement is not None:
+        _llm_model_vram_mb = round(placement["size_vram_bytes"] / (1024 * 1024))
+    _llm_local = _HAS_PSUTIL and _is_local_url(url)
+    if not _llm_local:
+        return
+    _rebuild_llm_procs()
+    if not _llm_procs:
+        print("[WARN] No single local 'ollama serve' process to attribute memory "
+              "to; llm_rss_mb will be blank")
+    elif len(_llm_procs) < 2:
+        # The server on its own, with no runner under it -- which is what a
+        # server inside a container looks like from out here, its children
+        # living in a pid namespace of their own.
+        print("[WARN] Found the Ollama server but no runner beneath it; "
+              "llm_rss_mb will not account for the model")
+
+
+def _read_llm_vram_mb():
+    """GPU memory the driver attributes to the LLM's processes.
+
+    Read from NVML over the same pids llm_rss_mb sums, so the two describe the
+    same processes. This is the larger of the two VRAM figures and the one
+    nvidia-smi shows: a runner that has loaded a 2467 MiB model appears here at
+    2992 MiB, the difference being the CUDA context, the kernels and the
+    libraries the runtime brings with it. llm_model_vram_mb carries what Ollama
+    says the model alone occupies, which is what decides whether it fits.
+
+    Blank where NVML is not the source of the GPU columns, or where the driver
+    will not attribute memory per process -- which happens on some cards and
+    under some virtualization, and cannot be told apart from an idle GPU.
+    """
+    if _nvml_handle is None:
+        return ""
+    procs = _nvml_value(lambda: pynvml.nvmlDeviceGetComputeRunningProcesses(_nvml_handle), None)
+    if not procs:
+        return ""
+    pids = {proc.pid for proc in _llm_procs}
+    ours = [proc for proc in procs if proc.pid in pids]
+    if any(proc.usedGpuMemory is None for proc in ours):
+        return ""
+    # No entry for our pids is a model that is not on the GPU at all, which is
+    # zero rather than unknown: the driver answered, and did not name them.
+    return round(sum(proc.usedGpuMemory for proc in ours) / (1024 * 1024))
+
+
+def read_llm_memory():
+    """What the LLM holds, in host RAM and on the GPU, as snapshot fields.
+
+    llm_rss_mb covers the Ollama server and the runners holding the model, and
+    is blank where the server is not on this machine or no process here could be
+    identified as it.
+    """
+    stats = {
+        "llm_rss_mb": "",
+        "llm_vram_mb": "",
+        "llm_model_vram_mb": _llm_model_vram_mb,
+    }
+    if not _llm_local:
+        return stats
+
+    total, alive = _sum_llm_rss()
+    # A runner is torn down when keep_alive expires, and the next request starts
+    # a fresh one under a new pid. Both halves of that appear here as a set with
+    # no runner left in it, and only a scan recovers it. Rate limited because a
+    # model that is not resident stays that way until something asks for it, and
+    # a scan at every stage boundary would be paid for in the latency figures.
+    if alive < 2 and time.monotonic() - _llm_procs_scanned_at >= LLM_PROC_RESCAN_S:
+        _rebuild_llm_procs()
+        total, alive = _sum_llm_rss()
+    if alive:
+        stats["llm_rss_mb"] = round(total / (1024 * 1024), 1)
+        stats["llm_vram_mb"] = _read_llm_vram_mb()
+    return stats
+
+
 def prime_cpu_percent():
     """Open a CPU measurement window on the calling thread.
 
@@ -505,11 +689,16 @@ def collect_resource_snapshot():
     ram_percent and rss_mb are read directly, the GPU fields come from NVML or,
     where that is unavailable, from the background nvidia-smi sampler. Missing
     psutil/NVML/nvidia-smi leaves blanks.
+
+    rss_mb covers this process alone, which is the pipeline without its LLM: the
+    model lives in the Ollama server's runner and is accounted for separately by
+    the llm_ fields.
     """
     stats = {
         "cpu_percent": "",
         "ram_percent": "",
         "rss_mb": "",
+        **read_llm_memory(),
     }
 
     if _HAS_PSUTIL:
@@ -567,6 +756,9 @@ def write_timing(writer, args, item, stage, duration_ms, stats=None, extra=None)
         "cpu_percent": stats.get("cpu_percent", ""),
         "ram_percent": stats.get("ram_percent", ""),
         "rss_mb": stats.get("rss_mb", ""),
+        "llm_rss_mb": stats.get("llm_rss_mb", ""),
+        "llm_vram_mb": stats.get("llm_vram_mb", ""),
+        "llm_model_vram_mb": stats.get("llm_model_vram_mb", ""),
         "gpu_util_percent": stats.get("gpu_util_percent", ""),
         "gpu_mem_used_mb": stats.get("gpu_mem_used_mb", ""),
         "gpu_mem_total_mb": stats.get("gpu_mem_total_mb", ""),
@@ -890,11 +1082,14 @@ def report_llm_placement(llm_engine, model_name):
     A model that does not fit is not an error to Ollama: the layers that overflow
     run on the CPU, with nothing in the log to say so. It is only reported, since a
     partly-offloaded model is a configuration somebody may well mean to measure.
+
+    Returns the reading, which is also where llm_vram_mb comes from, or None
+    where the server could not be asked.
     """
     placement = llm_engine.placement()
     if placement is None:
         print("[WARN] Could not read Ollama's model placement; GPU residency unverified")
-        return
+        return None
 
     fraction = placement["vram_fraction"]
     size_gb = placement["size_bytes"] / 1e9
@@ -904,6 +1099,7 @@ def report_llm_placement(llm_engine, model_name):
         print(f"[WARN] {(1 - fraction) * 100:.0f}% of {model_name} is on the CPU. "
               f"Generation runs several times slower than a GPU-resident model. "
               f"Lower --llm-num-ctx, free VRAM, or pick a smaller model.")
+    return placement
 
 
 # ---------- Main ----------
@@ -1123,7 +1319,8 @@ def main():
         num_thread=args.llm_num_thread,
     )
     llm_engine.warmup()
-    report_llm_placement(llm_engine, args.ollama_model)
+    placement = report_llm_placement(llm_engine, args.ollama_model)
+    start_llm_memory_monitor(args.ollama_url, placement)
 
     # Initialize TTS engine
     if args.tts_engine == "piper":
@@ -1184,7 +1381,8 @@ def main():
         "ts_iso", "mode", "stt_engine", "tts_engine",
         "input_mode", "audio_pacing", "utterance_trigger",
         "item", "stage", "duration_ms",
-        "cpu_percent", "ram_percent", "rss_mb",
+        "cpu_percent", "ram_percent", "rss_mb", "llm_rss_mb",
+        "llm_vram_mb", "llm_model_vram_mb",
         "gpu_util_percent", "gpu_mem_used_mb", "gpu_mem_total_mb", "gpu_name",
         "extra_json",
     ]
