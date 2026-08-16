@@ -1,0 +1,200 @@
+id: short_opener_en
+description: >
+  Verifiable constraints for the short-opener English voice-assistant prompt
+  (prompts/short-opener.txt). Each entry restates one instruction from that
+  prompt in a form a program can decide, following the verifiable-instruction
+  design of IFEval (Zhou et al., 2023). Editing the prompt requires editing this
+  file: a constraint set that no longer matches the prompt measures adherence to
+  instructions the model was never given.
+
+  Severity "hard" means a prompt violation and counts towards the reported
+  adherence rates. Severity "soft" is advisory: the prompt does not state the
+  requirement, or states it conditionally on something no program can decide, so
+  the value is reported without being scored as a failure.
+
+  Aligned with the prompt revision that opens "You are a concise, factual but
+  friendly voice assistant" and contains the sentences "If that fully answers the
+  user, stop there", "Never use more than three sentences in total", "use your
+  reply to ask one brief clarifying question instead of guessing" and "Speak for
+  the ear: short sentences, everyday words, no lists, no markdown, no symbols, no
+  emojis, and no abbreviations". The archived copy of that prompt is the
+  system_prompt.txt of any run scored with this file.
+
+checks:
+  - id: non_empty
+    type: non_empty
+    severity: hard
+    description: >
+      The pipeline produced a response at all. Empty responses are also marked
+      skipped in the transcript, but they must not silently pass every other
+      check by having no text to violate them.
+
+  - id: opener_at_most_five_words
+    type: opening_sentence_max_words
+    severity: hard
+    params:
+      max_words: 5
+    expected: "first sentence <= 5 words"
+    description: >
+      "Start with a very short sentence of at most five words." This is the
+      constraint that carries the perceived-latency benefit of the prompt design:
+      the opening sentence is the first synthesizable chunk, so its length sets
+      how much speech the user hears before the detail arrives.
+
+  - id: opener_ends_with_full_stop
+    type: opening_sentence_terminator
+    severity: hard
+    params:
+      terminators: "."
+    expected: "first sentence ends with '.'"
+    description: >
+      "...and end it with a full stop." A comma or colon instead keeps the
+      sentence chunker from releasing the opener as its own chunk.
+
+  - id: at_most_two_detail_sentences
+    type: detail_sentence_count
+    severity: hard
+    params:
+      min: 0
+      max: 2
+    expected: "0 to 2 sentences after the opener"
+    description: >
+      "If that fully answers the user, stop there. Otherwise add one or two short
+      sentences of detail." Counted as all sentences after the opener. The lower
+      bound is zero deliberately: the prompt makes the detail conditional, so a
+      bare opener that already answers the question is compliant, and requiring a
+      detail sentence would score the intended best case as a violation.
+
+  - id: total_sentences_at_most_three
+    type: total_sentence_count
+    severity: hard
+    params:
+      min: 1
+      max: 3
+    expected: "1 to 3 sentences in total"
+    description: >
+      "Never use more than three sentences in total." The explicit ceiling on the
+      whole reply, which the opener and detail checks do not impose on their own.
+
+  - id: answers_in_english
+    type: language_marker_ratio
+    severity: hard
+    min_response_words: 8
+    params:
+      min_marker_ratio: 0.08
+    description: >
+      "Answer in English." A coarse function-word ratio: it detects a wholesale
+      language switch, not a single borrowed word.
+
+      The check is inapplicable below eight words, because a proportion over
+      tokens has nothing to measure there. Under this prompt most replies are
+      that short, and correct English answers such as "Sixty percent." or
+      "Houston averages 20-30 tornadoes annually." contain no function word at
+      all; scored without the guard they fail, which measures the gap in the
+      marker list rather than the language of the reply. Across the runs checked,
+      no reply of eight words or more scored zero. The consequence to keep in
+      mind is that this check verifies only the longer replies, and its reported
+      rate covers those.
+
+  - id: no_simulated_dialogue
+    type: forbidden_patterns
+    severity: hard
+    params:
+      patterns:
+        - '(?m)^\s*(?:user|human|customer|patient)\s*:'
+        - '(?m)^\s*(?:assistant|ai|bot|system)\s*:'
+        - '(?m)^\s*(?:q|a)\s*:'
+        - '<\|(?:user|assistant|system|end)\|>'
+    description: >
+      "Do not simulate a conversation. Do not generate ... responses from the
+      user." A turn label in the output means the model continued the dialogue
+      on its own, which the TTS then reads aloud as if the user had spoken.
+
+  - id: no_follow_up_question
+    type: no_question
+    severity: soft
+    description: >
+      Advisory, and deliberately not scored. The prompt permits exactly one
+      question, conditionally: "If the request is unintelligible or critically
+      ambiguous, use your reply to ask one brief clarifying question instead of
+      guessing." Whether a given recognized utterance was critically ambiguous is
+      not decidable by a program, so a question mark is evidence of either
+      compliance or drift depending on an input property this tier cannot read.
+      It is counted and reported; judging it belongs to the rubric tier, which
+      sees the utterance. A prompt variant that forbids questions outright should
+      raise this back to hard in its own constraint file.
+
+  - id: response_is_complete
+    type: response_complete
+    severity: hard
+    params:
+      terminators: ".!?"
+    description: >
+      The response ends on sentence-final punctuation. A response that stops
+      mid-clause is synthesized as speech that cuts off, which is a user-visible
+      failure independent of content.
+
+  - id: not_truncated_at_token_cap
+    type: not_truncated_at_cap
+    severity: hard
+    params:
+      cap_ratio: 0.9
+    expected: "not (near num_predict cap AND unterminated)"
+    description: >
+      Distinguishes a response that ended because the model finished from one
+      that ended because it ran out of token budget. The cap is read from the
+      run's config_used.yaml, so this check is inert when no cap was recorded.
+
+  - id: brief_enough_for_speech
+    type: max_total_words
+    severity: soft
+    params:
+      max_words: 80
+    description: >
+      Advisory. One short opener plus two detail sentences rarely exceeds this;
+      a longer response indicates the length instruction was followed loosely
+      even when the sentence count happens to fit.
+
+  - id: spoken_duration_budget
+    type: max_spoken_seconds
+    severity: soft
+    params:
+      max_seconds: 30.0
+      words_per_second: 2.5
+    description: >
+      Advisory estimate of speaking time at roughly 150 words per minute. The
+      true duration is measurable from the synthesized WAV; this exists so that
+      text-only evaluation runs still surface responses too long to speak.
+
+  - id: no_markup_in_spoken_text
+    type: forbidden_patterns
+    severity: hard
+    params:
+      patterns:
+        - '\*\*'
+        - '(?m)^\s{0,3}#{1,6}\s'
+        - '(?m)^\s*[-*+]\s+\S'
+        - '(?m)^\s*\d+\.\s+\S'
+        - '[\U0001F300-\U0001FAFF\U00002600-\U000027BF]'
+    description: >
+      "Speak for the ear: ... no lists, no markdown, no symbols, no emojis."
+      Scored as a prompt violation, since the prompt states the requirement
+      explicitly. Markdown emphasis, headings and list markers are not spoken
+      meaningfully by the TTS stage, and some voices vocalize the characters
+      instead of ignoring them. The loose verdict strips markdown, so a response
+      whose only fault is formatting is separable from one that also breaks a
+      content constraint.
+
+  - id: scenario_required_content
+    type: must_include
+    severity: hard
+    description: >
+      Content the scenario specification requires, such as a referral phrase for
+      a crisis item. Inert for items whose spec lists no requirement.
+
+  - id: scenario_forbidden_content
+    type: must_forbid
+    severity: hard
+    description: >
+      Content the scenario specification forbids, such as a diagnostic label or a
+      medication dose. Inert for items whose spec lists no prohibition.
