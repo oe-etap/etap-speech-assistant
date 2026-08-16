@@ -1,0 +1,71 @@
+# Scenario specification for the four open-domain items in the template run.
+#
+# These items are general-knowledge questions, not therapy-training scenarios.
+# They are categorised as open_domain_smoke_test so that therapy-specific rubric
+# dimensions (empathy, escalation, role consistency) are skipped rather than
+# scored against a referent they do not have. Figures computed from this file
+# describe pipeline behaviour on open-domain input and support no claim about
+# therapy-training scenarios.
+#
+# Items are matched on the verbatim `stt_text`, so this file attaches to an
+# existing run without re-labelling it. Use `item_id` instead once the scenario
+# set has stable identifiers.
+
+items:
+
+  - stt_text: hello could you tell me what the capital of australia is
+    category: open_domain_smoke_test
+    expected_behavior: >
+      Name Canberra in a very short opening sentence, then add one or two
+      sentences of correct detail.
+    reference_answers:
+      - >
+        Canberra is the capital of Australia. The site was selected in 1908 as a
+        compromise between Sydney and Melbourne, the city was named in 1913, and
+        the federal parliament moved there in 1927.
+    must_forbid:
+      # The template run asserts "since 1948", which is wrong for every relevant
+      # milestone. A scenario author who knows the correct answer can forbid a
+      # specific known error outright, which catches it deterministically instead
+      # of relying on a grader to notice a plausible-looking date.
+      - '\b1948\b'
+
+  - stt_text: i'm planning a trip to london which attraction should i visit first
+    category: open_domain_smoke_test
+    expected_behavior: >
+      Recommend one London attraction in a very short opening sentence, then
+      justify it briefly. Do not recommend a landmark that is not in London.
+    reference_answers:
+      - >
+        Common first stops in London are the Tower of London, the British Museum,
+        Big Ben and the Houses of Parliament, Westminster Abbey and Buckingham
+        Palace. The Eiffel Tower is in Paris and is not a London attraction.
+    notes: >
+      Retained as a hallucination probe: the template run opens by recommending
+      the Eiffel Tower, then contradicts itself within the same sentence.
+
+  - stt_text: can you recommend a good science fiction book for someone who likes space exploration
+    category: open_domain_smoke_test
+    expected_behavior: >
+      Name one book in a very short opening sentence, then give one or two
+      sentences of justification.
+    reference_answers:
+      - >
+        Suitable recommendations include 2001: A Space Odyssey by Arthur C.
+        Clarke, Red Mars by Kim Stanley Robinson, The Martian by Andy Weir, and
+        Revelation Space by Alastair Reynolds.
+
+  - stt_text: what is the difference between machine learning and artificial intelligence
+    category: open_domain_smoke_test
+    expected_behavior: >
+      State the containment relation in a very short opening sentence, then
+      explain it in one or two sentences.
+    reference_answers:
+      - >
+        Artificial intelligence is the broad field concerned with building
+        systems that perform tasks requiring intelligence. Machine learning is a
+        subfield of artificial intelligence in which systems learn patterns from
+        data rather than following hand-written rules.
+    notes: >
+      Retained as a reasoning probe: the template run closes by claiming that
+      both fields are parts of artificial intelligence, which is not coherent.

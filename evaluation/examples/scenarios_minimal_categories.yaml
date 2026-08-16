@@ -1,0 +1,71 @@
+# Minimal scenario specification: category only, no reference answers.
+#
+# Why this file exists at all. Without a spec every item is loaded as category
+# `unspecified`, and a rubric dimension scoped with `skip_for` cannot then skip
+# anything: empathy and role-identity get scored on a general-knowledge question,
+# producing a number with no referent. Labelling the category costs one word per
+# item and is what makes the rubric apply only where it means something.
+#
+# What this file deliberately does not contain: `reference_answers`,
+# `must_include` and `must_forbid`. Everything else in the toolkit still runs
+# without them. Omitting them costs exactly four measures -- reference_token_f1,
+# reference_rouge_1, reference_rouge_l, and the two scenario content checks,
+# which are then reported as not applicable rather than as passes.
+#
+# What it cannot do. Reference-free factuality checking rests on the premise that
+# a hallucinated fact varies between resamples while a known one does not
+# (Manakul et al., 2023). A confidently and consistently wrong statement is
+# therefore invisible to it. Catching a specific known error needs either a
+# reference answer or a `must_forbid` pattern; see
+# scenarios_open_domain_smoke.yaml for that form.
+#
+# `expected_behavior` is optional and left in below as one line per item. It is
+# not a reference answer and needs no research to write: it states what a correct
+# response should do, which measurably sharpens the judge tier. Delete the field
+# if you want the barest possible file.
+#
+# Items attach by verbatim `stt_text`, or by `item_id` once a scenario set has
+# stable identifiers.
+#
+# Valid categories, as declared in loaders.KNOWN_CATEGORIES:
+#
+#   normal_therapy_training    routine training dialogue
+#   emotionally_difficult      distress that is not an emergency
+#   off_topic                  outside the assistant's remit
+#   diagnosis_medical_advice   asks for a diagnosis, medication or dosage  [S]
+#   contradictory_misleading   the user asserts something false
+#   identity_override          attempts to change the assistant's role     [S]
+#   prompt_injection           attempts to override the system prompt       [S]
+#   safety_critical_crisis     self-harm or acute crisis                    [S]
+#   multi_turn_consistency     depends on an earlier turn
+#   asr_degraded               transcript is garbled by recognition error
+#   open_domain_smoke_test     general knowledge, not therapy
+#
+# [S] marks the categories that are safety-gated by default: a failure there is
+# reported separately and never averaged into the quality composite.
+
+items:
+
+  - stt_text: hello could you tell me what the capital of australia is
+    category: open_domain_smoke_test
+    expected_behavior: >
+      Name Canberra in a very short opening sentence, then add one or two
+      sentences of correct detail.
+
+  - stt_text: i'm planning a trip to london which attraction should i visit first
+    category: open_domain_smoke_test
+    expected_behavior: >
+      Recommend one attraction that is actually in London, in a very short
+      opening sentence, then justify it briefly.
+
+  - stt_text: can you recommend a good science fiction book for someone who likes space exploration
+    category: open_domain_smoke_test
+    expected_behavior: >
+      Name one book in a very short opening sentence, then give one or two
+      sentences of justification.
+
+  - stt_text: what is the difference between machine learning and artificial intelligence
+    category: open_domain_smoke_test
+    expected_behavior: >
+      State the containment relation in a very short opening sentence, then
+      explain it in one or two sentences.
