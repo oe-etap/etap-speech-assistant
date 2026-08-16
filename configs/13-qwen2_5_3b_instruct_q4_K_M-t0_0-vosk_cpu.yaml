@@ -1,0 +1,208 @@
+# Default Configuration for MWE Assistant
+# You can override these values either by modifying this file or via CLI arguments.
+
+audio: 
+  - "./audios"
+
+mode: cpu
+stt-engine: vosk
+tts-engine: piper
+
+out-dir: outputs/13-qwen2_5_3b_instruct_q4_K_M-t0_0-vosk_cpu
+keep-normalized: false
+input-mode: file  # 'file' or 'mic'
+
+# Aggregate the run's own latency log when it finishes, into the same folder:
+# log_averages_summary.txt, log_averages.tsv and log_averages.json. The CSV is
+# the raw material, and what the run measured is the distribution over it.
+# false leaves the folder with the CSV alone; aggregate_logs.py produces the
+# same three files from it at any later point.
+summary: true
+
+# How input files are fed to the STT engine.
+#   realtime: simulate a microphone at 1x speed, so STT overlaps with the speech.
+#             Required for ttfa and stt_endpoint_delay, which are blank without
+#             it: only here does a point inside the audio map to an instant.
+#             Input files need enough silence after the last word for the
+#             endpointer to fire before the audio runs out -- about 1.1 s at the
+#             settings below, and more if vosk-endpoint-silence-ms or
+#             audio-chunk-ms is raised.
+#             Short of that the run measures a path live input never takes. A
+#             warning is printed when there is too little, naming the figure.
+#   fast:     read as quickly as possible, for throughput runs and for the
+#             per-stage costs, which stay valid without the pacing.
+audio-pacing: realtime
+
+# What starts the LLM under file input with realtime pacing.
+#   endpoint:    answer as soon as the STT calls the utterance over, which is
+#                the only thing a microphone can do. Silence past the endpoint
+#                costs nothing, so the trailing-silence upper bound drops away.
+#   end-of-file: wait for the whole file. Any silence beyond the endpoint is
+#                added to the latency in full.
+# Ignored under 'fast' pacing and in mic mode. No effect with Whisper, which
+# has no endpointer and finalizes only when the stream ends.
+file-realtime-trigger: endpoint
+# Chunk length handed to the STT. The endpointer can only fire on a chunk
+# boundary, so this costs about 0.4 ms of response time per ms of chunk. Nothing
+# else measurably moves with it between 50 and 250 ms -- not accuracy, not how
+# often the endpointer fires mid-sentence, not STT CPU.
+audio-chunk-ms: 100
+playback: false   # Play TTS output on speakers
+idle-timeout: 10.0 # Shutdown after N seconds of silence
+
+# STT Options
+vosk-model: "./vosk/vosk-model-small-en-us-0.15"
+
+# Silence after the last word before Vosk calls the utterance over. This is the
+# largest single component of what a user perceives as the response time, and
+# the whole of it is on the critical path.
+#
+# Too low and the endpointer fires on a breath: the LLM is handed half a
+# question, and that generation is discarded when the rest of the words arrive.
+# Swept over 833 recordings (see vosk_endpoint_sweep.py), 600 ms is where that
+# stops happening -- and waiting longer buys nothing, since the one utterance
+# still split at 600 ms is a false start that survives 1500 ms too.
+#
+# One number puts the same wait in front of every utterance. Three -- written
+# 500/600/600, for Kaldi's rules 2, 3 and 4 -- keep the shipped habit of leaving
+# early when the words already parse as a finished utterance, which takes 220 ms
+# off the fifth of utterances where the decoder is sure, at three times the
+# split rate. That trade is left to the operator: a split is audible, the answer
+# to the half-sentence having usually started playing before the rest arrives.
+#
+# 0 leaves the model's own settings alone. Nothing recommends them: both of the
+# above are faster and split no more often.
+vosk-endpoint-silence-ms: 600
+whisper-model: "small"
+whisper-device: "cuda"
+whisper-compute-type: "int8"
+
+# TTS Options
+piper-exe: "./piper/piper.exe"
+piper-voice: "./piper/en_US-lessac-medium.onnx"
+piper-use-exe: false
+
+# Execution provider for the Piper voice model, cpu or cuda. Unset follows the
+# `mode` preset above.
+#
+# The GPU has a floor of about 70 ms per call that no amount of shortening gets
+# under, while the CPU's cost tracks the length of the audio produced. Below
+# roughly 40 characters the CPU is ahead and cuda is the slower setting; above
+# it the gap opens the other way, to better than half at a full-length chunk.
+# Since the first chunk of an answer is the short one, and it alone is what
+# `ttfa` waits on, this is not the free win it looks like -- see the README.
+#
+# Needs an onnxruntime-gpu built for the GPU's compute capability. A provider
+# that fails to initialize is not an error to ONNX Runtime, which quietly runs
+# on the CPU instead; that is refused here rather than logged as a GPU run.
+piper-device: cpu
+
+# ONNX Runtime intra-op threads for the Piper voice model, on CPU.
+#
+# Piper is already parallel without this: left alone, ONNX Runtime sizes the
+# pool at one thread per core -- 15 here, and `tts_first_chunk` runs the box at
+# 93% CPU. What it also does, and only when the count is left at its default, is
+# pin each of those threads to a single core.
+#
+# On an idle box the pinning costs nothing. The first chunk is not synthesized on
+# an idle box: the LLM is still generating the rest of the answer underneath it,
+# and a pinned thread whose core is busy cannot migrate, so the inference waits
+# for its slowest thread. Measured under a streaming phi3:mini, first chunk
+# averaged over the four basic files: 226 ms pinned, 170 ms at 16 unpinned
+# threads, 123 ms at 12. Idle, the same three are within 2 ms of each other --
+# which is why this never showed up in a microbenchmark.
+#
+# Setting any explicit count is what turns the pinning off; the count is the
+# smaller half of the win. 12 is three quarters of this box's 16 cores, leaving
+# room for the LLM's streaming thread and the STT. On a different core count,
+# scale it rather than keeping 12 -- and re-measure under load, not idle.
+#
+# Unset leaves ONNX Runtime its default, pinning included. Ignored on cuda,
+# where the pool only feeds the GPU.
+piper-num-threads: 12
+
+coqui-voice: "xtts_v2"
+coqui-language: "en"
+coqui-speaker: "Daisy Studious"
+
+# Device for Coqui XTTS-v2. Unset follows the `mode` preset above.
+#
+# Not the same kind of choice as piper-device. XTTS-v2 is autoregressive and
+# generates slower than it speaks on this CPU, so `cpu` is not a slower setting
+# but an unusable one -- a single opening sentence takes longer than the entire
+# response budget. On the GPU it is usable and still costs several times what
+# Piper does. Needs a PyTorch built for the GPU's compute capability; see
+# requirements_gpu.txt.
+coqui-device: cuda
+
+# Shared LLM Options
+ollama-model: "qwen2.5:3b-instruct-q4_K_M"
+ollama-url: "http://localhost:11434/api/generate"
+
+# System prompt variant. Variants live in prompts/ and are identified by filename.
+# The prompt actually used is copied to <out-dir>/system_prompt.txt.
+system-prompt-file: "./prompts/short-opener.txt"
+
+llm-max-tokens: 150
+
+# KV cache size in tokens. Left unset, Ollama picks from the VRAM it finds --
+# 32768 on this 32 GB card -- and phi3:mini then occupies 15 GB instead of
+# 2.6 GB, qwen2.5:32b-instruct-q4_K_M 28 GB instead of 19 GB. Generation speed
+# is unchanged either way while the model fits (134.6 vs 133.4 tok/s on
+# phi3:mini, 28.0 vs 27.8 on the 32B), so this is a VRAM knob, not a speed knob.
+#
+# It becomes a speed knob at the cliff: the layers that no longer fit run on the
+# CPU -- 72.5 tok/s down to 12.5 with 70% of an 8B q4_K_M there -- and Ollama
+# reports this nowhere. The 9 GB it frees on the 32B is the margin that keeps the
+# next model up, or a second tenant on the GPU, from pushing a run over that edge.
+#
+# Budget it as system prompt + user text + llm-max-tokens. The prompts here come
+# to a few hundred tokens against 1024; a longer prompt variant needs this raised
+# with it, or llama.cpp's context shift will quietly drop the head of the system
+# prompt. 0 follows the server default.
+llm-num-ctx: 1024
+
+# How long Ollama holds the model in VRAM after a request. A reload costs about
+# 8 s for an 8B q4_K_M -- 7.6 s measured, against 0.8 s for a request that found
+# it resident -- and a reload triggered by the first utterance is paid inside
+# that utterance's latency. The server's own default of 5m expires between runs.
+#
+# Pair a long value with OLLAMA_MAX_LOADED_MODELS=1 on the server. Without it a
+# sweep leaves each model resident while the next one loads, and the next one
+# gets what VRAM is left. Empty follows the server default.
+llm-keep-alive: "30m"
+
+# Layers offloaded to the GPU. Unset lets Ollama size the offload itself, which
+# it did correctly for every model in this repo. Set 99 to force all of them:
+# a model that then does not fit fails loudly instead of half-loading onto the
+# CPU and returning numbers that look merely disappointing.
+llm-num-gpu: null
+
+# Prompt-processing batch size (server default 512) and runner CPU threads
+# (server default one per core, so 16 here). Neither is on the critical path
+# while the model is GPU-resident: prompts are far shorter than one batch, and
+# the CPU only feeds the GPU. num-thread is the more interesting of the two,
+# since those 16 threads share the box with Vosk and Piper.
+llm-num-batch: null
+llm-num-thread: null
+
+# Response length varies enough between runs to hide whatever is under test, and
+# llm_eval, tts_total and e2e_response_ready all scale with it. Greedy decoding
+# removes most of that variance -- but not all of it, and not reliably across
+# process restarts: two runs over the same recordings, with identical
+# transcripts reaching the LLM, still came back with different answers from a
+# GPU-resident phi3:mini. Treat temperature 0 as narrowing the spread, not as
+# pairing two runs.
+#
+# The seed does nothing at temperature 0 and is left unset rather than set to a
+# number that looks load-bearing but is not. Raise the temperature only together
+# with a seed, for instance to sample realistic response lengths.
+# Note: `null` is YAML for "no value"; writing None would be the string "None".
+llm-temperature: 0
+llm-seed: null
+
+# Safety-net chunk length for the LLM -> TTS handoff. Chunks are normally cut at
+# sentence boundaries; a sentence longer than this is split at a word boundary so
+# the TTS does not have to wait for the whole response.
+# Lower = lower TTFA, higher = better prosody.
+tts-chunk-max-chars: 140
