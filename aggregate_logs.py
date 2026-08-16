@@ -19,7 +19,7 @@ Writes a formatted table for reading, a TSV for pasting into a spreadsheet and,
 with --json-file, the whole thing including the per-item values for reanalysis.
 
 Importable as much as runnable: aggregate() does from code what the command
-line does, which is how mwe_assistant.py leaves a summary in the folder of
+line does, which is how assistant.py leaves a summary in the folder of
 every run it finishes.
 """
 

@@ -16,7 +16,7 @@ _DEFAULT_STOP_TOKENS = ["\nUser:", "\nHuman:", "\n---", "---", "<|end|>", "<|use
 
 # Fallback used when no prompt file is configured. Prompt variants for
 # experiments live in prompts/ instead, see load_system_prompt() in
-# mwe_assistant.py.
+# assistant.py.
 DEFAULT_SYSTEM_PROMPT = (
     "You are a concise, factual but friendly voice assistant. "
     "Answer the user's question in English in 1-3 medium length sentences. "

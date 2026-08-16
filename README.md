@@ -1,4 +1,4 @@
-# Offline Speech Assistant MWE (EN) - File Input, CPU/GPU
+# Offline Speech Assistant (EN) - File Input, CPU/GPU
 
 Audio -> STT -> LLM -> TTS, mostly offline. The only network-like dependency is the local Ollama HTTP API, and Ollama model downloads happen outside this script.
 
@@ -78,7 +78,7 @@ Additional assets:
 Whisper on CPU with Piper:
 
 ```bash
-python mwe_assistant.py --audio .\sample_en.wav ^
+python assistant.py --audio .\sample_en.wav ^
   --mode cpu ^
   --stt-engine whisper ^
   --whisper-device cpu ^
@@ -93,7 +93,7 @@ python mwe_assistant.py --audio .\sample_en.wav ^
 Vosk on CPU with Piper:
 
 ```bash
-python mwe_assistant.py --audio .\sample_en.wav ^
+python assistant.py --audio .\sample_en.wav ^
   --mode cpu ^
   --stt-engine vosk ^
   --vosk-model .\vosk-model-small-en-us-0.15 ^
@@ -105,7 +105,7 @@ python mwe_assistant.py --audio .\sample_en.wav ^
 Whisper on CUDA with Coqui:
 
 ```bash
-python mwe_assistant.py --audio .\sample_en.wav ^
+python assistant.py --audio .\sample_en.wav ^
   --mode gpu ^
   --stt-engine whisper ^
   --whisper-device cuda ^
@@ -119,7 +119,7 @@ python mwe_assistant.py --audio .\sample_en.wav ^
 Multiple files:
 
 ```bash
-python mwe_assistant.py --audio .\a.wav .\b.mp3 .\c.flac --stt-engine whisper --tts-engine piper
+python assistant.py --audio .\a.wav .\b.mp3 .\c.flac --stt-engine whisper --tts-engine piper
 ```
 
 ## Important Arguments

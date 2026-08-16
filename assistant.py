@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Offline Speech Assistant MWE (EN): audio file -> STT -> LLM -> TTS.
+Offline Speech Assistant (EN): audio file -> STT -> LLM -> TTS.
 Supports selectable engines:
   - STT: Vosk or faster-whisper
   - TTS: Piper or Coqui TTS
@@ -1311,7 +1311,7 @@ def report_llm_placement(llm_engine, model_name):
 
 # ---------- Main ----------
 def main():
-    parser = argparse.ArgumentParser(description="Offline Speech Assistant MWE (EN, file input only)")
+    parser = argparse.ArgumentParser(description="Offline Speech Assistant (EN, file input only)")
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config file (CLI args override it)")
     parser.add_argument("--audio", nargs="+", help="One or more audio files (wav/mp3/flac/etc.)")
     parser.add_argument("--mode", choices=["cpu", "gpu"], default="cpu", help="Default compute preset")
