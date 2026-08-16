@@ -22,7 +22,7 @@ rather than `python`; both forms are equivalent.
 ## From the command line
 
 ```powershell
-cd etap-speech-assistant-mwe-main
+cd etap-speech-assistant-main
 python -m evaluation --run-dir ..\output-template\20260809_164356
 ```
 
