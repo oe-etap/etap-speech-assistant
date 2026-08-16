@@ -1,0 +1,20 @@
+# Dependencies of the evaluation package alone, independent of the pipeline.
+#
+# Install with:  pip install -r evaluation/requirements.txt
+#
+# Everything here is used offline. The only network endpoint the package ever
+# contacts is a local Ollama server, and only when a model-backed tier is
+# switched on.
+
+requests>=2.28
+PyYAML>=6.0
+numpy>=1.24
+
+# Optional, and detected at runtime rather than required:
+#
+#   scipy                  exact t and normal quantiles for the TOST equivalence
+#                          test; a built-in approximation is used without it.
+#   sentence-transformers  embedding similarity for relevance and for the
+#                          self-consistency support kernel. Downloads a model on
+#                          first use, so it is the one part that needs network
+#                          access once.
