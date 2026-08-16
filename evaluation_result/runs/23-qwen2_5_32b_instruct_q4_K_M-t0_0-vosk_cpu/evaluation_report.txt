@@ -1,0 +1,1171 @@
+====================================================================================================
+                        LLM RESPONSE EVALUATION REPORT
+====================================================================================================
+Generated on           : 2026-08-15 23:57:59
+Run label              : 23 qwen2.5:32b-q4_K_M t0
+Transcripts            : ..\results\text-only\23-qwen2_5_32b_instruct_q4_K_M-t0_0-vosk_cpu\20260815_162513\transcripts.yaml
+Run directory          : ..\results\text-only\23-qwen2_5_32b_instruct_q4_K_M-t0_0-vosk_cpu\20260815_162513
+System prompt          : ..\results\text-only\23-qwen2_5_32b_instruct_q4_K_M-t0_0-vosk_cpu\20260815_162513\system_prompt.txt
+Constraint spec        : short_opener_en (C:\Workspace\etap\etap-speech-assistant-main\evaluation\rubrics\constraints_short_opener.yaml)
+Rubric                 : (judge tier not run)
+Items evaluated        : 120
+
+Generating configuration (from config_used.yaml):
+  ollama_model        : qwen2.5:32b-instruct-q4_K_M
+  llm_temperature     : 0
+  llm_seed            : None
+  llm_max_tokens      : 150
+  stt_engine          : vosk
+  tts_engine          : piper
+  mode                : cpu
+
+Tiers executed:
+  tier 0 constraints and readability: 15 checks from short_opener_en, token cap 150
+  input fidelity (recognizer)       : reference text for 120/120 item(s), corpus WER 0.350 (425/1215 words); strata: mild 66, severe 37, clean 17
+  tier 1 relevance                  : IDF over 120 items, reference measures for 120 item(s) from metadata.csv (32 marked unanswerable in the source, scored against a plausible answer)
+  runtime cost                      : 119/120 item(s) timed from latency_log_20260815_162513.csv, 1 warm-up item(s) excluded (00004)
+  tier 2 audit atoms                : deterministic extraction (always on)
+  tier 2 self-consistency           : off (selfcheck_samples = 0)
+  tier 2 atomic factual precision   : off (fact_precision not set)
+  tier 3 rubric grading             : off (no judge model)
+  tier 4 reliability and calibration: off (no human annotations)
+
+Acceptance policy (predeclare this before measurement):
+  min_quality_composite       : 3.5
+  min_safety_score            : 4.0
+  require_constraint_pass     : True
+  strict_constraints          : True
+====================================================================================================
+
+1. PER-ITEM SCORES
+====================================================================================================
+Item      	Category                  	   WER	 Adher	  Chk%	 Words	    FRE	 Cover	 CovOri	  E2E ms	 Incon	  Fact	  Qual	  Safe	 Accept
+----------------------------------------------------------------------------------------------------
+00004     	unspecified               	  0.22	  FAIL	    90	    17	   53.9	  0.63	   0.78	       -	     -	     -	     -	     -	     NO
+00005     	unspecified               	  0.08	  PASS	   100	    16	   29.5	  0.51	   0.51	    8122	     -	     -	     -	     -	    yes
+00012     	unspecified               	  0.50	  PASS	   100	    10	   83.3	  0.00	   0.00	    7132	     -	     -	     -	     -	    yes
+00030     	unspecified               	  0.25	  FAIL	    90	    15	   35.7	  0.18	   0.00	    8207	     -	     -	     -	     -	     NO
+00032     	unspecified               	  0.00	  FAIL	    89	     6	  130.2	  0.00	   0.00	    7294	     -	     -	     -	     -	     NO
+00035     	unspecified               	  0.20	  PASS	   100	    12	   59.8	  0.66	   0.51	    7220	     -	     -	     -	     -	    yes
+00045     	unspecified               	  0.22	  PASS	   100	    21	   71.3	  0.58	   0.59	    7557	     -	     -	     -	     -	    yes
+00046     	unspecified               	  0.00	  PASS	   100	    22	   61.0	  0.78	   0.78	    7583	     -	     -	     -	     -	    yes
+00047     	unspecified               	  0.33	  PASS	   100	    18	   69.2	  0.14	   0.48	    9298	     -	     -	     -	     -	    yes
+00054     	unspecified               	  0.30	  FAIL	    90	    16	   71.8	  0.31	   0.36	    7986	     -	     -	     -	     -	     NO
+00057     	unspecified               	  1.44	  FAIL	    90	    19	   41.4	  0.86	   0.00	   10536	     -	     -	     -	     -	     NO
+00059     	unspecified               	  1.00	  FAIL	    90	    26	   60.2	  0.40	   0.00	   10251	     -	     -	     -	     -	     NO
+00063     	unspecified               	  0.00	  FAIL	    89	     7	   54.7	  1.00	   1.00	    6684	     -	     -	     -	     -	     NO
+00072     	unspecified               	  0.00	  PASS	   100	    13	   50.6	  0.20	   0.20	    7242	     -	     -	     -	     -	    yes
+00088     	unspecified               	  0.11	  PASS	   100	    17	   29.0	  0.75	   1.00	    6594	     -	     -	     -	     -	    yes
+00089     	unspecified               	  0.10	  PASS	   100	    27	   45.9	  0.14	   0.28	    7984	     -	     -	     -	     -	    yes
+00093     	unspecified               	  0.80	  FAIL	    90	    17	   78.8	  0.37	   0.30	    5653	     -	     -	     -	     -	     NO
+00100     	unspecified               	  0.43	  PASS	   100	    11	  101.3	  0.74	   1.00	    6350	     -	     -	     -	     -	    yes
+00113     	unspecified               	  0.08	  PASS	   100	    16	   56.0	  0.15	   0.15	    7824	     -	     -	     -	     -	    yes
+00118     	unspecified               	  0.27	  FAIL	    90	    24	   53.7	  0.69	   0.55	    8501	     -	     -	     -	     -	     NO
+00124     	unspecified               	  0.11	  PASS	   100	    14	    6.4	  0.43	   0.44	    6525	     -	     -	     -	     -	    yes
+00130     	unspecified               	  3.60	  FAIL	    90	    14	   72.8	  0.00	   0.00	    9540	     -	     -	     -	     -	     NO
+00149     	unspecified               	  0.35	  PASS	   100	    16	   61.2	  0.36	   0.42	    7854	     -	     -	     -	     -	    yes
+00170     	unspecified               	  0.33	  PASS	   100	    13	   31.0	  0.51	   1.00	    7125	     -	     -	     -	     -	    yes
+00178     	unspecified               	  0.11	  FAIL	    90	    27	   45.9	  0.41	   0.56	    8947	     -	     -	     -	     -	     NO
+00181     	unspecified               	  0.07	  PASS	   100	    31	   84.5	  0.32	   0.56	   11813	     -	     -	     -	     -	    yes
+00197     	unspecified               	  0.17	  FAIL	    80	    19	   72.5	  0.20	   0.10	   13498	     -	     -	     -	     -	     NO
+00201     	unspecified               	  0.42	  FAIL	    90	    13	   11.5	  0.00	   0.00	    8010	     -	     -	     -	     -	     NO
+00206     	unspecified               	  0.20	  PASS	   100	    32	   58.5	  1.00	   0.67	    6677	     -	     -	     -	     -	    yes
+00208     	unspecified               	  0.33	  PASS	   100	    14	   84.9	  0.77	   0.66	    7152	     -	     -	     -	     -	    yes
+00211     	unspecified               	  0.08	  PASS	   100	    20	   40.2	  0.69	   0.69	   10924	     -	     -	     -	     -	    yes
+00233     	unspecified               	  0.12	  PASS	   100	    11	   78.2	  0.70	   0.70	    6141	     -	     -	     -	     -	    yes
+00236     	unspecified               	  0.14	  PASS	   100	    10	   49.5	  0.17	   0.17	    8291	     -	     -	     -	     -	    yes
+00244     	unspecified               	  0.00	  PASS	   100	    10	   74.9	  0.28	   0.28	    8103	     -	     -	     -	     -	    yes
+00245     	unspecified               	  0.22	  PASS	   100	    14	   72.8	  0.15	   0.15	    7312	     -	     -	     -	     -	    yes
+00259     	unspecified               	  0.00	  PASS	   100	    30	   67.5	  0.79	   0.79	    7896	     -	     -	     -	     -	    yes
+00261     	unspecified               	  0.15	  FAIL	    90	    27	   47.8	  0.43	   0.43	    8000	     -	     -	     -	     -	     NO
+00266     	unspecified               	  0.29	  FAIL	    89	     6	   31.6	  0.00	   0.00	   11252	     -	     -	     -	     -	     NO
+00267     	unspecified               	  0.29	  PASS	   100	     8	   97.0	  0.00	   0.00	    6470	     -	     -	     -	     -	    yes
+00271     	unspecified               	  0.33	  PASS	   100	    27	   20.8	  0.42	   0.34	    8881	     -	     -	     -	     -	    yes
+00290     	unspecified               	  0.33	  PASS	   100	    18	   73.8	  0.63	   0.61	    5791	     -	     -	     -	     -	    yes
+00298     	unspecified               	  0.00	  PASS	   100	    15	   13.1	  1.00	   1.00	    6233	     -	     -	     -	     -	    yes
+00305     	unspecified               	  0.92	  PASS	   100	    18	   52.0	  0.57	   0.00	    7977	     -	     -	     -	     -	    yes
+00311     	unspecified               	  0.69	  FAIL	    90	    14	   91.0	  0.42	   0.29	   10106	     -	     -	     -	     -	     NO
+00325     	unspecified               	  0.10	  PASS	   100	     9	   33.1	  0.74	   0.46	    8192	     -	     -	     -	     -	    yes
+00326     	unspecified               	  0.42	  PASS	   100	    21	   47.1	  0.42	   0.38	    9337	     -	     -	     -	     -	    yes
+00327     	unspecified               	  0.25	  FAIL	    90	    13	    0.7	  0.00	   0.00	    7289	     -	     -	     -	     -	     NO
+00335     	unspecified               	  1.17	  PASS	   100	    20	   39.3	  0.25	   0.00	    7617	     -	     -	     -	     -	    yes
+00352     	unspecified               	  1.00	  PASS	   100	    14	   84.9	  0.50	   0.00	    9734	     -	     -	     -	     -	    yes
+00357     	unspecified               	  0.43	  FAIL	    80	    27	   33.3	  0.50	   0.76	    7159	     -	     -	     -	     -	     NO
+00366     	unspecified               	  0.55	  PASS	   100	    14	   72.8	  0.27	   0.27	   10269	     -	     -	     -	     -	    yes
+00369     	unspecified               	  0.42	  PASS	   100	    17	   86.6	  0.16	   0.16	    7729	     -	     -	     -	     -	    yes
+00382     	unspecified               	  0.38	  PASS	   100	    11	   47.4	  0.51	   1.00	    6672	     -	     -	     -	     -	    yes
+00389     	unspecified               	  1.20	  PASS	   100	    10	   83.3	  0.00	   0.00	    7892	     -	     -	     -	     -	    yes
+00394     	unspecified               	  0.20	  FAIL	    89	     6	   45.6	  0.44	   0.54	    6397	     -	     -	     -	     -	     NO
+00406     	unspecified               	  0.08	  PASS	   100	    12	   66.8	  0.20	   0.17	    7799	     -	     -	     -	     -	    yes
+00417     	unspecified               	  0.20	  PASS	   100	    10	   91.8	  0.27	   0.00	   10070	     -	     -	     -	     -	    yes
+00422     	unspecified               	  0.05	  PASS	   100	    11	   62.8	  0.00	   0.00	   10868	     -	     -	     -	     -	    yes
+00425     	unspecified               	  0.00	  PASS	   100	    15	   41.3	  0.00	   0.00	    7550	     -	     -	     -	     -	    yes
+00432     	unspecified               	  0.17	  PASS	   100	    23	   70.1	  0.48	   1.00	   10131	     -	     -	     -	     -	    yes
+00433     	unspecified               	  0.90	  FAIL	    90	    27	   37.9	  0.70	   0.00	    7167	     -	     -	     -	     -	     NO
+00441     	unspecified               	  0.17	  PASS	   100	    20	   40.2	  1.00	   1.00	    6376	     -	     -	     -	     -	    yes
+00443     	unspecified               	  0.57	  FAIL	    90	    12	   95.0	  0.00	   0.00	    6566	     -	     -	     -	     -	     NO
+00444     	unspecified               	  0.00	  PASS	   100	    19	   14.6	  1.00	   1.00	    5946	     -	     -	     -	     -	    yes
+00452     	unspecified               	  0.69	  PASS	   100	    27	   75.5	  0.34	   0.00	   11612	     -	     -	     -	     -	    yes
+00455     	unspecified               	  1.22	  PASS	   100	    19	   72.5	  0.79	   0.00	    8975	     -	     -	     -	     -	    yes
+00457     	unspecified               	  0.83	  PASS	   100	    15	   75.1	  0.73	   0.00	    7331	     -	     -	     -	     -	    yes
+00460     	unspecified               	  0.30	  PASS	   100	    17	   34.0	  0.80	   0.22	    6415	     -	     -	     -	     -	    yes
+00474     	unspecified               	  0.50	  PASS	   100	    18	   73.8	  0.78	   0.52	    7285	     -	     -	     -	     -	    yes
+00475     	unspecified               	  0.44	  PASS	   100	    13	   -1.5	  0.51	   0.81	    7951	     -	     -	     -	     -	    yes
+00476     	unspecified               	  0.00	  FAIL	    90	    18	    5.0	  0.49	   0.49	    6758	     -	     -	     -	     -	     NO
+00481     	unspecified               	  0.14	  FAIL	    90	    41	   44.4	  0.75	   0.52	    8307	     -	     -	     -	     -	     NO
+00484     	unspecified               	  0.30	  PASS	   100	    12	   73.8	  0.31	   0.00	    7926	     -	     -	     -	     -	    yes
+00496     	unspecified               	  0.33	  FAIL	    90	    15	   58.2	  0.31	   0.31	    7031	     -	     -	     -	     -	     NO
+00497     	unspecified               	  0.14	  FAIL	    90	    29	   62.8	  0.64	   0.64	    7351	     -	     -	     -	     -	     NO
+00498     	unspecified               	  0.33	  FAIL	    90	    15	   63.9	  0.49	   0.49	    8555	     -	     -	     -	     -	     NO
+00500     	unspecified               	  0.00	  PASS	   100	    38	   65.1	  0.40	   0.40	   10676	     -	     -	     -	     -	    yes
+00501     	unspecified               	  0.33	  FAIL	    90	    13	   37.5	  0.39	   0.15	   10563	     -	     -	     -	     -	     NO
+00503     	unspecified               	  0.42	  FAIL	    90	    15	   80.8	  0.31	   0.11	    7646	     -	     -	     -	     -	     NO
+00507     	unspecified               	  0.17	  PASS	   100	    17	   76.7	  0.00	   0.00	    7104	     -	     -	     -	     -	    yes
+00521     	unspecified               	  0.30	  FAIL	    90	    21	   75.3	  0.63	   0.29	    7182	     -	     -	     -	     -	     NO
+00524     	unspecified               	  0.15	  PASS	   100	    23	   40.7	  0.86	   0.69	    9186	     -	     -	     -	     -	    yes
+00531     	unspecified               	  0.20	  PASS	   100	    19	    5.7	  0.32	   0.36	    8237	     -	     -	     -	     -	    yes
+00532     	unspecified               	  0.27	  PASS	   100	    17	    9.1	  0.56	   0.56	    8205	     -	     -	     -	     -	    yes
+00533     	unspecified               	  0.22	  FAIL	    90	    10	    2.1	  1.00	   0.83	    8006	     -	     -	     -	     -	     NO
+00546     	unspecified               	  0.33	  FAIL	    90	    14	   72.8	  0.32	   0.28	    6931	     -	     -	     -	     -	     NO
+00554     	unspecified               	  0.30	  PASS	   100	    19	   59.2	  0.40	   0.19	    7094	     -	     -	     -	     -	    yes
+00571     	unspecified               	  0.06	  PASS	   100	    11	   16.7	  0.11	   0.11	    9647	     -	     -	     -	     -	    yes
+00573     	unspecified               	  0.54	  FAIL	    90	    16	   87.7	  0.23	   0.14	    9705	     -	     -	     -	     -	     NO
+00582     	unspecified               	  0.33	  PASS	   100	    10	  100.2	  0.72	   1.00	    6882	     -	     -	     -	     -	    yes
+00594     	unspecified               	  0.33	  PASS	   100	    23	   70.1	  0.64	   0.34	    7647	     -	     -	     -	     -	    yes
+00612     	unspecified               	  1.20	  FAIL	    90	    26	   37.5	  0.48	   0.00	   10535	     -	     -	     -	     -	     NO
+00616     	unspecified               	  0.00	  PASS	   100	     4	   12.4	  0.32	   0.32	    6735	     -	     -	     -	     -	    yes
+00626     	unspecified               	  0.33	  PASS	   100	    24	   47.1	  0.00	   0.00	    6240	     -	     -	     -	     -	    yes
+00628     	unspecified               	  0.27	  PASS	   100	    18	   70.8	  0.31	   0.31	    9463	     -	     -	     -	     -	    yes
+00639     	unspecified               	  0.43	  FAIL	    89	     7	   66.8	  0.62	   0.50	    7769	     -	     -	     -	     -	     NO
+00640     	unspecified               	  0.08	  FAIL	    90	    13	   76.5	  0.81	   0.66	    7336	     -	     -	     -	     -	     NO
+00643     	unspecified               	  1.50	  FAIL	    90	    18	   94.3	  0.78	   0.00	    8716	     -	     -	     -	     -	     NO
+00653     	unspecified               	  0.18	  PASS	   100	    19	   44.6	  0.14	   0.16	    8426	     -	     -	     -	     -	    yes
+00656     	unspecified               	  0.00	  PASS	   100	    18	   70.8	  0.58	   0.58	   10771	     -	     -	     -	     -	    yes
+00657     	unspecified               	  0.91	  FAIL	    90	    23	   37.2	  0.51	   0.00	    9485	     -	     -	     -	     -	     NO
+00669     	unspecified               	  0.08	  FAIL	    80	    13	   76.6	  0.90	   0.90	    8723	     -	     -	     -	     -	     NO
+00670     	unspecified               	  0.06	  FAIL	    90	    15	   58.2	  0.37	   0.28	    8338	     -	     -	     -	     -	     NO
+00673     	unspecified               	  0.29	  PASS	   100	    30	   70.3	  0.22	   0.70	   11419	     -	     -	     -	     -	    yes
+00686     	unspecified               	  0.00	  PASS	   100	    27	    5.1	  0.58	   0.58	    8354	     -	     -	     -	     -	    yes
+00692     	unspecified               	  0.14	  PASS	   100	    14	   78.9	  0.77	   0.77	    7200	     -	     -	     -	     -	    yes
+00714     	unspecified               	  0.10	  PASS	   100	    15	   41.3	  0.40	   0.39	    8290	     -	     -	     -	     -	    yes
+00737     	unspecified               	  1.00	  PASS	   100	    14	   42.6	  0.60	   0.00	    7989	     -	     -	     -	     -	    yes
+00739     	unspecified               	  1.11	  PASS	   100	    18	   41.0	  0.30	   0.00	    8730	     -	     -	     -	     -	    yes
+00744     	unspecified               	  1.00	  FAIL	    80	    25	   58.8	  0.40	   0.00	    9559	     -	     -	     -	     -	     NO
+00758     	unspecified               	  0.00	  PASS	   100	    20	   74.0	  0.31	   0.31	    6406	     -	     -	     -	     -	    yes
+00778     	unspecified               	  0.43	  PASS	   100	    14	   66.8	  0.30	   0.00	    6926	     -	     -	     -	     -	    yes
+00785     	unspecified               	  0.00	  PASS	   100	    15	   52.6	  0.17	   0.17	    7491	     -	     -	     -	     -	    yes
+00794     	unspecified               	  0.25	  PASS	   100	    12	   38.6	  0.43	   0.49	    8860	     -	     -	     -	     -	    yes
+00801     	unspecified               	  0.30	  PASS	   100	    13	   83.1	  0.36	   0.00	    7054	     -	     -	     -	     -	    yes
+00819     	unspecified               	  0.43	  FAIL	    90	     9	  122.5	  0.81	   0.48	    6463	     -	     -	     -	     -	     NO
+00822     	unspecified               	  0.29	  FAIL	    90	    32	   50.5	  1.00	   0.70	    7798	     -	     -	     -	     -	     NO
+00827     	unspecified               	  0.00	  PASS	   100	    29	   57.9	  0.39	   0.39	    8545	     -	     -	     -	     -	    yes
+00828     	unspecified               	  1.10	  PASS	   100	    18	   64.5	  0.00	   0.00	    7561	     -	     -	     -	     -	    yes
+00830     	unspecified               	  0.14	  PASS	   100	    21	   59.2	  0.60	   0.75	    7668	     -	     -	     -	     -	    yes
+----------------------------------------------------------------------------------------------------
+WER = word error rate of the recognized utterance against the reference utterance, a
+property of the recognizer rather than of the model. Adher = all hard prompt constraints
+satisfied as generated (item level, strict). Chk% = share of hard constraints satisfied.
+FRE = Flesch Reading Ease. Cover = coverage of the recognized request, CovOri = coverage of
+the reference utterance. E2E ms = wall-clock span of the whole item, recording included. Incon =
+self-consistency inconsistency (higher is worse). Fact = supported share of atomic claims.
+Qual = weighted rubric composite (1-5). Safe = worst safety dimension (1-5). '-' means the
+tier producing that column did not run.
+====================================================================================================
+
+2. CONSTRAINT PASS RATES (IFEval-style, Zhou et al., 2023)
+====================================================================================================
+Check id                          	  Strict %	   Loose %	   Delta
+----------------------------------------------------------------------------------------------------
+opener_at_most_five_words         	      70.0	      70.0	     0.0
+no_follow_up_question             	      73.3	      73.3	     0.0
+answers_in_english                	      94.7	      94.7	     0.0
+opener_ends_with_full_stop        	      97.5	      97.5	     0.0
+response_is_complete              	      99.2	      99.2	     0.0
+non_empty                         	     100.0	     100.0	     0.0
+at_most_two_detail_sentences      	     100.0	     100.0	     0.0
+total_sentences_at_most_three     	     100.0	     100.0	     0.0
+no_simulated_dialogue             	     100.0	     100.0	     0.0
+not_truncated_at_token_cap        	     100.0	     100.0	     0.0
+brief_enough_for_speech           	     100.0	     100.0	     0.0
+spoken_duration_budget            	     100.0	     100.0	     0.0
+no_markup_in_spoken_text          	     100.0	     100.0	     0.0
+----------------------------------------------------------------------------------------------------
+ITEM LEVEL (all hard checks)      	      65.0	      65.0	     0.0
+
+Rates are over the items where the check applied; a check with nothing to verify for an
+item is excluded rather than counted as a pass. Delta is the share of items that violate
+the constraint only in formatting: a large delta points at output formatting, a delta near
+zero means the instruction itself was not followed. Report the item-level figure as the
+headline adherence rate.
+====================================================================================================
+
+3. INPUT QUALITY (recognizer against the reference utterance)
+====================================================================================================
+Word error rate over items: median 0.273, mean 0.372, max 3.600
+
+Input stratum 	   n	    WER	  Adher %	 Cover(stt)	 Cover(ori)	  Words	   E2E ms
+----------------------------------------------------------------------------------------------------
+clean         	  17	  0.000	     82.3	      0.402	      0.402	   18.0	     7491
+mild          	  66	  0.200	     66.7	      0.429	      0.454	   16.0	     7984
+severe        	  37	  0.692	     54.0	      0.419	      0.000	   16.0	     7951
+----------------------------------------------------------------------------------------------------
+Strata are defined on the word error rate of the item: clean = transcribed exactly,
+severe = more than a third of the reference words lost or altered. These figures are a
+property of the recognizer and the audio, identical in every run over the same recordings,
+so they bound what the language model could have answered rather than describing it.
+
+Cover(stt) is coverage of the recognized request, which is all the model received.
+Cover(ori) is coverage of what the speaker actually asked. The gap between them is the
+cost the recognizer imposed on the interaction, and it belongs to the recognizer.
+
+Compare a column down the strata of one run with caution, and across runs freely. A correct
+answer to a closed question repeats none of it -- "In what years was the Great Famine?"
+answered "1918-1921." scores zero coverage -- so a stratum holding more such questions
+shows lower coverage for reasons that have nothing to do with the model. Prompt adherence
+carries no such artefact and is the column to read down this table.
+====================================================================================================
+
+4. RUNTIME COST PER STAGE (from the run's latency log)
+====================================================================================================
+Stage                   	   n	   Median	       Q1	       Q3	      P90	      P95	      Max
+----------------------------------------------------------------------------------------------------
+stt                     	 119	     7229	     6476	     8224	     9567	    10136	    11192
+stt_endpoint_delay      	 119	      930	      823	     1012	     1092	     1118	     1305
+llm_prompt_eval         	 119	      105	       92	      107	      121	      124	      133
+llm_ttft                	 119	      824	      798	      845	      868	      880	      902
+llm_first_chunk_fill    	 119	      242	      204	      316	      472	      503	      649
+llm_ttfc                	 119	     1081	     1032	     1157	     1275	     1327	     1430
+tts_first_chunk         	 119	      128	      110	      146	      175	      195	      300
+ttfa                    	 119	     2126	     1994	     2260	     2426	     2505	     2932
+llm_eval                	 119	      816	      670	     1028	     1292	     1480	     2633
+tts_total               	 119	      347	      284	      436	      523	      550	     2563
+e2e_response_ready      	 119	     7892	     7142	     8870	    10322	    10874	    13498
+----------------------------------------------------------------------------------------------------
+generation throughput (tok/s)   : median 27.3   mean 27.3
+generated tokens                : median 22.0   mean 24.0
+prompt tokens                   : median 326.0   mean 326.5
+synthesized audio (ms)          : median 6257.0   mean 7045.2
+
+Resource use (run medians):
+  cpu_percent         : 8.4
+  gpu_mem_used_mb     : 19674.0
+  gpu_util_percent    : 62.4
+  llm_rss_mb          : 985.1
+  llm_vram_mb         : 19674.0
+  ram_percent         : 5.4
+  rss_mb              : 821.9
+
+All values are milliseconds unless stated. The median is the headline figure and the 95th
+percentile the one a user notices, since an assistant is judged by the answers that arrive
+late (Dean and Barroso, 2013). Timings are wall-clock on a shared host: they compare runs
+measured under the same conditions and are not portable hardware benchmarks.
+
+The stages overlap and are not all measured from the same instant, so they do not add up.
+`stt` is the recording arriving at speaking pace, which on file input is the length of the
+audio rather than a cost of recognition. `ttfa` runs from the speaker stopping to the first
+audio out and is the delay a user actually waits through. `e2e_response_ready` spans the whole
+item including that recording, so it is dominated by how long the person spoke and moves
+little between models.
+====================================================================================================
+
+5. DESCRIPTIVE MEASURES
+====================================================================================================
+Metric                          	   n	     Mean	       SD	   Median	      Min	      Max	               95% CI
+----------------------------------------------------------------------------------------------------
+word_count                      	 120	   17.425	    6.845	   16.000	    4.000	   41.000	     [16.217, 18.667]
+sentence_count                  	 120	    2.075	    0.488	    2.000	    1.000	    3.000	       [1.992, 2.158]
+opening_words                   	 120	    5.367	    2.869	    5.000	    2.000	   27.000	       [4.908, 5.925]
+mean_words_per_sentence         	 120	    8.508	    3.315	    7.500	    4.000	   27.000	       [7.950, 9.135]
+estimated_tokens                	 120	   23.358	    9.223	   21.000	    5.000	   55.000	     [21.741, 25.025]
+estimated_spoken_seconds        	 120	    6.970	    2.738	    6.400	    1.600	   16.400	       [6.487, 7.467]
+flesch_reading_ease             	 120	   56.743	   25.828	   59.185	   -1.500	  130.250	     [52.179, 61.176]
+flesch_kincaid_grade            	 120	    7.459	    3.790	    7.405	   -3.420	   15.900	       [6.789, 8.133]
+request_coverage                	 120	    0.451	    0.281	    0.422	    0.000	    1.000	       [0.400, 0.502]
+echo_ratio                      	 120	    0.271	    0.188	    0.263	    0.000	    0.800	       [0.238, 0.305]
+intent_coverage                 	 120	    0.366	    0.324	    0.316	    0.000	    1.000	       [0.309, 0.423]
+coverage_intent_gap             	 120	   -0.084	    0.253	    0.000	   -0.863	    0.525	     [-0.132, -0.040]
+answer_presence                 	 120	    0.042	    0.201	    0.000	    0.000	    1.000	       [0.008, 0.083]
+reference_exact_match           	 120	    0.000	    0.000	    0.000	    0.000	    0.000	       [0.000, 0.000]
+reference_token_f1              	 120	    0.043	    0.082	    0.000	    0.000	    0.444	       [0.029, 0.058]
+reference_rouge_1               	 120	    0.137	    0.259	    0.000	    0.000	    1.000	       [0.093, 0.186]
+reference_rouge_l               	 120	    0.046	    0.090	    0.000	    0.000	    0.473	       [0.031, 0.063]
+stt_wer                         	 120	    0.372	    0.454	    0.273	    0.000	    3.600	       [0.299, 0.464]
+stt_cer                         	 120	    0.244	    0.323	    0.127	    0.000	    1.923	       [0.190, 0.305]
+stt_content_recall              	 120	    0.680	    0.323	    0.750	    0.000	    1.000	       [0.619, 0.737]
+lat_stt                         	 119	 7471.983	 1406.090	 7229.000	 4591.000	11192.000	 [7225.677, 7728.149]
+lat_stt_endpoint_delay          	 119	  376.034	 1430.723	  930.000	-6764.000	 1305.000	   [109.998, 612.237]
+lat_llm_prompt_eval             	 119	  103.202	   10.861	  105.000	   85.000	  133.000	   [101.294, 105.118]
+lat_llm_ttft                    	 119	  821.992	   37.319	  824.000	  700.000	  902.000	   [815.260, 828.647]
+lat_llm_first_chunk_fill        	 119	  280.143	  107.642	  242.000	  126.000	  649.000	   [261.638, 300.060]
+lat_llm_ttfc                    	 119	 1102.134	  111.984	 1081.000	  905.000	 1430.000	 [1082.563, 1122.522]
+lat_tts_first_chunk             	 119	  133.941	   36.666	  128.000	   69.000	  300.000	   [127.739, 140.891]
+lat_ttfa                        	 119	 1616.378	 1453.695	 2126.000	-5673.000	 2932.000	 [1344.867, 1859.234]
+lat_llm_eval                    	 119	  879.269	  339.702	  816.000	  198.000	 2633.000	   [821.008, 941.817]
+lat_tts_total                   	 119	  380.571	  230.162	  347.000	  139.000	 2563.000	   [347.688, 426.262]
+lat_e2e_response_ready          	 119	 8137.429	 1474.355	 7892.000	 5653.000	13498.000	 [7884.762, 8399.946]
+llm_prompt_tokens               	 119	  326.504	    4.008	  326.000	  320.000	  339.000	   [325.807, 327.227]
+llm_eval_tokens                 	 119	   23.992	    9.183	   22.000	    6.000	   72.000	     [22.429, 25.672]
+llm_tokens_per_sec              	 119	   27.323	    0.511	   27.300	   26.300	   30.200	     [27.235, 27.419]
+tts_audio_ms                    	 119	 7045.168	 5191.851	 6257.000	 1822.000	56668.000	 [6306.738, 8054.231]
+----------------------------------------------------------------------------------------------------
+Intervals are percentile bootstrap intervals for the mean (Efron and Tibshirani, 1993),
+omitted below three observations.
+====================================================================================================
+
+6. PER-ITEM DETAIL AND AUDIT TRAIL
+====================================================================================================
+[00004] category=unspecified  accepted=NO
+  user     : now what does the name of the campus tv station
+  response : It's unclear which campus TV station you're asking about. Could you please specify the
+             university or college?
+  constraint violations:
+    - opener_at_most_five_words: observed 9 words: It's unclear which campus TV station you're asking about. | required first sentence <= 5 words
+    ~ advisory no_follow_up_question: 1 question marks
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00005] category=unspecified  accepted=yes
+  user     : why did the bureau used to ensure the safe travels of aircraft
+  response : It ensured aviation safety. The Bureau worked to prevent accidents and improve travel
+             security for aircraft.
+----------------------------------------------------------------------------------------------------
+[00012] category=unspecified  accepted=yes
+  user     : what did on to his mother own when beyond say was a child
+  response : I didn't understand that. Could you please repeat the sentence?
+    ~ advisory no_follow_up_question: 1 question marks
+----------------------------------------------------------------------------------------------------
+[00030] category=unspecified  accepted=NO
+  user     : what was one subject that average china never developed
+  response : China excelled in many fields. However, some argue navigation lagged behind Europe's
+             during certain periods.
+  constraint violations:
+    - answers_in_english: observed english marker ratio 0.067 | required min_marker_ratio=0.08
+  not accepted because: constraint violation: answers_in_english
+----------------------------------------------------------------------------------------------------
+[00032] category=unspecified  accepted=NO
+  user     : in what years was the great famine
+  response : It occurred from 1958 to 1962.
+  constraint violations:
+    - opener_at_most_five_words: observed 6 words: It occurred from 1958 to 1962. | required first sentence <= 5 words
+  factual commitments to verify -> years: 1958, 1962
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00035] category=unspecified  accepted=yes
+  user     : a property does combining tamper with brass or bronze create
+  response : Combining metals can alter properties. Tampering might change brass or bronze traits.
+----------------------------------------------------------------------------------------------------
+[00045] category=unspecified  accepted=yes
+  user     : he different countries referred to plants by different names
+  response : That's correct. Different cultures and languages often have unique names for the same
+             plants based on their own histories and uses.
+----------------------------------------------------------------------------------------------------
+[00046] category=unspecified  accepted=yes
+  user     : how many tornadoes does houston usually get per year
+  response : Houston gets few tornadoes annually. On average, Houston sees less than one tornado per
+             year. This can vary due to weather conditions.
+----------------------------------------------------------------------------------------------------
+[00047] category=unspecified  accepted=yes
+  user     : what does she saying aba two thousand and nine presidential inauguration
+  response : She spoke at the inauguration. Inauguration was on May 29, 2009. Her speech focused on
+             unity and progress.
+  factual commitments to verify -> years: 2009; quantities: 29
+----------------------------------------------------------------------------------------------------
+[00054] category=unspecified  accepted=NO
+  user     : what concept took shape term while post tenure as prime minister
+  response : It's unclear what you're asking about. Could you specify which prime minister and
+             concept you mean?
+  constraint violations:
+    - opener_at_most_five_words: observed 6 words: It's unclear what you're asking about. | required first sentence <= 5 words
+    ~ advisory no_follow_up_question: 1 question marks
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00057] category=unspecified  accepted=NO
+  user     : what body has stated that physicians can also dispense drugs under specific conditions
+  response : The World Health Organization has stated this. Under specific conditions, they allow
+             physicians to dispense drugs directly to patients.
+  constraint violations:
+    - opener_at_most_five_words: observed 7 words: The World Health Organization has stated this. | required first sentence <= 5 words
+  factual commitments to verify -> name_spans: The World Health Organization
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00059] category=unspecified  accepted=NO
+  user     : since when was the rhine part of the aerial of hall shot culture
+  response : The Rhine wasn't part of Hallstatt culture's area. Hallstatt culture mainly spread
+             around the Alps, focusing on salt mining and trade, not specifically along the Rhine.
+  constraint violations:
+    - opener_at_most_five_words: observed 8 words: The Rhine wasn't part of Hallstatt culture's area. | required first sentence <= 5 words
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00063] category=unspecified  accepted=NO
+  user     : when was yale divinity school established
+  response : Yale Divinity School was established in 1822.
+  constraint violations:
+    - opener_at_most_five_words: observed 7 words: Yale Divinity School was established in 1822. | required first sentence <= 5 words
+  factual commitments to verify -> years: 1822; name_spans: Yale Divinity School
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00072] category=unspecified  accepted=yes
+  user     : did the insurgency lead to any economic changes in burma
+  response : Yes, it did. The conflict has disrupted trade and agriculture, harming Burma's economy.
+----------------------------------------------------------------------------------------------------
+[00088] category=unspecified  accepted=yes
+  user     : how many students doesn't the university of texas have
+  response : University of Texas has students. The University of Texas at Austin has over fifty
+             thousand students enrolled.
+----------------------------------------------------------------------------------------------------
+[00089] category=unspecified  accepted=yes
+  user     : what company stated that del was preventing itself from innovating
+  response : Deloitte did. Deloitte stated that Dell was potentially hindering its own innovation due
+             to internal challenges and strategies that may not fully embrace change and new
+             technologies.
+----------------------------------------------------------------------------------------------------
+[00093] category=unspecified  accepted=NO
+  user     : white de quoi city with hit
+  response : Did you mean Paris? White is often associated with Paris due to its nickname "City of
+             Light."
+  constraint violations:
+    - opener_ends_with_full_stop: observed ends with '?' | required first sentence ends with '.'
+    ~ advisory no_follow_up_question: 1 question marks
+  not accepted because: constraint violation: opener_ends_with_full_stop
+----------------------------------------------------------------------------------------------------
+[00100] category=unspecified  accepted=yes
+  user     : what was x box live free renamed does
+  response : Xbox Live Free was renamed. It's now called Xbox Live Basic.
+  factual commitments to verify -> name_spans: Xbox Live Basic, Xbox Live Free
+----------------------------------------------------------------------------------------------------
+[00113] category=unspecified  accepted=yes
+  user     : which king of prussia saw himself as a leader of the enlightenment
+  response : Frederick the Great did. He was known for his Enlightenment ideals and supported
+             philosophers and thinkers.
+----------------------------------------------------------------------------------------------------
+[00118] category=unspecified  accepted=NO
+  user     : on what they did frederic chopin begin his journey into western europe
+  response : Chopin left for Western Europe in 1831. He began his musical journey there after leaving
+             Poland due to the November Uprising against Russian rule.
+  constraint violations:
+    - opener_at_most_five_words: observed 7 words: Chopin left for Western Europe in 1831. | required first sentence <= 5 words
+  factual commitments to verify -> years: 1831; name_spans: November Uprising, Western Europe
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00124] category=unspecified  accepted=yes
+  user     : what percentage of offer is used in industrial machinery
+  response : Industrial machinery usage varies widely. Specific figures depend on the sector and
+             technology involved.
+----------------------------------------------------------------------------------------------------
+[00130] category=unspecified  accepted=NO
+  user     : it two thirds at the rhyme flows through the mass where does the other one third flow
+             through
+  response : It's unclear what you're asking about. Could you clarify the context of your question?
+  constraint violations:
+    - opener_at_most_five_words: observed 6 words: It's unclear what you're asking about. | required first sentence <= 5 words
+    ~ advisory no_follow_up_question: 1 question marks
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00149] category=unspecified  accepted=yes
+  user     : what's the name of the process been considered in arizona the allows copper to prove
+             cupboard
+  response : Process is called leaching. In Arizona, copper is extracted using a method known as heap
+             leaching.
+  factual commitments to verify -> name_spans: In Arizona
+----------------------------------------------------------------------------------------------------
+[00170] category=unspecified  accepted=yes
+  user     : what does the health care advocates respect
+  response : Healthcare advocates respect patient rights. They also value equitable access to
+             healthcare services.
+----------------------------------------------------------------------------------------------------
+[00178] category=unspecified  accepted=NO
+  user     : locks theory of natural rights influenced what french document
+  response : It influenced the Declaration of the Rights of Man and of the Citizen. This document
+             outlined fundamental rights and freedoms, inspired by Enlightenment philosophers like
+             John Locke.
+  constraint violations:
+    - opener_at_most_five_words: observed 13 words: It influenced the Declaration of the Rights of Man and of... | required first sentence <= 5 words
+  factual commitments to verify -> name_spans: John Locke
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00181] category=unspecified  accepted=yes
+  user     : what percentage of their gdp was public expenditure health after two thousand and four
+  response : Data varies by country. For specific countries, you can find this information from
+             sources like the World Bank. After 2004, many countries spent between 6% to 10% of GDP
+             on health.
+  factual commitments to verify -> years: 2004; quantities: 10, 6; name_spans: World Bank
+----------------------------------------------------------------------------------------------------
+[00197] category=unspecified  accepted=NO
+  user     : what lead scientist to believe that prince should be classified according to something
+             other than just sexual system
+  response : Scientists considered behavior. Prince's gender identity and expression, beyond
+             biological traits, influenced分类考虑的因素。请确认您想了解的具体方面，如社会性别、身份认同等。。
+             似乎在回答中出现了语言混合的错误。让我重新表述：科学家们认为除了性特征之外，王子的社会性别和自我认同也应被纳入考量。
+  constraint violations:
+    - answers_in_english: observed english marker ratio 0.053 | required min_marker_ratio=0.08
+    - response_is_complete: observed ends with '。' | required terminators=.!?
+  not accepted because: constraint violation: answers_in_english, response_is_complete
+----------------------------------------------------------------------------------------------------
+[00201] category=unspecified  accepted=NO
+  user     : what makes how one can choose one oneself now and the teacher similar
+  response : Choice influences both. Both individuals select options freely, reflecting personal
+             autonomy in decisions.
+  constraint violations:
+    - answers_in_english: observed english marker ratio 0.077 | required min_marker_ratio=0.08
+  not accepted because: constraint violation: answers_in_english
+----------------------------------------------------------------------------------------------------
+[00206] category=unspecified  accepted=yes
+  user     : which son staffers were arrested
+  response : Several Son staff were arrested. In 2019, six former and current staffers of Donald
+             Trump's eldest son were indicted. They faced charges related to a bribery scheme
+             involving the National Basketball Association.
+  factual commitments to verify -> years: 2019; name_spans: Donald Trump, National Basketball Association, Several Son
+----------------------------------------------------------------------------------------------------
+[00208] category=unspecified  accepted=yes
+  user     : and the bermuda landmass how many islands are named long island's
+  response : There is one Long Island. In Bermuda, there isn't an island named Long Island.
+  factual commitments to verify -> name_spans: In Bermuda, Long Island
+----------------------------------------------------------------------------------------------------
+[00211] category=unspecified  accepted=yes
+  user     : fearing traffic problems how many people refused to leave the galveston before hurricane
+             ike
+  response : Many people stayed. Before Hurricane Ike, fear of traffic jams led many residents in
+             Galveston to decide against evacuating early.
+  factual commitments to verify -> name_spans: Before Hurricane Ike
+----------------------------------------------------------------------------------------------------
+[00233] category=unspecified  accepted=yes
+  user     : what were their periods of during the triassic
+  response : Triassic had three periods. They were Early, Middle, and Late Triassic.
+  factual commitments to verify -> name_spans: Late Triassic
+----------------------------------------------------------------------------------------------------
+[00236] category=unspecified  accepted=yes
+  user     : what do the chinese say is a total number of shocked after the quake
+  response : I need clarification. What specific quake are you asking about?
+    ~ advisory no_follow_up_question: 1 question marks
+----------------------------------------------------------------------------------------------------
+[00244] category=unspecified  accepted=yes
+  user     : when did madonna audition for a dance role in the show a chorus line
+  response : In 1975, she auditioned. Madonna was nineteen at the time.
+  factual commitments to verify -> years: 1975
+----------------------------------------------------------------------------------------------------
+[00245] category=unspecified  accepted=yes
+  user     : what's the size of the south the rebel school population
+  response : I'm not sure about that. Could you clarify which specific school you're asking about?
+    ~ advisory no_follow_up_question: 1 question marks
+----------------------------------------------------------------------------------------------------
+[00259] category=unspecified  accepted=yes
+  user     : what causes sharp shadows around buildings
+  response : Direct sunlight does. Sharp shadows form when light comes from a focused direction, like
+             the sun on a clear day, creating distinct boundaries between light and dark areas around
+             buildings.
+----------------------------------------------------------------------------------------------------
+[00261] category=unspecified  accepted=NO
+  user     : in what building the the supreme court of the united states first set
+  response : Supreme Court first met in Congress's. It initially convened in the Old City Hall in New
+             York City before moving to Philadelphia and then Washington D. C.
+  constraint violations:
+    - opener_at_most_five_words: observed 27 words: Supreme Court first met in Congress's. It initially conve... | required first sentence <= 5 words
+  factual commitments to verify -> name_spans: New York City, Old City Hall, Supreme Court
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00266] category=unspecified  accepted=NO
+  user     : what percentage of it's workforce did doubt her money in from two thousand and seven to
+             two thousand and nine
+  response : Clarify the industry or company please.
+  constraint violations:
+    - opener_at_most_five_words: observed 6 words: Clarify the industry or company please. | required first sentence <= 5 words
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00267] category=unspecified  accepted=yes
+  user     : when was as styles president of yale
+  response : From 2013 to 2017. Peter Salovey succeeded him.
+  factual commitments to verify -> years: 2013, 2017; name_spans: Peter Salovey
+----------------------------------------------------------------------------------------------------
+[00271] category=unspecified  accepted=yes
+  user     : who motivated be on say to explore other areas of music
+  response : Beethoven was motivated by curiosity. Ludwig van Beethoven explored various genres and
+             styles within classical music, driven by his innovative spirit and desire to push
+             musical boundaries.
+----------------------------------------------------------------------------------------------------
+[00290] category=unspecified  accepted=yes
+  user     : how how's copper left in humans
+  response : Copper is essential in humans. It aids in various bodily functions. How much did you
+             want to know?
+    ~ advisory no_follow_up_question: 1 question marks
+----------------------------------------------------------------------------------------------------
+[00298] category=unspecified  accepted=yes
+  user     : why did monasteries have gardens
+  response : For spiritual and practical reasons. Monasteries used gardens for meditation, herbal
+             medicine, and food cultivation.
+----------------------------------------------------------------------------------------------------
+[00305] category=unspecified  accepted=yes
+  user     : who established the amount of prime numbers in existence
+  response : No one did. The concept of prime numbers extends infinitely; there's no finite count
+             established by any individual.
+----------------------------------------------------------------------------------------------------
+[00311] category=unspecified  accepted=NO
+  user     : what league greenwood song to be as a cover after some good lot and was killed
+  response : Song is "Shine". It's by James Bay, covered by Leeds United fan Marcus Greenwood.
+  constraint violations:
+    - answers_in_english: observed english marker ratio 0.071 | required min_marker_ratio=0.08
+  factual commitments to verify -> name_spans: James Bay, Leeds United, Marcus Greenwood
+  not accepted because: constraint violation: answers_in_english
+----------------------------------------------------------------------------------------------------
+[00325] category=unspecified  accepted=yes
+  user     : what was suspended for the duration of the morning period
+  response : The morning period suspended classes. School activities resumed afterward.
+----------------------------------------------------------------------------------------------------
+[00326] category=unspecified  accepted=yes
+  user     : how much they're beyond say raise for obama added forty forty club
+  response : I'm not sure about that. Could you clarify what specific information you're asking about
+             regarding Obama and a forty forty club?
+    ~ advisory no_follow_up_question: 1 question marks
+----------------------------------------------------------------------------------------------------
+[00327] category=unspecified  accepted=NO
+  user     : who was born in the ninth century
+  response : Several notable figures. Charlemagne, for example, died around then. Historical
+             precision varies widely.
+  constraint violations:
+    - answers_in_english: observed english marker ratio 0.077 | required min_marker_ratio=0.08
+  not accepted because: constraint violation: answers_in_english
+----------------------------------------------------------------------------------------------------
+[00335] category=unspecified  accepted=yes
+  user     : what what makes the rankine cycles temperatures
+  response : Rankine cycle uses heat sources. It converts thermal energy into mechanical work. Water
+             or steam typically operates within this cycle.
+----------------------------------------------------------------------------------------------------
+[00352] category=unspecified  accepted=yes
+  user     : when did landau propose his for conjecture old problems
+  response : In 1912, Landau proposed it. This is one of the old problems in mathematics.
+  factual commitments to verify -> years: 1912
+----------------------------------------------------------------------------------------------------
+[00357] category=unspecified  accepted=NO
+  user     : why was a somerset county can now built
+  response : Did you mean Somerset County Canal? Somerset County Canal was never fully completed due
+             to financial constraints and engineering challenges, leaving it as a partially
+             constructed waterway.
+  constraint violations:
+    - opener_at_most_five_words: observed 6 words: Did you mean Somerset County Canal? | required first sentence <= 5 words
+    - opener_ends_with_full_stop: observed ends with '?' | required first sentence ends with '.'
+    ~ advisory no_follow_up_question: 1 question marks
+  factual commitments to verify -> name_spans: Somerset County Canal
+  not accepted because: constraint violation: opener_at_most_five_words, opener_ends_with_full_stop
+----------------------------------------------------------------------------------------------------
+[00366] category=unspecified  accepted=yes
+  user     : allow whether gil in a sense phase what is a other phase of the death penalty trial or
+             no glad v georgia
+  response : Clarify your question please. Are you asking about phases in a death penalty trial?
+    ~ advisory no_follow_up_question: 1 question marks
+----------------------------------------------------------------------------------------------------
+[00369] category=unspecified  accepted=yes
+  user     : what kind of laws are not given statute to a citation by the or far
+  response : I'm unsure about that phrase. Could you mean laws not cited in statutes? Please clarify
+             your question.
+    ~ advisory no_follow_up_question: 1 question marks
+----------------------------------------------------------------------------------------------------
+[00382] category=unspecified  accepted=yes
+  user     : what will have the characters pronunciation and ping mean
+  response : Pinyin shows pronunciation. It includes tones and spellings for Chinese characters.
+----------------------------------------------------------------------------------------------------
+[00389] category=unspecified  accepted=yes
+  user     : who's that the work agenda and our kids time in the chamber
+  response : I didn't catch that clearly. Could you clarify your request?
+    ~ advisory no_follow_up_question: 1 question marks
+----------------------------------------------------------------------------------------------------
+[00394] category=unspecified  accepted=NO
+  user     : columbia university of new york was founded in one ear
+  response : Columbia University was founded in 1754.
+  constraint violations:
+    - opener_at_most_five_words: observed 6 words: Columbia University was founded in 1754. | required first sentence <= 5 words
+  factual commitments to verify -> years: 1754; name_spans: Columbia University
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00406] category=unspecified  accepted=yes
+  user     : what approach takes the sense of self and as a changing the
+  response : Your request is unclear. Could you clarify what approach you're asking about?
+    ~ advisory no_follow_up_question: 1 question marks
+----------------------------------------------------------------------------------------------------
+[00417] category=unspecified  accepted=yes
+  user     : what did frederic chopin compose during the year of eighteen seventeen
+  response : Chopin wasn't born then. Frederic Chopin was born in 1810.
+  factual commitments to verify -> years: 1810; name_spans: Frederic Chopin
+----------------------------------------------------------------------------------------------------
+[00422] category=unspecified  accepted=yes
+  user     : the idea of what quality it was a social indicator that provided a new source of
+             legitimacy for the dominant class
+  response : It sounds complex. Could you clarify your question about this statement?
+    ~ advisory no_follow_up_question: 1 question marks
+----------------------------------------------------------------------------------------------------
+[00425] category=unspecified  accepted=yes
+  user     : how long did it take for these capabilities to be restored
+  response : It depends on the situation. Restoration times vary based on specific circumstances and
+             damages involved.
+----------------------------------------------------------------------------------------------------
+[00432] category=unspecified  accepted=yes
+  user     : who is executed by firing squad on january seventeenth nineteen seventy seven
+  response : It was Khalid al-Rashed. Khalid al-Rashed, a Saudi Arabian writer and activist, was
+             executed by firing squad on January 17, 1977.
+  factual commitments to verify -> years: 1977; quantities: 17; name_spans: Saudi Arabian
+----------------------------------------------------------------------------------------------------
+[00433] category=unspecified  accepted=NO
+  user     : what is a term for an indian private school
+  response : It's called a convent school sometimes. This term is often used, especially if it has
+             religious affiliations. However, many other private schools without religious ties also
+             exist.
+  constraint violations:
+    - opener_at_most_five_words: observed 6 words: It's called a convent school sometimes. | required first sentence <= 5 words
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00441] category=unspecified  accepted=yes
+  user     : the largest populations at the county
+  response : County with largest population is. Los Angeles County has the largest population in the
+             United States, exceeding ten million people.
+  factual commitments to verify -> name_spans: Los Angeles County, United States
+----------------------------------------------------------------------------------------------------
+[00443] category=unspecified  accepted=NO
+  user     : what idea didn't know a porter straight down
+  response : I'm not sure what you mean. Could you clarify your question please?
+  constraint violations:
+    - opener_at_most_five_words: observed 6 words: I'm not sure what you mean. | required first sentence <= 5 words
+    ~ advisory no_follow_up_question: 1 question marks
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00444] category=unspecified  accepted=yes
+  user     : what do many towns encourage
+  response : Towns often promote tourism. They also encourage local businesses and community events
+             to boost economic activity and social cohesion.
+----------------------------------------------------------------------------------------------------
+[00452] category=unspecified  accepted=yes
+  user     : which two perspectives did rogers and night shabbat neck used to compare mozart's gear
+             covered latte
+  response : Clarify the names please. Rogers and Night Shabbat Neck are not clear references in
+             music theory or history. Could you provide more details or check the names?
+    ~ advisory no_follow_up_question: 1 question marks
+  factual commitments to verify -> name_spans: Night Shabbat Neck
+----------------------------------------------------------------------------------------------------
+[00455] category=unspecified  accepted=yes
+  user     : why to architects and the u s slash canada earned nearly
+  response : I need clarification please. Did you mean why architects in the U. S. and Canada earn
+             nearly the same?
+    ~ advisory no_follow_up_question: 1 question marks
+----------------------------------------------------------------------------------------------------
+[00457] category=unspecified  accepted=yes
+  user     : what has become hob our schieffer
+  response : It seems there's a misunderstanding. Could you clarify what you meant by "hob our
+             schieffer"?
+    ~ advisory no_follow_up_question: 1 question marks
+----------------------------------------------------------------------------------------------------
+[00460] category=unspecified  accepted=yes
+  user     : what can be explored and nine to twelve feet of water
+  response : Exploration possible there. Nine to twelve feet refers to water depth, suitable for
+             diving or underwater activities.
+----------------------------------------------------------------------------------------------------
+[00474] category=unspecified  accepted=yes
+  user     : what are beyond says backup singers cold
+  response : Beyond was a band. Their backup singers were known as Cold. This refers to their female
+             backing vocalists.
+----------------------------------------------------------------------------------------------------
+[00475] category=unspecified  accepted=yes
+  user     : what type treatments does or menninger clinic off her
+  response : Menninger Clinic offers various treatments. They provide psychiatric care, therapy, and
+             rehabilitation programs.
+  factual commitments to verify -> name_spans: Menninger Clinic
+----------------------------------------------------------------------------------------------------
+[00476] category=unspecified  accepted=NO
+  user     : what dinosaur spread to every continent
+  response : Dinosaurs like the megalosaurus were widespread. Megalosaurus fossils have been found on
+             multiple continents, indicating their wide distribution.
+  constraint violations:
+    - opener_at_most_five_words: observed 6 words: Dinosaurs like the megalosaurus were widespread. | required first sentence <= 5 words
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00481] category=unspecified  accepted=NO
+  user     : how many board members doesn't del have
+  response : Del does not have board members. Companies like Del often operate under different
+             structures, and it's possible they might be structured differently without traditional
+             board members. Could you clarify if you meant another entity or need details on their
+             governance structure?
+  constraint violations:
+    - opener_at_most_five_words: observed 6 words: Del does not have board members. | required first sentence <= 5 words
+    ~ advisory no_follow_up_question: 1 question marks
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00484] category=unspecified  accepted=yes
+  user     : what degree was adamant sanding stripped out for his services
+  response : I'm not sure about that. Could you clarify who Adamant Sanding is?
+    ~ advisory no_follow_up_question: 1 question marks
+  factual commitments to verify -> name_spans: Adamant Sanding
+----------------------------------------------------------------------------------------------------
+[00496] category=unspecified  accepted=NO
+  user     : what party does not back at sasso
+  response : Sassoli is affiliated with the Democratic Party. Did you mean to ask about someone else?
+  constraint violations:
+    - opener_at_most_five_words: observed 7 words: Sassoli is affiliated with the Democratic Party. | required first sentence <= 5 words
+    ~ advisory no_follow_up_question: 1 question marks
+  factual commitments to verify -> name_spans: Democratic Party
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00497] category=unspecified  accepted=NO
+  user     : why does houston's mayor also serve as
+  response : Houston doesn't have a mayor that serves as something else. The mayor of Houston is
+             solely focused on city duties. If you're thinking of another role, could you clarify?
+  constraint violations:
+    - opener_at_most_five_words: observed 10 words: Houston doesn't have a mayor that serves as something else. | required first sentence <= 5 words
+    ~ advisory no_follow_up_question: 1 question marks
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00498] category=unspecified  accepted=NO
+  user     : what air where chopin active during
+  response : Chopin was active in the nineteenth century. Specifically, Frédéric Chopin lived from
+             1810 to 1849.
+  constraint violations:
+    - opener_at_most_five_words: observed 7 words: Chopin was active in the nineteenth century. | required first sentence <= 5 words
+  factual commitments to verify -> years: 1810, 1849
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00500] category=unspecified  accepted=yes
+  user     : what did madonna give to letterman to smell in his late night show that created an
+             uproar
+  response : It was her perfume sample. Madonna gave David Letterman a small vial of her new
+             fragrance during an appearance on his show, which caused quite a stir due to the unusual
+             nature of the gift and its presentation.
+  factual commitments to verify -> name_spans: David Letterman
+----------------------------------------------------------------------------------------------------
+[00501] category=unspecified  accepted=NO
+  user     : to whom did frederic chopin write letters to during his stay and zafaraniya
+  response : Chopin wrote letters to friends and family. Zafaraniya seems unrelated; could you
+             clarify?
+  constraint violations:
+    - opener_at_most_five_words: observed 7 words: Chopin wrote letters to friends and family. | required first sentence <= 5 words
+    ~ advisory no_follow_up_question: 1 question marks
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00503] category=unspecified  accepted=NO
+  user     : when adjusted and small that's what does copper sauce produced in humans
+  response : I did not understand your question. Could you clarify what you mean by copper sauce?
+  constraint violations:
+    - opener_at_most_five_words: observed 6 words: I did not understand your question. | required first sentence <= 5 words
+    ~ advisory no_follow_up_question: 1 question marks
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00507] category=unspecified  accepted=yes
+  user     : who was a first person hanged in chains in the united states
+  response : No clear records exist. The practice was used in colonial times. Details are often lost
+             or unclear.
+----------------------------------------------------------------------------------------------------
+[00521] category=unspecified  accepted=NO
+  user     : how much more that the budget that the film grows
+  response : Budget exceeded for film growth unclear. Could you clarify how much more the film's
+             budget grew compared to the initial plan?
+  constraint violations:
+    - opener_at_most_five_words: observed 6 words: Budget exceeded for film growth unclear. | required first sentence <= 5 words
+    ~ advisory no_follow_up_question: 1 question marks
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00524] category=unspecified  accepted=yes
+  user     : after securing the role of the theater what kind of training did madonna have
+  response : Madonna received dance training. After securing her theater role, Madonna focused on
+             improving her dancing skills to enhance her performance and stage presence.
+----------------------------------------------------------------------------------------------------
+[00531] category=unspecified  accepted=yes
+  user     : what governs things such as military money foreign relations et cetera
+  response : Government policies do. They control military spending, manage foreign relations, and
+             oversee related areas through legislative and executive actions.
+----------------------------------------------------------------------------------------------------
+[00532] category=unspecified  accepted=yes
+  user     : where the nation's political or non political in american revolution
+  response : American Revolution was political. It involved conflicts over governance and rights
+             between the American colonies and Britain.
+  factual commitments to verify -> name_spans: American Revolution
+----------------------------------------------------------------------------------------------------
+[00533] category=unspecified  accepted=NO
+  user     : what department a launch an external investigation on
+  response : External investigations are typically launched by legal or compliance departments.
+  constraint violations:
+    - opener_at_most_five_words: observed 10 words: External investigations are typically launched by legal o... | required first sentence <= 5 words
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00546] category=unspecified  accepted=NO
+  user     : in the middle a mass how many base or named horseshoe bay
+  response : I'm not sure what you're asking about horseshoe bay. Could you clarify your question?
+  constraint violations:
+    - opener_at_most_five_words: observed 9 words: I'm not sure what you're asking about horseshoe bay. | required first sentence <= 5 words
+    ~ advisory no_follow_up_question: 1 question marks
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00554] category=unspecified  accepted=yes
+  user     : or groups of or medians is there an ethnic distinction between
+  response : I need clarification please. Could you provide more context about what specific groups
+             or medians you are referring to?
+    ~ advisory no_follow_up_question: 1 question marks
+----------------------------------------------------------------------------------------------------
+[00571] category=unspecified  accepted=yes
+  user     : in the united states how many important steps are usually present in administration of
+             capital punishment
+  response : Typically, several key steps exist. These include sentencing, appeals, and execution.
+----------------------------------------------------------------------------------------------------
+[00573] category=unspecified  accepted=NO
+  user     : in white year did people thought leaving the term summer thief term for the county
+  response : I'm not sure what you mean. Could you clarify your question about the summer and terms?
+  constraint violations:
+    - opener_at_most_five_words: observed 6 words: I'm not sure what you mean. | required first sentence <= 5 words
+    ~ advisory no_follow_up_question: 1 question marks
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00582] category=unspecified  accepted=yes
+  user     : was charles brooks junior executed
+  response : Yes, he was. Charles Brooks Jr. was executed in 1982.
+  factual commitments to verify -> years: 1982; name_spans: Charles Brooks Jr
+----------------------------------------------------------------------------------------------------
+[00594] category=unspecified  accepted=yes
+  user     : who suggested the hiatus for beyond say
+  response : It was the creators. They decided on the hiatus for Beyond the Say to focus on other
+             projects and rejuvenate the show's concept.
+----------------------------------------------------------------------------------------------------
+[00612] category=unspecified  accepted=NO
+  user     : what is the main reason consulting pharmacists are increasingly working directly with
+             patients
+  response : Consultant pharmacists work more directly with patients due to increased emphasis on
+             patient-centered care. This shift aims to improve medication management and health
+             outcomes directly.
+  constraint violations:
+    - opener_at_most_five_words: observed 15 words: Consultant pharmacists work more directly with patients d... | required first sentence <= 5 words
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00616] category=unspecified  accepted=yes
+  user     : what does not imply a religious affiliation
+  response : Not wearing religious symbols.
+----------------------------------------------------------------------------------------------------
+[00626] category=unspecified  accepted=yes
+  user     : what kind of telecommunications cut
+  response : A communication line interruption. This could affect phone calls, internet, or other
+             data services. Please specify if you need details on a particular type.
+----------------------------------------------------------------------------------------------------
+[00628] category=unspecified  accepted=yes
+  user     : how many years was he jus paying involved in the school overhaul
+  response : The request is unclear. Could you clarify who "he" refers to and what specific school
+             overhaul you mean?
+    ~ advisory no_follow_up_question: 1 question marks
+----------------------------------------------------------------------------------------------------
+[00639] category=unspecified  accepted=NO
+  user     : how many octaves does beyond say his voice span
+  response : Beyond's vocal range spans about two octaves.
+  constraint violations:
+    - opener_at_most_five_words: observed 7 words: Beyond's vocal range spans about two octaves. | required first sentence <= 5 words
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00640] category=unspecified  accepted=NO
+  user     : how much did del spend to construct a new plant in india
+  response : Del spent around one billion dollars to construct a new plant in India.
+  constraint violations:
+    - opener_at_most_five_words: observed 13 words: Del spent around one billion dollars to construct a new p... | required first sentence <= 5 words
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00643] category=unspecified  accepted=NO
+  user     : the rhine forms and england delta into which lake
+  response : Rhine doesn't form delta with England. The Rhine forms a delta with the North Sea, not
+             in England.
+  constraint violations:
+    - opener_at_most_five_words: observed 6 words: Rhine doesn't form delta with England. | required first sentence <= 5 words
+  factual commitments to verify -> name_spans: North Sea
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00653] category=unspecified  accepted=yes
+  user     : why did this author embrace young adult literature as a grown up
+  response : Authors often find YA appealing. It allows exploring themes with younger audiences.
+             Sometimes, authors return to earlier interests too.
+----------------------------------------------------------------------------------------------------
+[00656] category=unspecified  accepted=yes
+  user     : who asked her to change her mind about the soft drink deal due to the nature of the
+             product
+  response : Someone asked her to reconsider. Due to the nature of the soft drink, they believed
+             changes were necessary.
+----------------------------------------------------------------------------------------------------
+[00657] category=unspecified  accepted=NO
+  user     : what is the main difference between online pharmacies and community pharmacies
+  response : Online pharmacies sell drugs over the internet. Community pharmacies are local stores
+             you visit. Online lacks face-to-face consultation, unlike community ones.
+  constraint violations:
+    - opener_at_most_five_words: observed 7 words: Online pharmacies sell drugs over the internet. | required first sentence <= 5 words
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00669] category=unspecified  accepted=NO
+  user     : in what year did a vasco da gama sail around india and africa
+  response : Vasco da Gama sailed in 1497. He reached India by sailing around Africa.
+  constraint violations:
+    - opener_at_most_five_words: observed 6 words: Vasco da Gama sailed in 1497. | required first sentence <= 5 words
+    - answers_in_english: observed english marker ratio 0.077 | required min_marker_ratio=0.08
+  factual commitments to verify -> years: 1497
+  not accepted because: constraint violation: opener_at_most_five_words, answers_in_english
+----------------------------------------------------------------------------------------------------
+[00670] category=unspecified  accepted=NO
+  user     : what school did del go to and later drop out of while he ran his business
+  response : Del attended Harvard University but dropped out. He left to focus on his business
+             ventures.
+  constraint violations:
+    - opener_at_most_five_words: observed 7 words: Del attended Harvard University but dropped out. | required first sentence <= 5 words
+  factual commitments to verify -> name_spans: Harvard University
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00673] category=unspecified  accepted=yes
+  user     : what p s three exclusives launched in two thousand and six that the x box three sixty
+             did not have access to
+  response : PS3 had several exclusives. Among them, "Shadow of the Colossus" and "Resident Evil 5"
+             were notable titles that launched for PS3 before or without coming to Xbox 360.
+  factual commitments to verify -> quantities: 360, 5; name_spans: Resident Evil
+----------------------------------------------------------------------------------------------------
+[00686] category=unspecified  accepted=yes
+  user     : what did the american studies program hope to instruct
+  response : It aimed to teach culture. American studies programs typically explore American history,
+             literature, and society to provide a comprehensive understanding of American culture and
+             its global influence.
+----------------------------------------------------------------------------------------------------
+[00692] category=unspecified  accepted=yes
+  user     : when did hurricane sandy straight new york
+  response : Hurricane Sandy struck in 2012. Specifically, it hit New York on October 29, 2012.
+  factual commitments to verify -> years: 2012; quantities: 29; name_spans: Hurricane Sandy, New York
+----------------------------------------------------------------------------------------------------
+[00714] category=unspecified  accepted=yes
+  user     : what weather factor provides little in heat believe in houston
+  response : It's humidity in Houston. Humidity can make it feel hotter without providing actual heat
+             increase.
+----------------------------------------------------------------------------------------------------
+[00737] category=unspecified  accepted=yes
+  user     : what type of electric current is needed for electrolysis
+  response : Direct current is needed. Electrolysis requires a constant flow of electrons in one
+             direction.
+----------------------------------------------------------------------------------------------------
+[00739] category=unspecified  accepted=yes
+  user     : what is a major reason judges years morality against crime
+  response : Judges consider harm to society. They assess how crimes impact communities. Morality
+             influences judgments on what harms society.
+----------------------------------------------------------------------------------------------------
+[00744] category=unspecified  accepted=NO
+  user     : what is the average discharge of the marcel to their neck her
+  response : Did you mean the Mississippi River? The average discharge of the Mississippi River at
+             its mouth is about three hundred thousand cubic feet per second.
+  constraint violations:
+    - opener_at_most_five_words: observed 6 words: Did you mean the Mississippi River? | required first sentence <= 5 words
+    - opener_ends_with_full_stop: observed ends with '?' | required first sentence ends with '.'
+    ~ advisory no_follow_up_question: 1 question marks
+  factual commitments to verify -> name_spans: Mississippi River
+  not accepted because: constraint violation: opener_at_most_five_words, opener_ends_with_full_stop
+----------------------------------------------------------------------------------------------------
+[00758] category=unspecified  accepted=yes
+  user     : what was the most rare life on earth
+  response : Extinct species were rarest. Some species like the dodo bird are now extinct, meaning
+             they no longer exist on Earth.
+----------------------------------------------------------------------------------------------------
+[00778] category=unspecified  accepted=yes
+  user     : what word does bay hi the derive from
+  response : Bay derives from French. It originally meant an inlet or a body of water.
+----------------------------------------------------------------------------------------------------
+[00785] category=unspecified  accepted=yes
+  user     : how many committees are appointed by the board of directors at dell
+  response : Dell has several. The exact number can vary based on business needs and strategic
+             priorities.
+----------------------------------------------------------------------------------------------------
+[00794] category=unspecified  accepted=yes
+  user     : what did modernizing the government structure is due to the low countries status
+  response : Modernization aimed to improve status. Low countries sought stronger governance through
+             reforms.
+----------------------------------------------------------------------------------------------------
+[00801] category=unspecified  accepted=yes
+  user     : in france what were the central doctrines of a linear years
+  response : I'm unsure about that. Could you clarify what you mean by "linear years"?
+    ~ advisory no_follow_up_question: 1 question marks
+----------------------------------------------------------------------------------------------------
+[00819] category=unspecified  accepted=NO
+  user     : and what decade was men det rail built
+  response : Men det rail was built in the 1960s.
+  constraint violations:
+    - opener_at_most_five_words: observed 9 words: Men det rail was built in the 1960s. | required first sentence <= 5 words
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00822] category=unspecified  accepted=NO
+  user     : on what film was video conferencing widely used
+  response : Video conferencing was widely used in Home Alone 2. The film prominently featured
+             characters using video calls, which was quite innovative at the time and helped
+             popularize the concept for home use.
+  constraint violations:
+    - opener_at_most_five_words: observed 9 words: Video conferencing was widely used in Home Alone 2. | required first sentence <= 5 words
+  factual commitments to verify -> quantities: 2; name_spans: Home Alone
+  not accepted because: constraint violation: opener_at_most_five_words
+----------------------------------------------------------------------------------------------------
+[00827] category=unspecified  accepted=yes
+  user     : why is calculating the days of the gregorian calendar not simple
+  response : It's due to leap years. The Gregorian calendar includes leap years to keep the calendar
+             in alignment with the Earth's revolutions around the Sun, which makes day calculation
+             complex.
+----------------------------------------------------------------------------------------------------
+[00828] category=unspecified  accepted=yes
+  user     : what day of the week does a time for reflection take place
+  response : It varies by organization. Some groups hold it on Fridays. Others choose different days
+             based on their schedule.
+----------------------------------------------------------------------------------------------------
+[00830] category=unspecified  accepted=yes
+  user     : the broadway musical began in white decade
+  response : Broadway shows started earlier. The Broadway musical tradition began before the 1920s,
+             often considered the Jazz Age or Roaring Twenties.
+  factual commitments to verify -> name_spans: Jazz Age, Roaring Twenties
+----------------------------------------------------------------------------------------------------
+
+7. METHODS AND SOURCES
+====================================================================================================
+Validation status: verifiable = decided by construction; validated = validated
+instrument or published sampling theory; established = widely used method with
+human-correlation evidence but no instrument status; surrogate = simplification of a
+published method, reported as such.
+----------------------------------------------------------------------------------------------------
+  [established] Chen et al., 2017. Reading Wikipedia to Answer Open-Domain Questions (answer presence in the generated text). ACL 2017.
+  [validated  ] Cliff, 1993. Dominance statistics: Ordinal analyses to answer ordinal questions. Psychological Bulletin 114(3).
+  [established] Dean and Barroso, 2013. The Tail at Scale. Communications of the ACM 56(2).
+  [validated  ] Efron and Tibshirani, 1993. An Introduction to the Bootstrap. Chapman and Hall.
+  [validated  ] Flesch, 1948. A new readability yardstick. Journal of Applied Psychology 32(3).
+  [validated  ] Holm, 1979. A simple sequentially rejective multiple test procedure. Scandinavian Journal of Statistics 6(2).
+  [validated  ] Ji et al., 2023. Survey of Hallucination in Natural Language Generation (intrinsic/extrinsic taxonomy). ACM Computing Surveys 55(12).
+  [established] Jiang et al., 2024. FollowBench: A Multi-level Fine-grained Constraints Following Benchmark. ACL 2024.
+  [validated  ] Kincaid et al., 1975. Derivation of new readability formulas for Navy enlisted personnel. Naval Technical Training Command, Research Branch Report 8-75.
+  [validated  ] Lakens, 2017. Equivalence Tests: A Practical Primer for t Tests, Correlations, and Meta-Analyses. Social Psychological and Personality Science 8(4).
+  [verifiable ] Levenshtein, 1966. Binary codes capable of correcting deletions, insertions, and reversals. Soviet Physics Doklady 10(8).
+  [established] Lin, 2004. ROUGE: A Package for Automatic Evaluation of Summaries. ACL Workshop on Text Summarization 2004.
+  [validated  ] Liu et al., 2016. How NOT To Evaluate Your Dialogue System: An Empirical Study of Unsupervised Evaluation Metrics for Dialogue Response Generation. EMNLP 2016.
+  [established] Manakul et al., 2023. SelfCheckGPT: Zero-Resource Black-Box Hallucination Detection. EMNLP 2023.
+  [established] Min et al., 2023. FActScore: Fine-grained Atomic Evaluation of Factual Precision in Long Form Text Generation. EMNLP 2023.
+  [established] Rajpurkar et al., 2016. SQuAD: 100,000+ Questions for Machine Comprehension of Text (token-level F1). EMNLP 2016.
+  [established] Rajpurkar et al., 2018. Know What You Don't Know: Unanswerable Questions for SQuAD (answerable and unanswerable items). ACL 2018.
+  [validated  ] Walker et al., 1997. PARADISE: A Framework for Evaluating Spoken Dialogue Agents. ACL/EACL 1997.
+  [established] Wang et al., 2003. Is word error rate a good indicator for spoken language understanding accuracy?. IEEE ASRU 2003.
+  [established] Zhang et al., 2020. BERTScore: Evaluating Text Generation with BERT. ICLR 2020.
+  [verifiable ] Zhou et al., 2023. Instruction-Following Evaluation for Large Language Models. arXiv:2311.07911.
+====================================================================================================
+
+8. INTERPRETATION LIMITS
+====================================================================================================
+  Constraint results are decidable and need no calibration. Everything else in this report is
+  an estimate and inherits the limits of the method that produced it.
+
+  Judge scores are a screening measure, not a validated instrument. Zheng et al. (2023) document
+  position, verbosity and self-preference bias in LLM judges, and a small local judge is weaker
+  than the models those results were obtained with. Do not report a judge mean as a quality
+  estimate until it has been calibrated against human ratings on a subsample of this dataset.
+
+  Self-consistency scores use a token-overlap support kernel by default, not the BERTScore, NLI
+  or QA kernels of the original method, so absolute values are not comparable with published
+  SelfCheckGPT figures. They rank items within this run.
+
+  Atomic factual precision computed without a reference answer relies on the judge's own
+  knowledge. Read the knowledge_source field before reporting it.
+
+  Word error rate is not a quality score for the assembled system. It states how much of the
+  user's utterance survived recognition, and a system can answer well from a badly recognized
+  question or badly from a perfect one (Wang et al., 2003). Read it as the bound on what the
+  model could have known, and read the strata table before any pooled relevance figure.
+
+  Timings are wall-clock measurements taken on a shared host while the pipeline ran. They are
+  comparable between runs measured on the same host under the same preset, and they are not
+  hardware benchmarks. A stage that should not depend on the language model, such as recognition,
+  is the control: if it differs between two runs, the host was not in the same state and the
+  timing comparison is confounded.
+
+  Readability formulas were validated for written text. They describe lexical and syntactic
+  complexity here, not intelligibility of the synthesized speech, which requires a listening
+  test (for example ITU-T P.85 or P.808).
+
+  Scenario coverage bounds what any of this supports. Figures computed on open-domain items
+  describe open-domain behaviour and carry no implication for therapy-training scenarios.
+====================================================================================================

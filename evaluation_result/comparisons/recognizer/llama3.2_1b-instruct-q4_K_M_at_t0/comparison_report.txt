@@ -1,0 +1,141 @@
+====================================================================================================================================
+                                                       PAIRED RUN COMPARISON                                                        
+====================================================================================================================================
+Generated on           : 2026-08-15 23:58:14
+Baseline               : 01 llama3.2:1b-q4_K_M t0
+Contrast               : 25 llama3.2:1b-q4_K_M t0
+Significance level     : 0.05 (Holm-corrected within each metric family)
+
+Generating configuration differences:
+  25 llama3.2:1b-q4_K_M t0:
+    stt_engine          : vosk -> whisper
+    vosk_endpoint_silence_ms: 600 -> None
+    vosk_model          : ./vosk/vosk-model-small-en-us-0.15 -> None
+    whisper_compute_type: None -> int8
+    whisper_device      : None -> cuda
+    whisper_model       : None -> small
+  (Output paths and run identifiers differ by construction and are not listed.)
+====================================================================================================================================
+
+1. 25 llama3.2:1b-q4_K_M t0  vs  01 llama3.2:1b-q4_K_M t0
+====================================================================================================================================
+Paired items: 120
+
+PROMPT ADHERENCE (verifiable, IFEval-style)
+Metric                                   base   contrast      delta                  95% CI  better/worse            effect   p(adj)  verdict
+------------------------------------------------------------------------------------------------------------------------------------
+check: answers_in_english               1.000      1.000     +0.000        [+0.000, +0.000]           0/0                      1.000  no detected change
+check: at_most_two_detail_sentenc       1.000      1.000     +0.000        [+0.000, +0.000]           0/0                      1.000  no detected change
+check: brief_enough_for_speech          1.000      1.000     +0.000        [+0.000, +0.000]           0/0                      1.000  no detected change
+check: no_follow_up_question            0.942      0.992     +0.050        [+0.017, +0.092]           6/0                      0.531  no detected change
+check: no_markup_in_spoken_text         1.000      1.000     +0.000        [+0.000, +0.000]           0/0                      1.000  no detected change
+check: no_simulated_dialogue            1.000      1.000     +0.000        [+0.000, +0.000]           0/0                      1.000  no detected change
+check: non_empty                        1.000      1.000     +0.000        [+0.000, +0.000]           0/0                      1.000  no detected change
+check: not_truncated_at_token_cap       1.000      1.000     +0.000        [+0.000, +0.000]           0/0                      1.000  no detected change
+check: opener_at_most_five_words        0.367      0.450     +0.083        [-0.008, +0.175]         21/11                      1.000  no detected change
+check: opener_ends_with_full_stop       0.858      0.875     +0.017        [-0.058, +0.092]         12/10                      1.000  no detected change
+check: response_is_complete             0.900      0.883     -0.017        [-0.092, +0.058]          9/11                      1.000  no detected change
+check: spoken_duration_budget           1.000      1.000     +0.000        [+0.000, +0.000]           0/0                      1.000  no detected change
+check: total_sentences_at_most_th       1.000      1.000     +0.000        [+0.000, +0.000]           0/0                      1.000  no detected change
+share of checks passed, loose           0.908      0.916     +0.008        [-0.006, +0.023]         31/32  +0.06 negligible    1.000  no detected change
+share of checks passed                  0.908      0.916     +0.008        [-0.006, +0.023]         31/32  +0.06 negligible    1.000  no detected change
+prompt adherence, loose                 0.250      0.325     +0.075        [-0.008, +0.158]          18/9                      1.000  no detected change
+prompt adherence (item)                 0.250      0.325     +0.075        [-0.008, +0.158]          18/9                      1.000  no detected change
+  Holm correction within this family, over 17 scored test(s).
+
+RESPONSE CONTENT AND FORM
+Metric                                   base   contrast      delta                  95% CI  better/worse            effect   p(adj)  verdict
+------------------------------------------------------------------------------------------------------------------------------------
+reference answer present                0.025      0.017     -0.008        [-0.050, +0.025]           2/3                      1.000  no detected change
+echo of the question                    0.300        nan       +nan        [-0.055, +0.052]         37/47  -0.00 negligible    1.000  no detected change
+grade level                             7.276      6.440     -0.836        [-2.206, +0.444]         52/44  -0.03 negligible    1.000  no detected change
+reading ease                           57.816     61.042     +3.226       [-5.634, +12.908]         51/45  +0.00 negligible    1.000  no detected change
+coverage of intended question           0.250      0.232     -0.018        [-0.068, +0.032]         39/40  -0.03 negligible    1.000  no detected change
+exact match vs reference                0.008      0.008     +0.000        [-0.025, +0.025]           1/1                      1.000  no detected change
+ROUGE-1 vs reference                    0.101      0.101     -0.000        [-0.051, +0.050]         14/10  +0.02 negligible    1.000  no detected change
+ROUGE-L vs reference                    0.055      0.068     +0.013        [-0.019, +0.047]         23/12  +0.03 negligible    1.000  no detected change
+token F1 vs reference                   0.054      0.066     +0.012        [-0.020, +0.045]         23/12  +0.03 negligible    1.000  no detected change
+coverage of recognized request          0.301      0.280     -0.022        [-0.074, +0.032]         44/57  -0.05 negligible    1.000  no detected change
+estimated speech seconds                3.490      2.837     -0.653        [-1.123, -0.167]                -0.12 negligible           descriptive
+estimated tokens                       11.675      9.500     -2.175        [-3.734, -0.558]                -0.12 negligible           descriptive
+words per sentence                      8.372      6.821     -1.551        [-2.654, -0.468]                -0.12 negligible           descriptive
+opening sentence length                 8.283      6.867     -1.417        [-2.450, -0.375]                -0.12 negligible           descriptive
+sentences                               1.042      1.033     -0.008        [-0.067, +0.042]                -0.00 negligible           descriptive
+words                                   8.725      7.092     -1.633        [-2.808, -0.417]                -0.12 negligible           descriptive
+  Holm correction within this family, over 10 scored test(s).
+
+RUNTIME COST (from the latency logs)
+Metric                                   base   contrast      delta                  95% CI  better/worse            effect   p(adj)  verdict
+------------------------------------------------------------------------------------------------------------------------------------
+end to end, response ready (ms)          7620       8815      +1195          [+1157, +1232]         0/119      +0.47 medium   <0.001  degraded
+time to first audio (ms)                 1521       2996      +1476          [+1395, +1561]         0/119       +0.73 large   <0.001  degraded
+time to first speakable chunk (ms       967.4      913.3    -54.092      [-69.893, -39.075]         84/34      -0.42 medium   <0.001  improved
+time to first token (ms)                864.0      816.7    -47.269      [-57.278, -36.453]         96/22       -0.56 large   <0.001  improved
+total synthesis (ms)                    191.6      167.4    -24.193       [-42.152, -6.394]         73/45  -0.12 negligible    0.023  improved
+generation time (ms)                    120.5      104.9    -15.605       [-28.529, -3.241]         69/48  -0.11 negligible    0.124  equivalent
+prompt evaluation (ms)                 19.084     18.899     -0.185        [-0.782, +0.395]         46/48  -0.01 negligible    1.000  equivalent
+first speech chunk synthesis (ms)       172.8      161.9    -10.874       [-25.364, +3.045]         70/48  -0.07 negligible    0.124  equivalent
+generation throughput (tok/s)           101.3      101.6     +0.376        [-4.184, +4.819]         59/60  -0.04 negligible    1.000  equivalent
+first chunk fill wait (ms)              103.4     96.580     -6.824       [-18.044, +3.530]                -0.05 negligible           descriptive
+recognition, control (ms)                7473       7681     +208.0        [+201.3, +215.0]                +0.09 negligible           descriptive
+endpoint delay, control (ms)            376.1       1916      +1540          [+1462, +1620]                     +0.74 large           descriptive
+generated tokens                       12.361     10.597     -1.765        [-3.134, -0.412]                -0.10 negligible           descriptive
+prompt tokens                           322.5      322.3     -0.160        [-0.345, +0.025]                -0.02 negligible           descriptive
+synthesized audio (ms)                   3387       2957     -430.1       [-825.2, -33.628]                -0.08 negligible           descriptive
+  Holm correction within this family, over 9 scored test(s).
+
+VERDICT after Holm correction within each family:
+  runtime    improved: time to first token (ms), time to first speakable chunk (ms), total synthesis (ms); DEGRADED: time to first audio (ms), end to end, response ready (ms)
+====================================================================================================================================
+
+METHODS
+====================================================================================================================================
+  [validated  ] Cliff, 1993. Dominance statistics: Ordinal analyses to answer ordinal questions. Psychological Bulletin 114(3).
+  [validated  ] Efron and Tibshirani, 1993. An Introduction to the Bootstrap. Chapman and Hall.
+  [validated  ] Holm, 1979. A simple sequentially rejective multiple test procedure. Scandinavian Journal of Statistics 6(2).
+  [validated  ] Lakens, 2017. Equivalence Tests: A Practical Primer for t Tests, Correlations, and Meta-Analyses. Social Psychological and Personality Science 8(4).
+  [validated  ] McNemar, 1947. Note on the sampling error of the difference between correlated proportions or percentages. Psychometrika 12(2).
+  [validated  ] Wilcoxon, 1945. Individual comparisons by ranking methods (signed-rank test). Biometrics Bulletin 1(6).
+====================================================================================================================================
+
+HOW TO READ THIS
+====================================================================================================================================
+  delta is the mean paired difference, contrast minus baseline, in the metric's
+  own units. The interval is a percentile bootstrap over item pairs; an interval
+  that excludes zero and a significant p-value carry the same information, and
+  the interval also states how large the change is.
+
+  better/worse counts the items that moved in each direction, which distinguishes
+  a small shift in every item from a large shift in a few. Read it before the
+  p-value: a mean improvement produced by a handful of items is a different
+  finding from a uniform one.
+
+  effect is Cliff's delta with its conventional band. It is the probability that a
+  contrast response scores above a baseline one, minus the reverse, so it is
+  comparable across metrics measured in different units. It is left empty for a
+  pass-or-fail metric, where the change in pass rate shown as delta is itself the
+  effect size.
+
+  p(adj) is Holm-corrected within the metric family it sits in, not across the
+  whole table. Descriptive rows, such as word count and the recognition stages, are
+  excluded from the correction and never receive a verdict, since neither direction
+  is better for them.
+
+  In the runtime family, recognition and endpoint delay are controls: the same audio
+  was decoded by the same recognizer in both runs, so these should not move. If they
+  do, the host was not in the same state and the other timings carry that difference
+  too. Generation time also tracks how much the model chose to say, so read it next
+  to the token count and the throughput rather than on its own.
+
+  'equivalent' means the whole confidence interval for the difference lies inside
+  the declared margin: the change is not merely undetected, it is too small to
+  matter. 'no detected change' is weaker and includes an underpowered test.
+
+  Significance is not importance. With a large prompt set a difference of no
+  practical consequence still reaches significance, which is why every row
+  reports an effect size and, where a margin was declared, an equivalence test.
+
+  Constraint metrics are decidable and need no calibration. Judge-derived rows
+  inherit the limits of the judge and should not settle a close comparison on
+  their own.
+====================================================================================================================================
