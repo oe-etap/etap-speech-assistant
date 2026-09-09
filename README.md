@@ -17,6 +17,7 @@ Input comes either from pre-recorded English audio files or from a live micropho
 - Selectable STT engine: `--stt-engine vosk` or `--stt-engine whisper`
 - Tunable Vosk endpointer via `--vosk-endpoint-silence-ms`, the largest single component of perceived latency; `vosk_endpoint_sweep.py` measures the setting against a corpus of recordings
 - Selectable TTS engine: `--tts-engine piper` or `--tts-engine coqui`
+- `ollama_overhead_probe.py` separates what a request costs the model from what it costs to reach it through Ollama, which on this box is the larger of the two — see [Ollama](#ollama)
 - CPU/GPU preset via `--mode cpu|gpu`
 - Whisper can run on CPU or CUDA via `--whisper-device cpu|cuda`
 - Piper can run on CPU or CUDA via `--piper-device cpu|cuda`, which trades a per-call cost against a per-second-of-speech one and so helps long chunks and hurts short ones — see [Piper on the GPU](#piper-on-the-gpu)
@@ -917,6 +918,61 @@ reload into the run's first utterance — 7.6 s for an 8B q4_K_M, against 0.8 s
 for a request that left them alone, and precisely the outlier `warmup()` exists
 to prevent. `OllamaEngine._runner_options()` is why they travel together.
 
+**Most of `llm_ttft` is not the model.** Ollama times a request server-side and
+reports the parts — `load_duration`, `prompt_eval_duration` and `eval_duration`,
+which together account for `total_duration`. On a model that is already resident
+`load_duration` should be noise; there is nothing left to load. It is not.
+Subtracting `llm_prompt_eval` from `llm_ttft` across the 108 runs in
+`outputs/sub1` leaves a remainder that does not vary with model size at all, and
+varies sharply with model family:
+
+| Model | `llm_ttft` | `llm_prompt_eval` | Remainder |
+|---|---|---|---|
+| `llama3.2:1b-instruct-q4_K_M` | 862 ms | 19 ms | **843 ms** |
+| `llama3.1:8b-instruct-fp16` | 887 ms | 46 ms | **841 ms** |
+| `qwen2.5:1.5b-instruct-q4_K_M` | 749 ms | 26 ms | **723 ms** |
+| `qwen2.5:32b-instruct-q4_K_M` | 816 ms | 105 ms | **711 ms** |
+| `gemma3:1b-it-q4_K_M` | 1705 ms | 76 ms | **1629 ms** |
+| `gemma3:27b-it-q4_K_M` | 2282 ms | 650 ms | **1632 ms** |
+
+A 32B carries less of it than a 1B, which is the shape of a fixed cost rather
+than of work. `ollama_overhead_probe.py` measures what it is by asking the same
+question twice — once through Ollama, once directly on the port of the
+llama.cpp runner Ollama started, while that same model is resident and its
+prefix cache is warm:
+
+```bash
+python ollama_overhead_probe.py --unload llama3.2:1b-instruct-q4_K_M gemma3:1b-it-q4_K_M
+```
+
+| Model | Through Ollama | Runner directly | Overhead |
+|---|---|---|---|
+| `llama3.2:1b-instruct-q4_K_M` | 824 ms | 11 ms | 813 ms |
+| `gemma3:1b-it-q4_K_M` | 1845 ms | 64 ms | 1780 ms |
+| `gemma3:27b-it-q4_K_M` | 2185 ms | 421 ms | 1764 ms |
+
+Nothing this script exposes moves it. A 37-token prompt costs the same as a
+320-token one (794 vs 829 ms), `num_ctx` at 1024, 2048 and 4096 costs 785, 804
+and 829 ms, sending no options at all costs 828 ms, streaming 849 ms, and
+`num_gpu=0` — the whole model on the CPU — 665 ms. It is not the prompt, not the
+context, not the GPU and not the transport mode, which is why the probe compares
+transports instead of settings.
+
+Two things follow for reading the numbers. The 27B needs 421 ms to produce a
+first token and waits 1764 ms to be allowed to, so **`ttfa` currently carries
+roughly a second of time that belongs to no model under test** — around 840 ms on
+llama and qwen, around 1630 ms on gemma3. And because the constant differs by
+family, cross-family comparison is where it does damage: gemma3:1b looks 843 ms
+slower to first token than llama3.2:1b, while the two runners answer within
+60 ms of each other. Within a family the ordering survives, since every
+configuration pays the same constant.
+
+Removing it is not a setting. Either a newer Ollama does not have it — 0.32.9 is
+what these figures are from, and the probe re-measures it in two minutes — or the
+runner is addressed directly, which means this script taking over the model
+loading Ollama does today. Neither is a change to make mid-comparison: it moves
+every `ttft` and `ttfa` figure by about a second.
+
 ## Aggregating a run
 
 `aggregate_logs.py` turns the CSVs into a report. **One recording is one
@@ -1222,7 +1278,7 @@ an empty string, so the first utterance starts from the same cache state as ever
 later one instead of paying to evaluate the whole prompt. Two consequences when
 reading the number: a run whose input repeats the same question will report values
 far below what a fresh question costs, and a cold server reports several times the
-warm figure.
+warm figure. **And not every model gets the reuse.** Asked the same question three times over, `qwen2.5:7b-instruct-q4_K_M` evaluates a 324-token prompt in 15-21 ms, the same as a 97-token one; `gemma3:27b-it-q4_K_M` takes 532-703 ms for 313 tokens against 201-251 ms for 82, which is the cost of reading the whole prompt again every time. Shortening the system prompt therefore buys nothing measurable on llama or qwen and about 300 ms per request on gemma3.
 
 ---
 
@@ -1230,7 +1286,7 @@ warm figure.
 
 | | |
 |---|---|
-| **What it measures** | Request sent → first token back. Covers the HTTP round trip and Ollama's prompt evaluation. |
+| **What it measures** | Request sent → first token back. Covers the HTTP round trip, Ollama's prompt evaluation, and whatever the server spends before it starts — which is most of this figure, and belongs to Ollama rather than to the model; see [Ollama](#ollama). |
 | **Measurement point** | Start of the streaming request → first token from the generator. |
 | **duration_ms** | Prompt → first token. |
 | **extra_json** | – |
