@@ -5,12 +5,12 @@
 Ollama times every request server-side and reports the parts: `load_duration`,
 `prompt_eval_duration` and `eval_duration`, which together should account for
 `total_duration`. On a model that is already resident `load_duration` is meant to
-be noise -- there is nothing left to load. Measured over `outputs/sub1` it was
-not: subtracting `prompt_eval` from the logged `llm_ttft` left 711-843 ms for
-every llama and qwen configuration and 1629-1632 ms for every gemma3 one, flat
-across model sizes from 1B to 32B. A constant that large sits inside `ttfa`, the
-figure the whole comparison rests on, and it belongs to none of the models under
-test.
+be noise -- there is nothing left to load. On Ollama 0.32.9, which is what
+`outputs/sub1` was measured on, it was not: subtracting `prompt_eval` from the
+logged `llm_ttft` left 711-843 ms for every llama and qwen configuration and
+1629-1632 ms for every gemma3 one, flat across model sizes from 1B to 32B. A
+constant that large sits inside every `ttfa` in that series, and it belongs to
+none of the models under test.
 
 This script measures it two ways and prints both:
 
@@ -22,9 +22,12 @@ This script measures it two ways and prints both:
     warm KV cache; the only thing removed is Ollama in front of it.
 
 The difference is what a request pays to get to a model that is already loaded.
-On a GRID V100DX-32C with Ollama 0.32.9 it was 829 ms for llama3.2:1b (857 ms
-against 28 ms), 1735 ms for gemma3:1b and 1764 ms for gemma3:27b -- in each case
-larger than the model's own time to first token.
+On a GRID V100DX-32C it was 813 ms for llama3.2:1b, 1780 ms for gemma3:1b and
+1764 ms for gemma3:27b under Ollama 0.32.9 -- in each case larger than the
+model's own time to first token -- and 19, 17 and -40 ms under 0.33.3, which is
+run-to-run noise. The defect was fixed upstream, so this is a regression check
+rather than a standing finding: run it after a server upgrade, and before
+trusting a llm_ttft figure measured across one.
 
 Two things the direct figure is not. It skips the chat template Ollama applies,
 which is string work on a couple of kilobytes rather than hundreds of
@@ -32,15 +35,16 @@ milliseconds, and it skips Ollama's scheduling, which is the thing being
 measured. Treat it as the floor the runner is capable of, not as a drop-in
 replacement for what Ollama does.
 
-What the overhead does not depend on, all measured: prompt length (a 37-token
-prompt cost the same as a 320-token one), `num_ctx` at 1024, 2048 or 4096,
-whether options are sent at all, streaming or not, and whether the model is on
-the GPU or on the CPU. Raising or lowering any of them does not move it, which
-is why this compares transports rather than settings.
+What the overhead did not depend on, all measured on 0.32.9: prompt length (a
+37-token prompt cost the same as a 320-token one), `num_ctx` at 1024, 2048 or
+4096, whether options are sent at all, streaming or not, and whether the model
+is on the GPU or on the CPU. Nothing a caller controls moved it, which is why
+this compares transports rather than settings.
 
-The prompt_eval column is worth reading on its own. Where the prefix cache works
--- llama and qwen -- a long system prompt is evaluated once and costs nothing on
-later requests, so prompt length is free. gemma3 re-evaluates it every time.
+The prompt_eval column is worth reading on its own, and it outlived the fix.
+Where the prefix cache works -- llama and qwen -- a long system prompt is
+evaluated once and costs nothing on later requests, so prompt length is free.
+gemma3 re-evaluates it every time, on both versions.
 
 Usage:
     python ollama_overhead_probe.py llama3.2:1b-instruct-q4_K_M gemma3:27b-it-q4_K_M
