@@ -1289,7 +1289,44 @@ an empty string, so the first utterance starts from the same cache state as ever
 later one instead of paying to evaluate the whole prompt. Two consequences when
 reading the number: a run whose input repeats the same question will report values
 far below what a fresh question costs, and a cold server reports several times the
-warm figure. **And not every model gets the reuse.** Asked the same question three times over on 0.33.3, `qwen2.5:7b-instruct-q4_K_M` evaluates a 324-token prompt in 11-12 ms, the same as a 97-token one; `gemma3:27b-it-q4_K_M` takes 443-511 ms for 313 tokens against 171-213 ms for 82, which is the cost of reading the whole prompt again every time. Shortening the system prompt therefore buys nothing measurable on llama or qwen and about 300 ms per request on gemma3. This one is the model's, not the server's: the same split was there on 0.32.9, and the upgrade that removed the per-request overhead left it alone.
+warm figure.
+
+**And not every model gets the reuse.** Asked the same question three times over
+on 0.33.3, `qwen2.5:7b-instruct-q4_K_M` evaluates a 324-token prompt in 11-12
+ms, the same as a 97-token one; `gemma3:27b-it-q4_K_M` takes 443-511 ms for 313
+tokens against 171-213 ms for 82, most of what reading the whole prompt again
+would cost. Shortening the system prompt therefore buys nothing measurable on
+llama or qwen and about 300 ms per request on gemma3. This one is the model's,
+not the server's: the same split was there on 0.32.9, and the upgrade that
+removed the per-request overhead left it alone.
+
+**What gemma3 misses is the benefit, not the cache.** Its attention is
+windowed — `attention.sliding_window` is 512 on the 1B and 1024 on the 27B,
+a key llama and qwen do not carry — and the KV cache for a windowed layer
+holds a rolling window rather than the whole prefix, so those layers are
+recomputed even when the global ones were kept. The server reports the hit
+either way. Run against the same GGUF on the same GPU with nothing changed
+but llama.cpp's `--swa-full`, which keeps the full cache for the windowed
+layers too:
+
+| gemma3:27b, 304-token prompt | Recomputed | From cache | `prompt_ms` |
+|---|---|---|---|
+| Windowed, prompt repeated | 5 tokens | 299 tokens | **502 ms** |
+| Windowed, prompt never seen | 307 tokens | 0 tokens | 618 ms |
+| `--swa-full`, prompt repeated | 1 token | 303 tokens | **33 ms** |
+| `--swa-full`, prompt never seen | 302 tokens | 5 tokens | 503 ms |
+
+A hit on 299 of 304 tokens costs 502 ms against 618 ms for computing all of
+them: the cache saves 19%. With the windowing off the same hit costs 33 ms and
+saves 93%. gemma3:1b has the same shape one order down — 52 ms against 49, and
+9 ms against 33 with `--swa-full`.
+
+Two things follow. Ollama does not expose `--swa-full`, so there is nothing to
+set here: on gemma3 every utterance pays close to a full prefill, and the
+~500 ms it costs the 27B lands in `ttfa` looking like the model being slow.
+And it is the one argument for addressing llama-server directly that survived
+the 0.33.3 upgrade — though `--swa-full` trades VRAM for it, which grows with
+`--llm-num-ctx` rather than staying at the 1024 measured here.
 
 ---
 
