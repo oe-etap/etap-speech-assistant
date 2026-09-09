@@ -1537,7 +1537,15 @@ def main():
         num_batch=args.llm_num_batch,
         num_thread=args.llm_num_thread,
     )
-    llm_engine.warmup()
+    if not llm_engine.warmup():
+        # A warm-up that did not leave the model resident is paid in full inside
+        # the first utterance -- 28 to 43 s on the 27B and 32B models, all of it
+        # in that item's ttfa. It happened in 11 of the 108 runs in outputs/sub1,
+        # every one of them a model above 15 GB, and the only trace was a blank
+        # llm_model_vram_mb column. One retry costs a load; not retrying costs a
+        # measurement.
+        print("[WARN] The LLM is not resident after warmup; retrying once.")
+        llm_engine.warmup()
     placement = report_llm_placement(llm_engine, args.ollama_model)
     start_llm_memory_monitor(args.ollama_url, placement)
 

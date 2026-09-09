@@ -5,6 +5,7 @@ LLM engine abstraction layer.
 Provides OllamaEngine for streaming text generation via the Ollama API.
 """
 
+import itertools
 import json
 import time
 
@@ -32,6 +33,13 @@ _SENTENCE_TERMINATORS = ".?!:;\n"
 _CLOSING_CHARS = "\"')]}”’»"
 
 DEFAULT_CHUNK_MAX_CHARS = 140
+
+# How long warmup() waits for the server to have the model loaded. Nothing here
+# is timed, so this is sized for the worst load rather than the usual one: an
+# eviction plus a fresh load of a 20 GB quantization ran past the 120 s this used
+# to be, on 11 of the 108 runs in outputs/sub1, and the load those clients
+# abandoned was then paid inside the first utterance's latency instead.
+WARMUP_TIMEOUT_S = 600
 
 
 class TextChunker:
@@ -297,16 +305,24 @@ class OllamaEngine:
 
         The load-time options travel with it for the same reason; see
         _runner_options().
+
+        Returns whether the model is resident afterwards, since a warm-up that
+        silently did not happen is paid in full by the first utterance and shows
+        up nowhere else. Nothing here is on a latency path, so the wait is long
+        enough for the largest model on the slowest disk: a client that gives up
+        mid-load leaves the load to the run.
         """
         try:
             self._session.post(
                 self._url,
                 json=self._build_request(self._build_prompt(""),
                                          {"num_predict": 1}, stream=False),
-                timeout=120,
+                timeout=WARMUP_TIMEOUT_S,
             )
         except Exception as e:
             print(f"[WARN] Failed to warmup Ollama: {e}")
+            return False
+        return self.placement() is not None
 
     def cancel(self):
         """Cancel the current streaming response by closing the HTTP connection.
@@ -383,7 +399,17 @@ class OllamaEngine:
                 # chunk_size=None yields one HTTP chunk (roughly one token) at a
                 # time for a chunked response, but the chunk may hold a partial
                 # NDJSON line, so lines are reassembled here.
-                for raw in r.iter_content(chunk_size=None):
+                #
+                # The sentinel closes the last line. Only what sits before a
+                # newline is ever parsed, so a final message that arrives without
+                # its trailing one stays in the buffer and is dropped -- and that
+                # is the message carrying the server-side stats, which is how
+                # config 18 in outputs/sub1 lost its llm_prompt_eval and llm_eval
+                # rows on one recording in each of three runs. Appending it to the
+                # iterator rather than repeating the parse after the loop costs
+                # one extra pass, once, through a loop that already runs per token.
+                for raw in itertools.chain(r.iter_content(chunk_size=None),
+                                           (b"\n",)):
                     if not raw:
                         continue
                     socket_buffer += raw.decode("utf-8", errors="ignore")
@@ -391,7 +417,16 @@ class OllamaEngine:
                         line, socket_buffer = socket_buffer.split("\n", 1)
                         if not line.strip():
                             continue
-                        data = json.loads(line)
+                        try:
+                            data = json.loads(line)
+                        except ValueError:
+                            # A line the stream cut short. It was silently
+                            # dropped with the rest of the buffer before the
+                            # sentinel reached it, and must not now surface as a
+                            # failed call glued onto the answer.
+                            print("[WARN] Discarded a malformed line from the "
+                                  "Ollama stream.")
+                            continue
 
                         # Capture server-side stats from the final message
                         if data.get("done", False):
@@ -421,6 +456,14 @@ class OllamaEngine:
             if ollama_stats:
                 yield {"text": "", "ollama_stats": ollama_stats,
                        "cancelled": False, "first_token_t": first_token_t}
+            else:
+                # A generation that ran to the end and still has no stats leaves
+                # a gap in the latency CSV, since the caller writes those two
+                # rows only when this arrives. Silent before, and a silent gap is
+                # what took three runs to notice.
+                print("[WARN] The Ollama stream ended without its final stats "
+                      "message; this response gets no llm_prompt_eval or "
+                      "llm_eval row.")
 
         except Exception as e:
             if self._cancel_requested:
