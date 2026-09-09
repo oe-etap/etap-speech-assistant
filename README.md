@@ -935,11 +935,10 @@ varies sharply with model family:
 | `gemma3:1b-it-q4_K_M` | 1705 ms | 76 ms | **1629 ms** |
 | `gemma3:27b-it-q4_K_M` | 2282 ms | 650 ms | **1632 ms** |
 
-A 32B carries less of it than a 1B, which is the shape of a fixed cost rather
-than of work. `ollama_overhead_probe.py` measures what it is by asking the same
-question twice — once through Ollama, once directly on the port of the
-llama.cpp runner Ollama started, while that same model is resident and its
-prefix cache is warm:
+A 32B carries less of it than a 1B, so it is not the model doing work.
+`ollama_overhead_probe.py` measures what it is by asking the same question twice
+— once through Ollama, once directly on the port of the llama.cpp runner Ollama
+started, while that same model is resident and its prefix cache is warm:
 
 ```bash
 python ollama_overhead_probe.py --unload llama3.2:1b-instruct-q4_K_M gemma3:1b-it-q4_K_M
@@ -947,9 +946,34 @@ python ollama_overhead_probe.py --unload llama3.2:1b-instruct-q4_K_M gemma3:1b-i
 
 | Model | Through Ollama | Runner directly | Overhead |
 |---|---|---|---|
-| `llama3.2:1b-instruct-q4_K_M` | 824 ms | 11 ms | 813 ms |
-| `gemma3:1b-it-q4_K_M` | 1845 ms | 64 ms | 1780 ms |
-| `gemma3:27b-it-q4_K_M` | 2185 ms | 421 ms | 1764 ms |
+| `phi3:mini` | 178 ms | 21 ms | **158 ms** |
+| `qwen2.5:1.5b-instruct-q4_K_M` | 740 ms | 18 ms | **721 ms** |
+| `llama3.2:1b-instruct-q4_K_M` | 824 ms | 11 ms | **813 ms** |
+| `llama3.1:8b-instruct-q4_K_M` | 873 ms | 33 ms | **840 ms** |
+| `gemma3:1b-it-q4_K_M` | 1845 ms | 64 ms | **1780 ms** |
+| `gemma3:4b-it-q4_K_M` | 1885 ms | 152 ms | **1732 ms** |
+| `gemma3:27b-it-q4_K_M` | 2185 ms | 421 ms | **1764 ms** |
+
+**It is a per-family constant, not a fixed one.** Within a family it does not
+move with the parameter count at all — gemma3 pays about 1700 ms at 1B and at
+27B, qwen2.5 about 710 ms at 1.5B and at 32B. Across families it varies elevenfold,
+and `phi3:mini` at 158 ms shows where the floor is: whatever this is, it is not
+the price of putting a server in front of a model.
+
+What it tracks is the size of the tokenizer's vocabulary:
+
+| Family | Vocabulary | Overhead | Per vocabulary entry |
+|---|---|---|---|
+| phi3 | 32 064 | 151 ms | 4.71 µs |
+| llama3 | 128 256 | 840 ms | 6.55 µs |
+| qwen2.5 | 151 936 | 710 ms | 4.67 µs |
+| gemma3 | 262 144 | 1680 ms | 6.41 µs |
+
+Consistent with something walking the whole vocabulary once per request, and it
+explains why the smallest model in the set carries the largest overhead. Read it
+as a lead rather than as a finding: four families is four points, qwen2.5 sits
+190 ms off a straight line through them, and nothing here can see what the server
+spends the time on. `journalctl -u ollama` is where that would be settled.
 
 Nothing this script exposes moves it. A 37-token prompt costs the same as a
 320-token one (794 vs 829 ms), `num_ctx` at 1024, 2048 and 4096 costs 785, 804
@@ -960,18 +984,19 @@ transports instead of settings.
 
 Two things follow for reading the numbers. The 27B needs 421 ms to produce a
 first token and waits 1764 ms to be allowed to, so **`ttfa` currently carries
-roughly a second of time that belongs to no model under test** — around 840 ms on
-llama and qwen, around 1630 ms on gemma3. And because the constant differs by
-family, cross-family comparison is where it does damage: gemma3:1b looks 843 ms
-slower to first token than llama3.2:1b, while the two runners answer within
-60 ms of each other. Within a family the ordering survives, since every
-configuration pays the same constant.
+close to a second of time that belongs to no model under test** — around 840 ms
+on llama, 710 ms on qwen and 1700 ms on gemma3. Within a family the ordering
+survives, since every configuration there pays the same amount. Across families
+it does not: gemma3:1b looks 843 ms slower to first token than llama3.2:1b, while
+the two runners answer within 60 ms of each other. Any sentence of the form
+"gemma3 is the slower family" rests on this constant rather than on the models.
 
 Removing it is not a setting. Either a newer Ollama does not have it — 0.32.9 is
 what these figures are from, and the probe re-measures it in two minutes — or the
 runner is addressed directly, which means this script taking over the model
 loading Ollama does today. Neither is a change to make mid-comparison: it moves
-every `ttft` and `ttfa` figure by about a second.
+`ttft` and `ttfa` by a different amount for each family, which is exactly the
+comparison being made.
 
 ## Aggregating a run
 
