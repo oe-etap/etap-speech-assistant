@@ -619,6 +619,13 @@ def contrast_rows(grouped: GroupedSamples, launch_values: LaunchValues,
         if unmatched:
             notes.append(f"launches present on only one side, excluded: "
                          f"{', '.join(sorted(unmatched))}")
+        if len(shifts) < len(matched):
+            # compare_paired() returns shift=None only when a matched launch's
+            # two sides share no item names at all - the item vocabulary
+            # should be constant within a campaign, so this is worth a name
+            # rather than a quietly shrunk R.
+            notes.append(f"{len(matched) - len(shifts)} matched launch(es) had "
+                         f"no items in common, excluded from R")
 
         rows.append(_row(kind="contrast", cell_id=baseline_cell,
                          contrast_cell_id=contrast_cell, name=name,
