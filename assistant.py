@@ -23,6 +23,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 import wave
 from datetime import datetime
@@ -1135,6 +1136,15 @@ def llm_worker(llm_engine, mailbox, tts_queue, llm_metrics):
                 if chunk_data.get("cancelled"):
                     break
 
+                if chunk_data.get("failed"):
+                    # Nothing was generated, so nothing downstream may act as
+                    # though something was: no chunk to the TTS, no WAV, and
+                    # the stage rows below are withheld for this item.
+                    llm_metrics["llm_error"] = chunk_data.get("error") or "unknown error"
+                    print(f"[LLM] FAILED, no response for this item: "
+                          f"{llm_metrics['llm_error']}", file=sys.stderr)
+                    break
+
                 if mailbox.has_pending():
                     print("[LLM] Newer utterance arrived, restarting generation...")
                     llm_engine.cancel()
@@ -1170,6 +1180,49 @@ def llm_worker(llm_engine, mailbox, tts_queue, llm_metrics):
         llm_metrics["error"] = str(e)
     finally:
         tts_queue.put(None)  # EOF signal
+
+
+def drop_normalized_copy(item, args):
+    """Delete the ffmpeg 16 kHz copy this item was fed from.
+
+    Called on every way out of an item, not only the last one: an item that
+    ends early -- nothing recognized, or a generation that failed -- leaves the
+    copy behind otherwise, and a corpus-sized run of them fills the disk with
+    files nothing will read again.
+    """
+    if item.normalized_wav and not args.keep_normalized:
+        try:
+            os.remove(item.normalized_wav)
+        except Exception:
+            pass
+
+
+def write_transcript_record(run_dir, item, stt_text, llm_text, stt_engine,
+                           llm_error=None):
+    """Append one item to the run's transcripts, in both formats.
+
+    `llm_text` stays empty when the generation failed, and the reason goes in
+    `llm_error` beside it. Putting the exception in `llm_text` would hand the
+    evaluation package an error message to score as though it were the
+    assistant's answer, and the transcripts are the one artefact that travels
+    to other tools by filename rather than by run directory.
+    """
+    record = {
+        "filename": item.filename,
+        "ori_text": item.ori_text,
+        "stt_text": stt_text,
+        "llm_text": llm_text,
+        "stt_engine": stt_engine,
+    }
+    if llm_error:
+        record["llm_error"] = llm_error
+
+    with open(os.path.join(run_dir, "transcripts.jsonl"), "a",
+              encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    with open(os.path.join(run_dir, "transcripts.yaml"), "a",
+              encoding="utf-8") as handle:
+        yaml.dump([record], handle, sort_keys=False, allow_unicode=True)
 
 
 def response_wav_path(out_wav, index):
@@ -1958,6 +2011,7 @@ def main():
                 "llm_t0": None, "llm_ttfc_ms": None, "llm_ttft_ms": None,
                 "first_chunk_chars": None,
                 "full_assistant_text": "", "llm_chunk_count": 0,
+                "llm_error": None,
                 "ollama_stats": None,
                 "ttft_stats": None, "ttfc_stats": None, "end_stats": None,
             }
@@ -2118,6 +2172,31 @@ def main():
                                  int((time.perf_counter() - e2e_t0) * 1000),
                                  e2e_stats, skipped_extra)
                 fcsv.flush()
+                drop_normalized_copy(item, args)
+                continue
+
+            # A generation that failed produced no reply, so no stage below may
+            # describe one. Writing them anyway is worse than writing nothing:
+            # an unreachable LLM would otherwise leave a complete-looking row
+            # set whose ttfa timed the synthesis of an error message -- 4.1 s
+            # against this recording's real 1.4 s, high enough to read as a slow
+            # configuration rather than as a failure, and indistinguishable from
+            # one by aggregation time.
+            if llm_metrics.get("llm_error"):
+                print(f"[Warn] No response for {item_name}: "
+                      f"{llm_metrics['llm_error']}", file=sys.stderr)
+                failed_extra = {"llm_failed": True,
+                                "llm_error": llm_metrics["llm_error"]}
+                if input_duration_ms is not None:
+                    failed_extra["input_duration_ms"] = input_duration_ms
+                write_timing(writer, args, item_name, "e2e_response_ready",
+                             int((time.perf_counter() - e2e_t0) * 1000),
+                             e2e_stats, failed_extra)
+                fcsv.flush()
+                write_transcript_record(run_dir, item, user_text, "",
+                                        args.stt_engine,
+                                        llm_error=llm_metrics["llm_error"])
+                drop_normalized_copy(item, args)
                 continue
 
             # LLM TTFT (first token) and TTFC (first chunk handed to TTS).
@@ -2253,29 +2332,10 @@ def main():
             # can stamp its rows with what recognized the words it answered.
             # In text mode this passes the incoming provenance through rather
             # than claiming this run produced anything.
-            transcript_record = {
-                "filename": item.filename,
-                "ori_text": item.ori_text,
-                "stt_text": user_text,
-                "llm_text": full_reply,
-                "stt_engine": args.stt_engine,
-            }
+            write_transcript_record(run_dir, item, user_text, full_reply,
+                                    args.stt_engine)
 
-            # JSONL Logging
-            jsonl_path = os.path.join(run_dir, "transcripts.jsonl")
-            with open(jsonl_path, "a", encoding="utf-8") as f_jsonl:
-                f_jsonl.write(json.dumps(transcript_record, ensure_ascii=False) + "\n")
-
-            # YAML Logging
-            yaml_path = os.path.join(run_dir, "transcripts.yaml")
-            with open(yaml_path, "a", encoding="utf-8") as f_yaml:
-                yaml.dump([transcript_record], f_yaml, sort_keys=False, allow_unicode=True)
-
-            if item.normalized_wav and not args.keep_normalized:
-                try:
-                    os.remove(item.normalized_wav)
-                except Exception:
-                    pass
+            drop_normalized_copy(item, args)
 
             # The stop signal is shared by every item, so a Ctrl+C or an idle
             # timeout ends the whole run instead of feeding empty audio to the
