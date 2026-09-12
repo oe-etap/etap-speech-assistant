@@ -13,7 +13,8 @@ same items both ways.
 Five phases, each skipped if its output is already there, so a killed run
 resumes by being re-issued:
 
-    subset    stratified pick of the corpus, written as its own folder
+    subset    stratified pick of the corpus, written as its own folder,
+              plus one recording ahead of it to spend on the warm-up
     asr       one --asr-only launch over the subset: the canonical pass
     text      --input-mode text, cells x replicates, off those transcripts
     measured  the full pipeline, same cells x replicates, same items
@@ -144,6 +145,25 @@ def keys_from_asr(tree):
     if not gathered:
         die(f"{tree}: no {ASR_KEY_STAGE} rows")
     return {item: rstat.percentile(values, 0.5) for item, values in gathered.items()}
+
+
+def pick_warmup(keys):
+    """The recording that will be sacrificed to the warm-up exclusion.
+
+    `assistant.py` processes `sorted(args.audio)`, so whichever filename
+    sorts first in the subset folder is the launch's first item -- and every
+    analysis drops that item, because the model load lands inside its `ttfa`
+    and inside none of the three terms. A stratified draw that does not
+    account for this silently loses one of its strata: the first live run of
+    this script drew the corpus's hardest recording, 00004.wav at 1728 ms of
+    internal pause, and then spent it on the warm-up.
+
+    So the warm-up is chosen first, as the corpus's alphabetically first
+    recording -- the only one guaranteed to sort ahead of anything the draw
+    can pick -- and taken out of the draw's pool. Its hardness is irrelevant
+    because nothing reads its numbers.
+    """
+    return min(keys) if keys else None
 
 
 def stratified_pick(keys, wanted, strata, seed):
@@ -339,18 +359,30 @@ def main(argv=None):
         keys = keys_from_metadata(rows, args.key_column)
         key_name = f"{args.key_column} (metadata proxy)"
 
-    chosen, bands = stratified_pick(keys, args.items, args.strata, args.seed)
-    print(f"[INFO] stratified on {key_name} over {len(keys)} candidate recordings")
+    warmup = pick_warmup(keys)
+    pool = {name: key for name, key in keys.items() if name != warmup}
+    chosen, bands = stratified_pick(pool, args.items, args.strata, args.seed)
+    print(f"[INFO] stratified on {key_name} over {len(pool)} candidate recordings")
     for index, band in enumerate(bands, start=1):
         taken = [name for name in chosen if name in band]
-        print(f"  band {index}: key {keys[band[0]]:.0f}..{keys[band[-1]]:.0f} ms, "
+        print(f"  band {index}: key {pool[band[0]]:.0f}..{pool[band[-1]]:.0f} ms, "
               f"{len(band)} candidates, {len(taken)} taken: {', '.join(taken) or '-'}")
-    print(f"[INFO] subset ({len(chosen)}): {', '.join(chosen)}")
+    print(f"[INFO] subset ({len(chosen)} measured): {', '.join(chosen)}")
+    print(f"[INFO] plus {warmup} first, to be spent on the warm-up exclusion")
+    if chosen and warmup is not None and keys[warmup] > max(keys[name] for name in chosen):
+        # Sort order and hardness are unrelated, so this is chance rather
+        # than a rule -- but when it happens the hard end of the stratification
+        # is gone and nothing downstream would say so.
+        print(f"[WARN] {warmup} sorts first and is also the hardest recording "
+              f"({keys[warmup]:.0f} ms); the warm-up exclusion will spend it. Rename "
+              "it, or draw from a corpus whose first-sorting recording is easier.",
+              file=sys.stderr)
 
     if not args.dry_run:
-        build_subset(args.audio_dir, rows, chosen, subset_dir)
+        build_subset(args.audio_dir, rows, [warmup] + chosen, subset_dir)
         with open(os.path.join(args.out_dir, "subset.json"), "w", encoding="utf-8") as handle:
             json.dump({"key": key_name, "seed": args.seed, "strata": args.strata,
+                       "warmup_item": warmup,
                        "items": {name: keys[name] for name in chosen}},
                       handle, indent=2, sort_keys=True)
         print(f"[INFO] wrote {subset_dir} and {os.path.join(args.out_dir, 'subset.json')}")

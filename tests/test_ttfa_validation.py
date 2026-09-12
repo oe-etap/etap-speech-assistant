@@ -89,6 +89,34 @@ class StratifiedPickTest(unittest.TestCase):
         self.assertEqual([len(band) for band in bands], [4, 4, 4])
 
 
+class WarmupRecordingTest(unittest.TestCase):
+    """One recording is spent on the exclusion so the draw keeps all of its own."""
+
+    def test_the_warmup_is_whatever_sorts_first(self):
+        """`assistant.py` runs `sorted(args.audio)`, so sort order picks it."""
+        self.assertEqual(val.pick_warmup(KEYS), sorted(KEYS)[0])
+
+    def test_the_draw_never_spends_a_stratum_on_it(self):
+        warmup = val.pick_warmup(KEYS)
+        pool = {name: key for name, key in KEYS.items() if name != warmup}
+        chosen, _ = val.stratified_pick(pool, wanted=3, strata=3, seed=1)
+        self.assertNotIn(warmup, chosen)
+        self.assertIn(HARDEST, chosen)
+
+    def test_the_subset_folder_puts_it_ahead_of_every_chosen_item(self):
+        tmp = tempfile.mkdtemp(prefix="ttfa-val-warm-")
+        self.addCleanup(_rmtree, tmp)
+        source = os.path.join(tmp, "audios")
+        rows = corpus(source, KEYS)
+        dest = os.path.join(tmp, "subset")
+        warmup = val.pick_warmup(KEYS)
+        chosen = [HARDEST, "00006.wav"]
+        val.build_subset(source, rows, [warmup] + chosen, dest)
+        present = sorted(name for name in os.listdir(dest) if name.endswith(".wav"))
+        self.assertEqual(present[0], warmup)
+        self.assertEqual(len(present), len(chosen) + 1)
+
+
 class SubsetFolderTest(unittest.TestCase):
 
     def test_the_subset_is_a_corpus_of_its_own(self):
