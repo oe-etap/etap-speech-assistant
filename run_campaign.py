@@ -18,7 +18,7 @@ launches apart. The reload this costs is paid during warmup, before the first
 timed item.
 
 The run directory a launch actually writes is one level below what this
-passes as --out-dir: assistant.py:1570 is
+passes as --out-dir: assistant.py:1591 is
 `run_dir = os.path.join(args.out_dir, timestamp)`, so a launch given
 `--out-dir <root>/<cell>/r2` writes `<root>/<cell>/r2/<timestamp>/`, and a
 second attempt at the same launch makes a *second* timestamped directory
@@ -30,7 +30,7 @@ leave (the next attempt gets its own fresh timestamp) and it is the forensic
 trail for whatever went wrong.
 
 A launch counts as complete when it has both of: config_used.yaml (written at
-assistant.py:1599, after warmup and before the first item -- proves the
+assistant.py:1620, after warmup and before the first item -- proves the
 process got that far) and a non-empty latency_log_*.csv whose *last* row still
 names the cell_id/launch_id this launch was given (proves the CSV was not left
 over from a different launch that once used this same directory). Neither
@@ -87,7 +87,7 @@ MANIFEST_VERSION = 1
 MANIFEST_FILENAME = "campaign_manifest.json"
 
 # assistant.py's own timestamp format (datetime.now().strftime("%Y%m%d_%H%M%S")
-# at assistant.py:1349/1570) -- a run directory is named exactly this.
+# at assistant.py:1360/1591) -- a run directory is named exactly this.
 TIMESTAMP_DIR_RE = re.compile(r"^\d{8}_\d{6}$")
 
 # assistant.py:1568. Printed before config_used.yaml exists, so it lives only
