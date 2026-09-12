@@ -257,6 +257,19 @@ def reference_speech_end_s(row):
         return None
 
 
+# One item's worth of work, whatever the input mode supplies it from. A field a
+# mode cannot fill is None, and the metric writing keys off exactly that: an item
+# with no audio_source, for instance, has nothing measured from the speech.
+ItemWork = collections.namedtuple("ItemWork", (
+    "index",             # 1-based position in this run; names the output files
+    "name",              # the CSV's `item` column
+    "filename",          # the recording's name, as the transcript log records it
+    "ori_text",          # what the recording was supposed to say, or None
+    "ref_speech_end_s",  # the anchor for the speech-end metrics, or None
+    "audio_source",      # where this item's audio comes from
+    "normalized_wav",    # the ffmpeg copy to delete afterwards, or None
+))
+
 def is_mono_16k_pcm(path):
     """Check if a file is already mono 16kHz 16-bit PCM WAV."""
     try:
@@ -1312,6 +1325,61 @@ def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics, playback=False):
                 pass
 
 
+def plan_items(args, run_dir, shutdown_event):
+    """Yield the items this run processes, one ItemWork each, in run order.
+
+    The input modes differ in where an item comes from and in nothing else,
+    which is why this is the only place that branches on `--input-mode`:
+    everything after it reads an ItemWork and measures whatever that item
+    actually carries. A mic session is one open-ended item; a file-mode item
+    carries the audio to be recognized.
+    """
+    if args.input_mode == "mic":
+        print("=" * 60)
+        item_name = "live_mic"
+        user_wav = os.path.join(run_dir, f"user_input_1_{item_name}.wav")
+        print(f"[INFO] Processing live microphone input (saving to {user_wav})...")
+        # Live speech has nothing describing it in advance: no text it was
+        # supposed to be, and no measured end to anchor on.
+        yield ItemWork(
+            index=1, name=item_name, filename=None, ori_text=None,
+            ref_speech_end_s=None,
+            audio_source=MicAudioSource(save_path=user_wav,
+                                        chunk_ms=args.audio_chunk_ms,
+                                        stop_event=shutdown_event),
+            normalized_wav=None)
+        return
+
+    for index, audio_path in enumerate(args.audio, start=1):
+        print("=" * 60)
+        audio_file = Path(audio_path)
+        if not audio_file.exists():
+            raise FileNotFoundError(audio_path)
+
+        metadata = metadata_for(audio_path)
+        print(f"[INFO] Processing audio file: {audio_file} "
+              f"(pacing: {args.audio_pacing})")
+
+        user_wav = os.path.join(run_dir, f"user_input_{index}_{audio_file.name}")
+        try:
+            if os.path.abspath(audio_path) != os.path.abspath(user_wav):
+                shutil.copyfile(audio_path, user_wav)
+        except Exception as e:
+            print(f"[WARN] Copy failed: {e}")
+
+        wav_path = ensure_wav_mono_16k(audio_path, out_dir=run_dir,
+                                       prefix=f"input_{index}")
+        yield ItemWork(
+            index=index, name=audio_file.stem, filename=audio_file.name,
+            ori_text=ground_truth_text(metadata),
+            ref_speech_end_s=reference_speech_end_s(metadata),
+            audio_source=FileAudioSource(wav_path,
+                                         pacing=args.audio_pacing,
+                                         chunk_ms=args.audio_chunk_ms,
+                                         stop_event=shutdown_event),
+            normalized_wav=wav_path)
+
+
 def report_llm_placement(llm_engine, model_name):
     """Print where Ollama put the model, and warn when it is not all on the GPU.
 
@@ -1698,50 +1766,9 @@ def main():
         if not csv_exists:
             writer.writeheader()
 
-        for item_index, audio_path in enumerate(args.audio, start=1):
-            print("=" * 60)
-            
-            wav_path = None
-            if args.input_mode == "mic":
-                item_name = "live_mic"
-                # Live speech has nothing describing it in advance: no text it
-                # was supposed to be, and no measured end to anchor on.
-                item_filename, ori_text, ref_speech_end_s = None, None, None
-                user_wav = os.path.join(run_dir, f"user_input_{item_index}_{item_name}.wav")
-                audio_source = MicAudioSource(
-                    save_path=user_wav,
-                    chunk_ms=args.audio_chunk_ms,
-                    stop_event=shutdown_event,
-                )
-                print(f"[INFO] Processing live microphone input (saving to {user_wav})...")
-            else:
-                audio_file = Path(audio_path)
-                if not audio_file.exists():
-                    raise FileNotFoundError(audio_path)
-
-                item_name = audio_file.stem
-                item_filename = audio_file.name
-                metadata = metadata_for(audio_path)
-                ori_text = ground_truth_text(metadata)
-                ref_speech_end_s = reference_speech_end_s(metadata)
-                print(f"[INFO] Processing audio file: {audio_file} (pacing: {args.audio_pacing})")
-
-                user_wav = os.path.join(run_dir, f"user_input_{item_index}_{audio_file.name}")
-                try:
-                    if os.path.abspath(audio_path) != os.path.abspath(user_wav):
-                        shutil.copyfile(audio_path, user_wav)
-                except Exception as e:
-                    print(f"[WARN] Copy failed: {e}")
-
-                wav_path = ensure_wav_mono_16k(audio_path, out_dir=run_dir, prefix=f"input_{item_index}")
-                audio_source = FileAudioSource(
-                    wav_path,
-                    pacing=args.audio_pacing,
-                    chunk_ms=args.audio_chunk_ms,
-                    stop_event=shutdown_event,
-                )
-
-            out_wav = os.path.join(run_dir, f"assistant_{item_index}_{item_name}.wav")
+        for item in plan_items(args, run_dir, shutdown_event):
+            item_name = item.name
+            out_wav = os.path.join(run_dir, f"assistant_{item.index}_{item_name}.wav")
 
             # Shared metrics dicts (single-writer per dict = thread-safe).
             # The *_stats entries hold the snapshot taken at that milestone.
@@ -1775,33 +1802,33 @@ def main():
             e2e_t0 = time.perf_counter()
 
             # Start worker threads
-            stt_t = threading.Thread(
-                target=stt_worker,
-                args=(stt_engine, audio_source, mailbox, stt_metrics,
-                      trigger_on_endpoint, ref_speech_end_s),
-                daemon=True,
-            )
-            llm_t = threading.Thread(
-                target=llm_worker,
-                args=(llm_engine, mailbox, tts_queue, llm_metrics),
-                daemon=True,
-            )
-            tts_t = threading.Thread(
-                target=tts_worker,
-                args=(tts_engine, tts_queue, out_wav, tts_metrics, args.playback),
-                daemon=True,
-            )
+            workers = [
+                threading.Thread(
+                    target=stt_worker,
+                    args=(stt_engine, item.audio_source, mailbox, stt_metrics,
+                          trigger_on_endpoint, item.ref_speech_end_s),
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=llm_worker,
+                    args=(llm_engine, mailbox, tts_queue, llm_metrics),
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=tts_worker,
+                    args=(tts_engine, tts_queue, out_wav, tts_metrics, args.playback),
+                    daemon=True,
+                ),
+            ]
 
-            stt_t.start()
-            llm_t.start()
-            tts_t.start()
+            for worker in workers:
+                worker.start()
 
             # Wait for completion or interrupt
             try:
-                if args.input_mode == "file":
-                    stt_t.join()
-                    llm_t.join()
-                    tts_t.join()
+                if args.input_mode != "mic":
+                    for worker in workers:
+                        worker.join()
                 else:
                     last_action_t = time.perf_counter()
                     while True:
@@ -1827,7 +1854,7 @@ def main():
 
             # Let the workers drain before their metrics are read, otherwise the
             # response WAV may still be open while its duration is measured.
-            for worker in (stt_t, llm_t, tts_t):
+            for worker in workers:
                 worker.join(timeout=WORKER_SHUTDOWN_TIMEOUT_S)
                 if worker.is_alive():
                     print(f"[WARN] {worker.name} did not stop within "
@@ -1841,7 +1868,7 @@ def main():
             stt_ms = stt_metrics.get("stt_ms") or 0
             # Read after the workers finish: a mic source only knows how much
             # audio it captured once capturing has stopped.
-            input_duration_ms = audio_source.duration_ms
+            input_duration_ms = item.audio_source.duration_ms
 
             stt_rtf = round(stt_ms / input_duration_ms, 3) if input_duration_ms > 0 else 0.0
             stt_extra = {"input_duration_ms": input_duration_ms, "stt_rtf": stt_rtf,
@@ -2008,8 +2035,8 @@ def main():
 
             # --- Transcript Logging ---
             transcript_record = {
-                "filename": item_filename,
-                "ori_text": ori_text,
+                "filename": item.filename,
+                "ori_text": item.ori_text,
                 "stt_text": user_text,
                 "llm_text": full_reply,
             }
@@ -2024,9 +2051,9 @@ def main():
             with open(yaml_path, "a", encoding="utf-8") as f_yaml:
                 yaml.dump([transcript_record], f_yaml, sort_keys=False, allow_unicode=True)
 
-            if args.input_mode == "file" and not args.keep_normalized:
+            if item.normalized_wav and not args.keep_normalized:
                 try:
-                    os.remove(wav_path)
+                    os.remove(item.normalized_wav)
                 except Exception:
                     pass
 
