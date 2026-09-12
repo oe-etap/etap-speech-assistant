@@ -957,6 +957,8 @@ def write_timing(writer, args, item, stage, duration_ms, stats=None, extra=None)
         # setting only takes effect under file input with realtime pacing.
         "utterance_trigger": (TRIGGER_ENDPOINT if triggers_on_endpoint(args)
                               else TRIGGER_END_OF_FILE),
+        "cell_id": args.cell_id,
+        "launch_id": args.launch_id,
         "item": item,
         "stage": stage,
         "duration_ms": int(duration_ms),
@@ -1320,6 +1322,16 @@ def main():
 
     parser.add_argument("--out-dir", type=str, default="outputs", help="Where to save the audiofiles")
     parser.add_argument("--latency-csv", type=str, default=None, help="CSV file to append latency/resource logs")
+    parser.add_argument("--cell-id", type=str, default=None,
+                        help="Configuration cell this launch belongs to, written on every CSV "
+                             "row and into config_used.yaml so a launch stays identifiable once "
+                             "several CSVs are concatenated. Defaults to --config's basename "
+                             "without its extension; empty when no --config is given.")
+    parser.add_argument("--launch-id", type=str, default=None,
+                        help="Which repeat of --cell-id this process is (e.g. 'r2'), written "
+                             "alongside it on every row and into config_used.yaml. Empty by "
+                             "default: two launches of the same cell are the same experiment, "
+                             "not a compatibility mismatch, so nothing requires this to be set.")
     parser.add_argument("--no-summary", dest="summary", action="store_false",
                         help="Skip the aggregate report the run otherwise leaves in its own "
                              "folder. The CSV is written either way, and aggregate_logs.py "
@@ -1452,6 +1464,15 @@ def main():
     args.vosk_endpoint_silence_ms = parse_endpoint_schedule(args.vosk_endpoint_silence_ms) \
         if not isinstance(args.vosk_endpoint_silence_ms, tuple) \
         else args.vosk_endpoint_silence_ms
+
+    # A config file names its own cell; a bare CLI run has none unless told
+    # explicitly. Resolved here rather than as an argparse default because the
+    # default depends on --config's value, which argparse does not expose to
+    # another argument's default at declaration time.
+    if args.cell_id is None:
+        args.cell_id = os.path.splitext(os.path.basename(args.config))[0] if args.config else ""
+    if args.launch_id is None:
+        args.launch_id = ""
 
     if args.input_mode == "mic":
         args.audio = ["mic"]
@@ -1605,10 +1626,16 @@ def main():
     # These ride along on every row so a stage is always interpretable on its
     # own: which stages carry a value, and what they include, depends on them.
     # Averaging across a mix of them is meaningless.
+    #
+    # cell_id/launch_id are a different kind of identity: which configuration
+    # cell and which repeat of it wrote the row, surviving several CSVs being
+    # concatenated. Two launches of one cell are still the same experiment --
+    # pooling replicates is the point -- so unlike the columns above, these
+    # must stay out of aggregate_logs.py's RUN_CONTEXT_COLUMNS.
     fieldnames = [
         "ts_iso", "mode", "stt_engine", "tts_engine",
         "input_mode", "audio_pacing", "utterance_trigger",
-        "item", "stage", "duration_ms",
+        "cell_id", "launch_id", "item", "stage", "duration_ms",
         "cpu_percent", "ram_percent", "rss_mb", "llm_rss_mb",
         "llm_vram_mb", "llm_model_vram_mb",
         "gpu_util_percent", "gpu_mem_used_mb", "gpu_mem_total_mb", "gpu_name",
@@ -1622,6 +1649,23 @@ def main():
 
     # Prepare CSV
     csv_exists = os.path.exists(args.latency_csv)
+    if csv_exists:
+        # DictWriter never reads an existing file, so it would otherwise append
+        # rows in the current field order under whatever header is already
+        # there. Harmless for a file this run itself started, but pointing
+        # --latency-csv at a CSV from before cell_id/launch_id existed would
+        # silently shift every value two columns over rather than fail loudly.
+        with open(args.latency_csv, "r", newline="", encoding="utf-8") as fexisting:
+            existing_header = next(csv.reader(fexisting), [])
+        if existing_header and existing_header != fieldnames:
+            parser.error(
+                f"--latency-csv {args.latency_csv} already exists with a "
+                f"different header than this run would write.\n"
+                f"  existing: {existing_header}\n"
+                f"  expected: {fieldnames}\n"
+                f"Appending would misalign columns rather than extend the file; "
+                f"point at a fresh path instead."
+            )
     with open(args.latency_csv, "a", newline="", encoding="utf-8") as fcsv:
         writer = csv.DictWriter(fcsv, fieldnames=fieldnames)
         if not csv_exists:
