@@ -296,7 +296,8 @@ def run_pipeline(work_dir, with_metadata):
         rows = list(csv.DictReader(fh))
     for row in rows:
         row["extra"] = json.loads(row["extra_json"])
-    return rows, tts, RecordingFileAudioSource.instances
+    # A copy, because the next launch rebinds the class attribute.
+    return rows, tts, list(RecordingFileAudioSource.instances)
 
 
 class BargeInAccountingTest(unittest.TestCase):
