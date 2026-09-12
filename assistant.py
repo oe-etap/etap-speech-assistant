@@ -1006,6 +1006,7 @@ def stt_worker(stt_engine, audio_source, mailbox, stt_metrics,
     `stt` row, since runs anchored differently are not comparable.
     """
     try:
+        stt_metrics["endpoint_fire_count"] = 0
         # Opens this thread's CPU window for the span reported as stt_ms.
         prime_cpu_percent()
         t0 = time.perf_counter()
@@ -1018,6 +1019,14 @@ def stt_worker(stt_engine, audio_source, mailbox, stt_metrics,
             if not result["is_final"]:
                 print(f"[STT Partial] {result['text']}", end="\r")
                 continue
+
+            # A fire past the first is the endpointer calling the utterance
+            # over before the speaker had finished: the answer already in
+            # flight is thrown away and a second one starts. 1.1% of the
+            # archived file-mode items (186 of 16 606), and nothing downstream
+            # can tell afterwards which items they were -- a fire cancelled
+            # before any audio is synthesized does not even leave a WAV.
+            stt_metrics["endpoint_fire_count"] += 1
 
             accumulated_final = (
                 accumulated_final + " " + result["text"]
@@ -1168,11 +1177,16 @@ def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics, playback=False):
           any queued audio from the speakers, and reset the metrics.
         - "end_of_response": the answer is complete; close its WAV so the next
           one starts a new file.
+
+    out_wavs holds the answer that survived to the end of the item, which is
+    the one every figure in tts_metrics describes; discarded_wavs holds the
+    answers a later utterance superseded, whose audio still exists on disk.
     """
     wav_file = None
     stream = None
     response_index = 1
     tts_metrics["out_wavs"] = []
+    tts_metrics["discarded_wavs"] = []
 
     def close_response():
         nonlocal wav_file, response_index
@@ -1211,6 +1225,19 @@ def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics, playback=False):
                 continue
 
             if msg_type == "cancel":
+                # Every answer closed before this point has been superseded.
+                # On a barge-in that is one whole answer, not a partial:
+                # llm_worker puts end_of_response at the end of an iteration
+                # and the cancel only at the top of the next, and this queue is
+                # FIFO, so close_response() has already run and advanced
+                # response_index by the time the cancel is read. The delete
+                # below then names an _rN.wav that was never opened and the
+                # finished WAV stays on disk. Moving it here is what keeps
+                # output_duration_ms describing the same answer as tts_total,
+                # which the reset further down empties.
+                tts_metrics["discarded_wavs"].extend(tts_metrics["out_wavs"])
+                tts_metrics["out_wavs"] = []
+
                 # Discard the partial WAV of the superseded answer
                 partial_path = response_wav_path(out_wav, response_index)
                 if wav_file:
@@ -1817,7 +1844,10 @@ def main():
             input_duration_ms = audio_source.duration_ms
 
             stt_rtf = round(stt_ms / input_duration_ms, 3) if input_duration_ms > 0 else 0.0
-            stt_extra = {"input_duration_ms": input_duration_ms, "stt_rtf": stt_rtf}
+            stt_extra = {"input_duration_ms": input_duration_ms, "stt_rtf": stt_rtf,
+                         # On every row, not only the interesting ones, so that
+                         # a missing value can never be read as "fired once".
+                         "endpoint_fire_count": stt_metrics.get("endpoint_fire_count", 0)}
 
             # Trailing silence is what an endpointer needs to see before it can
             # call the utterance over. Too little and the engine only finalizes
@@ -1943,10 +1973,17 @@ def main():
                          int(tts_metrics["total_tts_time"] * 1000),
                          tts_metrics.get("end_stats") if tts_metrics["total_tts_time"] > 0 else None)
 
-            # Output audio duration and E2E summary. A mic session answers more
-            # than once, so the reported duration covers every response WAV.
+            # Output audio duration and E2E summary. An answer a later
+            # utterance superseded is left on disk but reported apart from the
+            # surviving one: tts_total, full_text, llm_chunk_count and the
+            # response sizes all reset on the cancel, so folding the discarded
+            # audio into output_duration_ms made that one field describe a
+            # different answer than the rest of the row. The count still covers
+            # both, since above one is what identifies these items at all.
             response_wavs = [p for p in tts_metrics.get("out_wavs", []) if os.path.exists(p)]
+            discarded_wavs = [p for p in tts_metrics.get("discarded_wavs", []) if os.path.exists(p)]
             output_duration_ms = sum(wav_duration_ms(p) for p in response_wavs)
+            discarded_output_duration_ms = sum(wav_duration_ms(p) for p in discarded_wavs)
             full_reply = llm_metrics["full_assistant_text"].strip()
 
             write_timing(writer, args, item_name, "e2e_response_ready",
@@ -1954,13 +1991,17 @@ def main():
                          e2e_stats,
                          {"input_duration_ms": input_duration_ms,
                           "output_duration_ms": output_duration_ms,
+                          "discarded_output_duration_ms": discarded_output_duration_ms,
                           "output_wav": response_wavs[0] if response_wavs else "",
-                          "output_wav_count": len(response_wavs),
+                          "output_wav_count": len(response_wavs) + len(discarded_wavs),
                           "full_text": full_reply,
                           "response_word_count": len(full_reply.split()) if full_reply else 0,
                           "response_char_count": len(full_reply),
                           "llm_chunk_count": llm_metrics["llm_chunk_count"]})
             print(f"[TTS] Stream finished. Saved to {', '.join(response_wavs) or '(no audio)'}.")
+            if discarded_wavs:
+                print(f"[TTS] {discarded_output_duration_ms} ms of superseded audio "
+                      f"kept for inspection: {', '.join(discarded_wavs)}")
 
             # Flush CSV after each item to prevent data loss
             fcsv.flush()
