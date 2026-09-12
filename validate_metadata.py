@@ -226,9 +226,10 @@ def main():
     if pauses:
         pauses.sort()
         print(f"  max_internal_pause_ms over {len(pauses)} recordings: "
-             f"median={percentile(pauses, 50):.0f} p90={percentile(pauses, 90):.0f} "
-             f"p95={percentile(pauses, 95):.0f} max={pauses[-1]:.0f} "
-             f"(reported, not gated -- how endpoint-hard the corpus is)")
+              f"median={percentile(pauses, 50):.0f} "
+              f"p90={percentile(pauses, 90):.0f} "
+              f"p95={percentile(pauses, 95):.0f} max={pauses[-1]:.0f} "
+              f"(reported, not gated -- how endpoint-hard the corpus is)")
 
     if all_problems:
         print(f"\n[FAIL] {len(all_problems)} problem(s) in {metadata_path}:")
@@ -236,7 +237,7 @@ def main():
             print(f"  {p}")
         sys.exit(1)
 
-    print(f"\n[OK] every row passed")
+    print("\n[OK] every row passed")
 
 
 if __name__ == "__main__":
