@@ -199,6 +199,12 @@ Each run creates `outputs/<YYYYMMDD_HHMMSS>/` containing:
   `filename` column and read from its `question` column — the layout the corpus
   under `audios/` ships in. Recordings with no such file, no matching row, or a
   live microphone get `null` instead; nothing else changes.
+
+  `stt_engine` records which recognizer produced `stt_text`, so the provenance
+  travels with the text rather than with the directory it was written in. A
+  text-mode run passes the incoming value through unchanged rather than
+  claiming it recognized anything, which keeps the chain intact when one
+  frozen ASR pass feeds many configuration cells.
 - `latency_log_<timestamp>.csv`
 - `log_averages_summary.txt`, `log_averages.tsv` and `log_averages.json`: the aggregate of that CSV, written when the run finishes. They are exactly what `aggregate_logs.py` produces over the same log — see [Aggregating a run](#aggregating-a-run) for how to read them, and `--no-summary` to skip them
 
@@ -207,6 +213,9 @@ The CSV contains:
 - `stage`: one of `stt`, `stt_endpoint_delay`, `llm_prompt_eval`, `llm_ttft`, `llm_first_chunk_fill`, `llm_ttfc`, `tts_first_chunk`, `ttfa`, `llm_eval`, `tts_total`, `e2e_response_ready`. A stage a mode cannot measure writes **no row**, never a zero: `--input-mode text` omits `stt`, `stt_endpoint_delay` and `ttfa`, and `--asr-only` writes only the first two of those. Keys inside `extra_json` follow the same rule, so `input_duration_ms` and `stt_rtf` are absent where no audio had a duration
 - `duration_ms`: stage duration in milliseconds
 - `input_mode`, `audio_pacing`, `utterance_trigger`: how the audio reached the pipeline and what released it to the LLM. Which stages carry a value, and what they include, depends on these, so runs that differ in them must not be pooled. `utterance_trigger` records the behaviour that applied, not the setting that was requested.
+- `stt_engine`: **which recognizer produced the text this run answered** — not necessarily one that ran here. Under `--input-mode file`, `mic` and `--asr-only` a recognizer does run and this is it. Under `--input-mode text` none runs, so the value is read from the transcripts file's own `stt_engine` field and `--stt-engine` is ignored (the run says so on stderr when the two differ). That is why the column stays a run-context column rather than becoming a grouping key: the same LLM answering a Vosk transcript and a Whisper transcript is not answering the same question, so those two cells must not pool, exactly as if the recognizer had run in-process.
+
+  A transcripts file naming two recognizers is **refused before any model loads** — one file is one recognizer's output, and stamping every row with a single engine would misdescribe most of them. A file written before this field existed names none, so the run reports an empty `stt_engine`; that is honest, and being a distinct value it still keeps such a run from pooling with one whose provenance is known.
 - `cell_id`, `launch_id`: which configuration cell this is, and which repetition of that cell this process is — set by `--cell-id` and `--launch-id`, and defaulting to the config file's basename and empty. They are a different kind of identity from the three above: two launches of one cell **are** the same experiment, and pooling them is the point of replicating, so these are grouping keys rather than compatibility guards and deliberately sit outside `aggregate_logs.py`'s `RUN_CONTEXT_COLUMNS`. `campaign_report.py` groups on them. Identity that lives only in a directory layout does not survive the concatenated CSV a campaign publishes, which is why it rides on every row
 - `cpu_percent`: average system-wide CPU load over the stage the row belongs to
 - `gpu_util_percent`: average device-wide GPU utilisation over that same stage, sampled throughout it rather than read at its end — see [Utilisation is a span, not an instant](#utilisation-is-a-span-not-an-instant)
