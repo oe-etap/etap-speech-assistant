@@ -20,7 +20,7 @@ of medians only if the stages are perfectly rank-correlated, and they are not:
 a slow endpoint and a slow first token happen to different recordings. Every
 statistic below is taken over per-item reconstructed values that were summed
 first. `tests/test_ttfa_reconstruct.py` pins this with deliberately
-anti-correlated stages where the two routes give 1042 ms and 86 ms.
+anti-correlated stages where the two routes give 1042 ms and 46 ms.
 
 **One ASR run is frozen as canonical.** The text arm ran on one particular
 set of transcripts, so the endpoint delay paired with each item has to come
