@@ -1200,7 +1200,7 @@ recorded at all.
 | **What it measures** | Wall-clock time in the STT worker, from its start to the finalized transcript. Under `fast` pacing that is the net decode cost. Under `realtime` pacing, or on a microphone, it also contains the wait for the audio to arrive, since the worker cannot outrun the speaker. |
 | **Measurement point** | Before → after the transcription loop. |
 | **duration_ms** | STT worker wall-clock time. |
-| **extra_json** | `input_duration_ms` – length of input audio (ms); `stt_rtf` – `stt / input_duration` (a genuine real-time factor only under `fast` pacing; under `realtime` it exceeds 1 because the wait is included); `trailing_silence_ms` – gap between the end of speech and the end of the audio; `speech_end_source` – `metadata` where a `speech_end_ms` column supplied the anchor, `stt_word_timings` where the engine's own timings did. |
+| **extra_json** | `input_duration_ms` – length of input audio (ms); `stt_rtf` – `stt / input_duration` (a genuine real-time factor only under `fast` pacing; under `realtime` it exceeds 1 because the wait is included); `trailing_silence_ms` – gap between the end of speech and the end of the audio; `speech_end_source` – `metadata` where a `speech_end_ms` column supplied the anchor, `stt_word_timings` where the engine's own timings did; `endpoint_fire_count` – utterances the STT finalized, on every row so that a blank never has to be read as one. Above one is the endpointer calling the utterance over before the speaker had finished, which throws an answer away: 1.1% of the archived file-mode items. |
 
 ---
 
@@ -1246,6 +1246,19 @@ Vosk's last-word end runs ~57 ms late and Whisper's last-segment end ~252 ms
 late — and a *later* anchor shortens the engine's own `ttfa`, so comparisons
 across engines carry that bias. Supplying `speech_end_ms` removes it: both
 engines are then measured from the same instant, one neither of them chose.
+
+**Where the endpointer fires twice, this is the answer that survived.** A second
+fire cancels the generation already in flight, and the cancel resets the
+first-chunk instant, so `ttfa` is the wait before the audio the user actually
+heard — not before the first chunk of the answer that was thrown away, a whole
+generation earlier. `stt_endpoint_delay` moves with it, both of them anchored on
+the last fire: on the `metadata` anchor every fire reads the same value, and on
+`stt_word_timings` the anchor moves with each fire and the last one is what the
+row carries. So the decomposition above still closes on these items, at +7 to
++9 ms against +2 to +3 ms on a single fire, the difference being one more trip
+through the cancel path — which sits inside `ttfa` and inside none of the three
+terms. `endpoint_fire_count` on the `stt` row says which items these are.
+Asserted, rather than read off the code, in `tests/test_bargein_accounting.py`.
 
 ---
 
@@ -1367,7 +1380,7 @@ the 0.33.3 upgrade — though `--swa-full` trades VRAM for it, which grows with
 
 | | |
 |---|---|
-| **What it measures** | The sum of the synthesis times of all TTS chunks. Net TTS time, does not include LLM waiting or I/O. |
+| **What it measures** | The sum of the synthesis times of all TTS chunks of the surviving answer. Net TTS time, does not include LLM waiting or I/O. The figure is reset when an answer is superseded, so where `endpoint_fire_count` exceeds one this covers the reply that was spoken and not the one thrown away — the same set of WAVs as `output_duration_ms`. |
 | **Measurement point** | Σ (Before → after TTS call) for every chunk. |
 | **duration_ms** | Total TTS synthesis time. |
 | **extra_json** | – |
@@ -1381,7 +1394,7 @@ the 0.33.3 upgrade — though `--swa-full` trades VRAM for it, which grows with
 | **What it measures** | The wall-clock span of the whole item, from the start of processing to the complete response. One definition in every mode: on file input it therefore includes delivering the audio, and on a microphone it covers the entire session. A span, not a latency — for latency use `ttfa`. |
 | **Measurement point** | `e2e_t0`, set before the workers start → after they have drained and the response WAVs are closed. |
 | **duration_ms** | Whole-item wall-clock time. |
-| **extra_json** | `input_duration_ms` – length of input audio; `output_duration_ms` – total length of the response audio; `output_wav` – path of the first generated WAV; `output_wav_count` – number of response WAVs (a mic session answers more than once); `full_text` – full text response of the LLM; `response_word_count`, `response_char_count` – size of the response; `llm_chunk_count` – number of sentence-level chunks. |
+| **extra_json** | `input_duration_ms` – length of input audio; `output_duration_ms` – length of the surviving response audio, the same set of WAVs `tts_total` covers; `discarded_output_duration_ms` – length of the response audio a later utterance superseded, 0 on an item whose endpointer fired once. The superseded WAVs are not deleted, so the wasted synthesis can be listened to as well as counted: an item that answered twice leaves the superseded reply under the plain `assistant_<n>_<item>.wav` name and the surviving one as `_r2.wav`; `output_wav` – path of the surviving response WAV; `output_wav_count` – response WAVs the item wrote, superseded ones included, so above one identifies a double fire even without the `stt` row; `full_text` – full text response of the LLM; `response_word_count`, `response_char_count` – size of the response; `llm_chunk_count` – number of sentence-level chunks. |
 
 ---
 
