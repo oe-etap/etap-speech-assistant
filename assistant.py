@@ -1006,6 +1006,7 @@ def stt_worker(stt_engine, audio_source, mailbox, stt_metrics,
     `stt` row, since runs anchored differently are not comparable.
     """
     try:
+        stt_metrics["endpoint_fire_count"] = 0
         # Opens this thread's CPU window for the span reported as stt_ms.
         prime_cpu_percent()
         t0 = time.perf_counter()
@@ -1018,6 +1019,14 @@ def stt_worker(stt_engine, audio_source, mailbox, stt_metrics,
             if not result["is_final"]:
                 print(f"[STT Partial] {result['text']}", end="\r")
                 continue
+
+            # A fire past the first is the endpointer calling the utterance
+            # over before the speaker had finished: the answer already in
+            # flight is thrown away and a second one starts. 1.1% of the
+            # archived file-mode items (186 of 16 606), and nothing downstream
+            # can tell afterwards which items they were -- a fire cancelled
+            # before any audio is synthesized does not even leave a WAV.
+            stt_metrics["endpoint_fire_count"] += 1
 
             accumulated_final = (
                 accumulated_final + " " + result["text"]
@@ -1817,7 +1826,10 @@ def main():
             input_duration_ms = audio_source.duration_ms
 
             stt_rtf = round(stt_ms / input_duration_ms, 3) if input_duration_ms > 0 else 0.0
-            stt_extra = {"input_duration_ms": input_duration_ms, "stt_rtf": stt_rtf}
+            stt_extra = {"input_duration_ms": input_duration_ms, "stt_rtf": stt_rtf,
+                         # On every row, not only the interesting ones, so that
+                         # a missing value can never be read as "fired once".
+                         "endpoint_fire_count": stt_metrics.get("endpoint_fire_count", 0)}
 
             # Trailing silence is what an endpointer needs to see before it can
             # call the utterance over. Too little and the engine only finalizes
