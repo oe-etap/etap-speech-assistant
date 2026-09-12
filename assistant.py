@@ -26,7 +26,7 @@ import subprocess
 import time
 import wave
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePath
 from urllib.parse import urlparse
 
 import soundfile as sf
@@ -256,6 +256,20 @@ def reference_speech_end_s(row):
     except (KeyError, TypeError, ValueError):
         return None
 
+
+# One item's worth of work, whatever the input mode supplies it from. A field a
+# mode cannot fill is None, and the metric writing keys off exactly that: an item
+# with no audio_source, for instance, has nothing measured from the speech.
+ItemWork = collections.namedtuple("ItemWork", (
+    "index",             # 1-based position in this run; names the output files
+    "name",              # the CSV's `item` column
+    "filename",          # the recording's name, as the transcript log records it
+    "ori_text",          # what the recording was supposed to say, or None
+    "ref_speech_end_s",  # the anchor for the speech-end metrics, or None
+    "audio_source",      # where this item's audio comes from, or None
+    "normalized_wav",    # the ffmpeg copy to delete afterwards, or None
+    "user_text",         # the utterance, when it arrives already final, or None
+))
 
 def is_mono_16k_pcm(path):
     """Check if a file is already mono 16kHz 16-bit PCM WAV."""
@@ -954,9 +968,12 @@ def write_timing(writer, args, item, stage, duration_ms, stats=None, extra=None)
         "input_mode": args.input_mode,
         "audio_pacing": args.audio_pacing if args.input_mode == "file" else "",
         # The behaviour that applied, not the setting that was asked for: the
-        # setting only takes effect under file input with realtime pacing.
-        "utterance_trigger": (TRIGGER_ENDPOINT if triggers_on_endpoint(args)
-                              else TRIGGER_END_OF_FILE),
+        # setting only takes effect under file input with realtime pacing, and
+        # text input releases nothing -- the utterance is already final when it
+        # arrives, so naming a trigger for it would describe a step never taken.
+        "utterance_trigger": "" if args.input_mode == "text" else (
+            TRIGGER_ENDPOINT if triggers_on_endpoint(args)
+            else TRIGGER_END_OF_FILE),
         "cell_id": args.cell_id,
         "launch_id": args.launch_id,
         "item": item,
@@ -1312,6 +1329,131 @@ def tts_worker(tts_engine, tts_queue, out_wav, tts_metrics, playback=False):
                 pass
 
 
+TRANSCRIPT_SUFFIXES = (".jsonl", ".ndjson", ".yaml", ".yml")
+
+
+def load_transcript_items(path):
+    """Read the utterances a text-mode run answers, in file order.
+
+    Accepts the formats `evaluation/loaders.py` accepts, so one transcripts file
+    drives both a run and the evaluation of it. `stt_text` is the utterance; an
+    `llm_text` already in the file answered some earlier copy of it and is
+    ignored.
+
+    `filename` is the item's identity: a text-mode row is joined to the
+    file-mode row for the same recording on the `item` column, and
+    `evaluation/comparison.py` pairs items on the filename itself. A record
+    carrying neither can be placed by nothing, and a name invented here would
+    break both joins silently and much later, so it fails here instead.
+    """
+    path = Path(path)
+    suffix = path.suffix.lower()
+    if suffix in (".jsonl", ".ndjson"):
+        records = []
+        with open(path, "r", encoding="utf-8") as handle:
+            for line_no, line in enumerate(handle, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"{path}:{line_no}: invalid JSON line: {e}")
+    elif suffix in (".yaml", ".yml"):
+        with open(path, "r", encoding="utf-8") as handle:
+            records = yaml.safe_load(handle)
+    else:
+        raise ValueError(f"{path}: not one of {', '.join(TRANSCRIPT_SUFFIXES)}")
+
+    if not isinstance(records, list) or not records:
+        raise ValueError(f"{path}: holds no transcript records")
+
+    for position, record in enumerate(records, 1):
+        if not isinstance(record, dict):
+            raise ValueError(f"{path}: record {position} is not a mapping")
+        if not str(record.get("filename") or "").strip():
+            raise ValueError(
+                f"{path}: record {position} has no filename, so the item it "
+                f"describes cannot be given the name a run over the recording "
+                f"itself would give it")
+    return records
+
+
+def plan_items(args, run_dir, shutdown_event, transcripts=None):
+    """Yield the items this run processes, one ItemWork each, in run order.
+
+    The input modes differ in where an item comes from and in nothing else,
+    which is why this is the only place that branches on `--input-mode`:
+    everything after it reads an ItemWork and measures whatever that item
+    actually carries. A mic session is one open-ended item; a file-mode item
+    carries the audio to be recognized; a text-mode item carries the utterance
+    already recognized and no audio at all.
+    """
+    if args.input_mode == "text":
+        for index, record in enumerate(transcripts, start=1):
+            print("=" * 60)
+            filename = str(record["filename"]).strip()
+            print(f"[INFO] Processing transcript {index}: {filename}")
+            # filename and ori_text travel with the transcript rather than
+            # being re-read from a metadata.csv beside the audio: the
+            # recordings need not be on this host for a text-mode run, and
+            # going looking for them would put the corpus back into the loop
+            # this mode exists to take it out of. PurePath, so a filename
+            # recorded under another OS still reduces to the stem file mode
+            # would have derived from it.
+            yield ItemWork(
+                index=index, name=PurePath(filename).stem, filename=filename,
+                ori_text=record.get("ori_text"), ref_speech_end_s=None,
+                audio_source=None, normalized_wav=None,
+                user_text=str(record.get("stt_text") or ""))
+        return
+
+    if args.input_mode == "mic":
+        print("=" * 60)
+        item_name = "live_mic"
+        user_wav = os.path.join(run_dir, f"user_input_1_{item_name}.wav")
+        print(f"[INFO] Processing live microphone input (saving to {user_wav})...")
+        # Live speech has nothing describing it in advance: no text it was
+        # supposed to be, and no measured end to anchor on.
+        yield ItemWork(
+            index=1, name=item_name, filename=None, ori_text=None,
+            ref_speech_end_s=None,
+            audio_source=MicAudioSource(save_path=user_wav,
+                                        chunk_ms=args.audio_chunk_ms,
+                                        stop_event=shutdown_event),
+            normalized_wav=None, user_text=None)
+        return
+
+    for index, audio_path in enumerate(args.audio, start=1):
+        print("=" * 60)
+        audio_file = Path(audio_path)
+        if not audio_file.exists():
+            raise FileNotFoundError(audio_path)
+
+        metadata = metadata_for(audio_path)
+        print(f"[INFO] Processing audio file: {audio_file} "
+              f"(pacing: {args.audio_pacing})")
+
+        user_wav = os.path.join(run_dir, f"user_input_{index}_{audio_file.name}")
+        try:
+            if os.path.abspath(audio_path) != os.path.abspath(user_wav):
+                shutil.copyfile(audio_path, user_wav)
+        except Exception as e:
+            print(f"[WARN] Copy failed: {e}")
+
+        wav_path = ensure_wav_mono_16k(audio_path, out_dir=run_dir,
+                                       prefix=f"input_{index}")
+        yield ItemWork(
+            index=index, name=audio_file.stem, filename=audio_file.name,
+            ori_text=ground_truth_text(metadata),
+            ref_speech_end_s=reference_speech_end_s(metadata),
+            audio_source=FileAudioSource(wav_path,
+                                         pacing=args.audio_pacing,
+                                         chunk_ms=args.audio_chunk_ms,
+                                         stop_event=shutdown_event),
+            normalized_wav=wav_path, user_text=None)
+
+
 def report_llm_placement(llm_engine, model_name):
     """Print where Ollama put the model, and warn when it is not all on the GPU.
 
@@ -1364,7 +1506,11 @@ def main():
                              "folder. The CSV is written either way, and aggregate_logs.py "
                              "produces the same report from it afterwards.")
     parser.add_argument("--keep-normalized", action="store_true", help="Keep ffmpeg-normalized input WAVs")
-    parser.add_argument("--input-mode", choices=["file", "mic"], default="file", help="Input mode: file or live mic")
+    parser.add_argument("--input-mode", choices=["file", "mic", "text"], default="file",
+                        help="Where utterances come from: audio files, live mic, or a transcripts file")
+    parser.add_argument("--transcripts", type=str, default=None,
+                        help="Transcripts file (.jsonl/.ndjson/.yaml) supplying the utterances "
+                             "when --input-mode is 'text'")
     parser.add_argument("--audio-pacing", choices=[PACING_REALTIME, PACING_FAST], default=PACING_REALTIME,
                         help="How input files are fed to the STT engine. 'realtime' simulates a "
                              "microphone at 1x speed so STT overlaps with speech (representative "
@@ -1382,6 +1528,9 @@ def main():
     parser.add_argument("--audio-chunk-ms", type=int, default=DEFAULT_CHUNK_MS,
                         help="Audio chunk length in milliseconds fed to the STT engine")
     parser.add_argument("--playback", action="store_true", help="Play TTS output on speakers")
+    parser.add_argument("--asr-only", action="store_true",
+                        help="Stop after the recognizer: write transcripts and "
+                             "stt_endpoint_delay, and load no LLM or TTS")
     parser.add_argument("--idle-timeout", type=float, default=10.0, help="Seconds of silence before exiting mic mode")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1501,8 +1650,20 @@ def main():
     if args.launch_id is None:
         args.launch_id = ""
 
+    transcript_records = None
     if args.input_mode == "mic":
         args.audio = ["mic"]
+    elif args.input_mode == "text":
+        if not args.transcripts:
+            parser.error("--transcripts is required when --input-mode is 'text' "
+                         "(either in CLI or config)")
+        # Read before a single model is loaded: a transcripts file that cannot
+        # name its items is a setup mistake, and finding that out only after a
+        # model load has been paid for throws the load away.
+        try:
+            transcript_records = load_transcript_items(args.transcripts)
+        except (OSError, ValueError) as e:
+            parser.error(f"--transcripts could not be loaded: {e}")
     else:
         if not args.audio:
             parser.error("--audio is required when --input-mode is 'file' (either in CLI or config)")
@@ -1544,6 +1705,16 @@ def main():
         args.piper_device = "cuda" if args.mode == "gpu" else "cpu"
     if args.coqui_device is None:
         args.coqui_device = "cuda" if args.mode == "gpu" else "cpu"
+    if args.asr_only:
+        if args.input_mode == "text":
+            parser.error("--asr-only has nothing to recognize under --input-mode "
+                         "text: the utterances are already transcribed")
+        if args.playback:
+            # There is no response to play. Failing beats ignoring the flag,
+            # which would look like a broken audio device.
+            parser.error("--asr-only synthesizes nothing, so --playback has "
+                         "nothing to play")
+
     if args.piper_num_threads is not None and args.piper_num_threads < 1:
         # 0 is ONNX Runtime's own "pick for me", which is the pinned default
         # this setting exists to get away from. Leaving it unset says that.
@@ -1555,10 +1726,17 @@ def main():
 
     # Pre-load (warmup) models so their initialization time isn't counted
     # in the latency of the first file
-    print("[INFO] Pre-loading AI models (STT, LLM, TTS)...")
+    print("[INFO] Pre-loading AI models (STT)..." if args.asr_only
+          else "[INFO] Pre-loading AI models (STT, LLM, TTS)...")
 
-    # Initialize STT engine
-    if args.stt_engine == "vosk":
+    # Initialize STT engine. Text input has already been recognized, so loading
+    # a recognizer to sit idle beside it would cost every launch a model load
+    # and hold RAM that rss_mb then reports against the stages that do run --
+    # the whole point of the mode being that repeating a cell is cheap.
+    stt_engine = None
+    if args.input_mode == "text":
+        print("[INFO] Text input: no recognizer is loaded.")
+    elif args.stt_engine == "vosk":
         stt_engine = VoskEngine(args.vosk_model, args.vosk_endpoint_silence_ms)
     elif args.stt_engine == "whisper":
         stt_engine = WhisperEngine(
@@ -1567,53 +1745,64 @@ def main():
             compute_type=args.whisper_compute_type,
         )
 
-    # Initialize LLM engine
-    print(f"[INFO] System prompt: {prompt_label}")
-    llm_engine = OllamaEngine(
-        model=args.ollama_model,
-        url=args.ollama_url,
-        system_prompt=system_prompt,
-        max_tokens=args.llm_max_tokens,
-        temperature=args.llm_temperature,
-        seed=args.llm_seed,
-        chunk_max_chars=args.tts_chunk_max_chars,
-        # 0 and "" are how a command line asks for "leave the server alone",
-        # there being no way to pass a null through argparse.
-        num_ctx=args.llm_num_ctx or None,
-        keep_alive=args.llm_keep_alive or None,
-        num_gpu=args.llm_num_gpu,
-        num_batch=args.llm_num_batch,
-        num_thread=args.llm_num_thread,
-    )
-    if not llm_engine.warmup():
-        # A warm-up that did not leave the model resident is paid in full inside
-        # the first utterance -- 28 to 43 s on the 27B and 32B models, all of it
-        # in that item's ttfa. It happened in 11 of the 108 runs in outputs/sub1,
-        # every one of them a model above 15 GB, and the only trace was a blank
-        # llm_model_vram_mb column. One retry costs a load; not retrying costs a
-        # measurement.
-        print("[WARN] The LLM is not resident after warmup; retrying once.")
-        llm_engine.warmup()
-    placement = report_llm_placement(llm_engine, args.ollama_model)
-    start_llm_memory_monitor(args.ollama_url, placement)
+    # Initialize LLM engine. Not at all under --asr-only: the pass exists to
+    # measure the recognizer, and a resident Ollama model holds VRAM for the
+    # length of it while answering nothing, since every answer is regenerated
+    # from the frozen transcripts afterwards anyway. Skipping generation alone
+    # would leave the load paid for.
+    llm_engine = None
+    tts_engine = None
+    if args.asr_only:
+        print("[INFO] ASR only: no LLM and no TTS are loaded.")
+    else:
+        print(f"[INFO] System prompt: {prompt_label}")
+        llm_engine = OllamaEngine(
+            model=args.ollama_model,
+            url=args.ollama_url,
+            system_prompt=system_prompt,
+            max_tokens=args.llm_max_tokens,
+            temperature=args.llm_temperature,
+            seed=args.llm_seed,
+            chunk_max_chars=args.tts_chunk_max_chars,
+            # 0 and "" are how a command line asks for "leave the server alone",
+            # there being no way to pass a null through argparse.
+            num_ctx=args.llm_num_ctx or None,
+            keep_alive=args.llm_keep_alive or None,
+            num_gpu=args.llm_num_gpu,
+            num_batch=args.llm_num_batch,
+            num_thread=args.llm_num_thread,
+        )
+        if not llm_engine.warmup():
+            # A warm-up that did not leave the model resident is paid in full
+            # inside the first utterance -- 28 to 43 s on the 27B and 32B models,
+            # all of it in that item's ttfa. It happened in 11 of the 108 runs in
+            # outputs/sub1, every one of them a model above 15 GB, and the only
+            # trace was a blank llm_model_vram_mb column. One retry costs a load;
+            # not retrying costs a measurement.
+            print("[WARN] The LLM is not resident after warmup; retrying once.")
+            llm_engine.warmup()
+        placement = report_llm_placement(llm_engine, args.ollama_model)
+        start_llm_memory_monitor(args.ollama_url, placement)
 
-    # Initialize TTS engine
-    if args.tts_engine == "piper":
-        tts_engine = PiperEngine(
-            voice_path=args.piper_voice,
-            exe_path=args.piper_exe,
-            use_exe=args.piper_use_exe,
-            device=args.piper_device,
-            num_threads=args.piper_num_threads,
-        )
-    elif args.tts_engine == "coqui":
-        tts_engine = CoquiEngine(
-            model_name=args.coqui_voice,
-            language=args.coqui_language,
-            speaker=args.coqui_speaker,
-            device=args.coqui_device,
-        )
-    tts_engine.warmup()
+        # Initialize TTS engine. A loaded Piper holds its ONNX Runtime thread
+        # pool whether or not it is asked to speak, which is the other half of
+        # why --asr-only stops short of here.
+        if args.tts_engine == "piper":
+            tts_engine = PiperEngine(
+                voice_path=args.piper_voice,
+                exe_path=args.piper_exe,
+                use_exe=args.piper_use_exe,
+                device=args.piper_device,
+                num_threads=args.piper_num_threads,
+            )
+        elif args.tts_engine == "coqui":
+            tts_engine = CoquiEngine(
+                model_name=args.coqui_voice,
+                language=args.coqui_language,
+                speaker=args.coqui_speaker,
+                device=args.coqui_device,
+            )
+        tts_engine.warmup()
 
     run_dir = os.path.join(args.out_dir, timestamp)
     os.makedirs(run_dir, exist_ok=True)
@@ -1671,6 +1860,12 @@ def main():
 
     trigger_on_endpoint = triggers_on_endpoint(args)
 
+    # Whether an answer is produced at all. Under --asr-only the stages below the
+    # recognizer have nothing to report, so they write no row -- e2e_response_ready
+    # included: with neither an LLM nor a TTS underneath it, it would time the
+    # recognizer a second time under a name that says it timed the whole chain.
+    responds = not args.asr_only
+
     # Signals the microphone source to stop capturing
     shutdown_event = threading.Event()
 
@@ -1698,50 +1893,9 @@ def main():
         if not csv_exists:
             writer.writeheader()
 
-        for item_index, audio_path in enumerate(args.audio, start=1):
-            print("=" * 60)
-            
-            wav_path = None
-            if args.input_mode == "mic":
-                item_name = "live_mic"
-                # Live speech has nothing describing it in advance: no text it
-                # was supposed to be, and no measured end to anchor on.
-                item_filename, ori_text, ref_speech_end_s = None, None, None
-                user_wav = os.path.join(run_dir, f"user_input_{item_index}_{item_name}.wav")
-                audio_source = MicAudioSource(
-                    save_path=user_wav,
-                    chunk_ms=args.audio_chunk_ms,
-                    stop_event=shutdown_event,
-                )
-                print(f"[INFO] Processing live microphone input (saving to {user_wav})...")
-            else:
-                audio_file = Path(audio_path)
-                if not audio_file.exists():
-                    raise FileNotFoundError(audio_path)
-
-                item_name = audio_file.stem
-                item_filename = audio_file.name
-                metadata = metadata_for(audio_path)
-                ori_text = ground_truth_text(metadata)
-                ref_speech_end_s = reference_speech_end_s(metadata)
-                print(f"[INFO] Processing audio file: {audio_file} (pacing: {args.audio_pacing})")
-
-                user_wav = os.path.join(run_dir, f"user_input_{item_index}_{audio_file.name}")
-                try:
-                    if os.path.abspath(audio_path) != os.path.abspath(user_wav):
-                        shutil.copyfile(audio_path, user_wav)
-                except Exception as e:
-                    print(f"[WARN] Copy failed: {e}")
-
-                wav_path = ensure_wav_mono_16k(audio_path, out_dir=run_dir, prefix=f"input_{item_index}")
-                audio_source = FileAudioSource(
-                    wav_path,
-                    pacing=args.audio_pacing,
-                    chunk_ms=args.audio_chunk_ms,
-                    stop_event=shutdown_event,
-                )
-
-            out_wav = os.path.join(run_dir, f"assistant_{item_index}_{item_name}.wav")
+        for item in plan_items(args, run_dir, shutdown_event, transcript_records):
+            item_name = item.name
+            out_wav = os.path.join(run_dir, f"assistant_{item.index}_{item_name}.wav")
 
             # Shared metrics dicts (single-writer per dict = thread-safe).
             # The *_stats entries hold the snapshot taken at that milestone.
@@ -1767,41 +1921,54 @@ def main():
             # Setting up a recognizer is not recognition: doing it here keeps
             # its cost out of both windows opened below, the way the model load
             # is kept out by pre-loading before the loop.
-            stt_engine.warmup()
+            if stt_engine is not None:
+                stt_engine.warmup()
 
             # Opens the main thread's window, which spans the whole item.
             prime_cpu_percent()
 
             e2e_t0 = time.perf_counter()
 
-            # Start worker threads
-            stt_t = threading.Thread(
-                target=stt_worker,
-                args=(stt_engine, audio_source, mailbox, stt_metrics,
-                      trigger_on_endpoint, ref_speech_end_s),
-                daemon=True,
-            )
-            llm_t = threading.Thread(
-                target=llm_worker,
-                args=(llm_engine, mailbox, tts_queue, llm_metrics),
-                daemon=True,
-            )
-            tts_t = threading.Thread(
-                target=tts_worker,
-                args=(tts_engine, tts_queue, out_wav, tts_metrics, args.playback),
-                daemon=True,
-            )
+            # Start worker threads -- one per stage this item actually has. An
+            # utterance that arrives already final has no recognizer to run, and
+            # the mailbox a recognizer would have filled is filled below.
+            workers = []
+            if item.audio_source is not None:
+                workers.append(threading.Thread(
+                    target=stt_worker,
+                    args=(stt_engine, item.audio_source, mailbox, stt_metrics,
+                          trigger_on_endpoint, item.ref_speech_end_s),
+                    daemon=True,
+                ))
+            if responds:
+                workers.append(threading.Thread(
+                    target=llm_worker,
+                    args=(llm_engine, mailbox, tts_queue, llm_metrics),
+                    daemon=True,
+                ))
+                workers.append(threading.Thread(
+                    target=tts_worker,
+                    args=(tts_engine, tts_queue, out_wav, tts_metrics, args.playback),
+                    daemon=True,
+                ))
 
-            stt_t.start()
-            llm_t.start()
-            tts_t.start()
+            for worker in workers:
+                worker.start()
+
+            # Handed over after e2e_t0, which is what makes e2e_response_ready
+            # measure from the request in text mode instead of from the start of
+            # a speech there is none of. An empty utterance is not handed over at
+            # all, the way a recognizer hands over no silence.
+            if item.user_text is not None:
+                if item.user_text:
+                    mailbox.put(item.user_text)
+                mailbox.close()
 
             # Wait for completion or interrupt
             try:
-                if args.input_mode == "file":
-                    stt_t.join()
-                    llm_t.join()
-                    tts_t.join()
+                if args.input_mode != "mic":
+                    for worker in workers:
+                        worker.join()
                 else:
                     last_action_t = time.perf_counter()
                     while True:
@@ -1827,7 +1994,7 @@ def main():
 
             # Let the workers drain before their metrics are read, otherwise the
             # response WAV may still be open while its duration is measured.
-            for worker in (stt_t, llm_t, tts_t):
+            for worker in workers:
                 worker.join(timeout=WORKER_SHUTDOWN_TIMEOUT_S)
                 if worker.is_alive():
                     print(f"[WARN] {worker.name} did not stop within "
@@ -1837,51 +2004,65 @@ def main():
             # Covers the item as a whole rather than a single stage.
             e2e_stats = collect_resource_snapshot()
 
-            user_text = stt_metrics.get("user_text") or ""
-            stt_ms = stt_metrics.get("stt_ms") or 0
+            user_text = (item.user_text if item.user_text is not None
+                         else stt_metrics.get("user_text") or "")
             # Read after the workers finish: a mic source only knows how much
-            # audio it captured once capturing has stopped.
-            input_duration_ms = audio_source.duration_ms
+            # audio it captured once capturing has stopped. None rather than 0
+            # when there was no audio to read it from, and every extra_json key
+            # fed by it is then left out: aggregate_logs.py averages the
+            # EXTRA_LABELS keys across items exactly as it averages rows, and
+            # can no more tell a zero from a measurement there.
+            input_duration_ms = (item.audio_source.duration_ms
+                                 if item.audio_source is not None else None)
 
-            stt_rtf = round(stt_ms / input_duration_ms, 3) if input_duration_ms > 0 else 0.0
-            stt_extra = {"input_duration_ms": input_duration_ms, "stt_rtf": stt_rtf,
-                         # On every row, not only the interesting ones, so that
-                         # a missing value can never be read as "fired once".
-                         "endpoint_fire_count": stt_metrics.get("endpoint_fire_count", 0)}
+            # Only a recognizer produces these. Without one in the loop there is
+            # no stt row at all rather than a row of zeroes, and the two stages
+            # anchored on the end of speech further down drop out the same way,
+            # their instants having never been observed.
+            stt_ms = stt_metrics.get("stt_ms")
+            if stt_ms is not None:
+                stt_rtf = round(stt_ms / input_duration_ms, 3) if input_duration_ms > 0 else 0.0
+                stt_extra = {"input_duration_ms": input_duration_ms, "stt_rtf": stt_rtf,
+                             # On every row, not only the interesting ones, so that
+                             # a missing value can never be read as "fired once".
+                             "endpoint_fire_count": stt_metrics.get("endpoint_fire_count", 0)}
 
-            # Trailing silence is what an endpointer needs to see before it can
-            # call the utterance over. Too little and the engine only finalizes
-            # because the file ran out, a signal a live microphone never gets.
-            speech_end_s = stt_metrics.get("speech_end_s")
-            # Which reading of the end of speech everything anchored on. Runs
-            # that differ here are measuring from different instants, so the
-            # figures must not be pooled across them.
-            if stt_metrics.get("speech_end_source"):
-                stt_extra["speech_end_source"] = stt_metrics["speech_end_source"]
-            if speech_end_s is not None and input_duration_ms > 0:
-                trailing_silence_ms = input_duration_ms - int(speech_end_s * 1000)
-                stt_extra["trailing_silence_ms"] = trailing_silence_ms
-                needed_ms = min_trailing_silence_ms(args)
-                if (args.input_mode == "file"
-                        and args.audio_pacing == PACING_REALTIME
-                        and args.stt_engine == "vosk"   # the only engine that endpoints
-                        and trailing_silence_ms < needed_ms):
-                    print(f"[WARN] Only {trailing_silence_ms} ms of silence after the last "
-                          f"word; {needed_ms} ms or more is needed for the endpointer to "
-                          f"fire at --vosk-endpoint-silence-ms "
-                          f"{format_schedule(args.vosk_endpoint_silence_ms)}. This run "
-                          f"measures the end-of-file path, which live microphone input "
-                          f"never takes, so its TTFA is optimistic.")
+                # Trailing silence is what an endpointer needs to see before it can
+                # call the utterance over. Too little and the engine only finalizes
+                # because the file ran out, a signal a live microphone never gets.
+                speech_end_s = stt_metrics.get("speech_end_s")
+                # Which reading of the end of speech everything anchored on. Runs
+                # that differ here are measuring from different instants, so the
+                # figures must not be pooled across them.
+                if stt_metrics.get("speech_end_source"):
+                    stt_extra["speech_end_source"] = stt_metrics["speech_end_source"]
+                if speech_end_s is not None and input_duration_ms > 0:
+                    trailing_silence_ms = input_duration_ms - int(speech_end_s * 1000)
+                    stt_extra["trailing_silence_ms"] = trailing_silence_ms
+                    needed_ms = min_trailing_silence_ms(args)
+                    if (args.input_mode == "file"
+                            and args.audio_pacing == PACING_REALTIME
+                            and args.stt_engine == "vosk"   # the only engine that endpoints
+                            and trailing_silence_ms < needed_ms):
+                        print(f"[WARN] Only {trailing_silence_ms} ms of silence after the last "
+                              f"word; {needed_ms} ms or more is needed for the endpointer to "
+                              f"fire at --vosk-endpoint-silence-ms "
+                              f"{format_schedule(args.vosk_endpoint_silence_ms)}. This run "
+                              f"measures the end-of-file path, which live microphone input "
+                              f"never takes, so its TTFA is optimistic.")
 
-            write_timing(writer, args, item_name, "stt", stt_ms,
-                         stt_metrics.get("stats"), stt_extra)
+                write_timing(writer, args, item_name, "stt", stt_ms,
+                             stt_metrics.get("stats"), stt_extra)
 
             if not user_text:
                 print("[Warn] No text recognized. Skipping to next file.")
-                write_timing(writer, args, item_name, "e2e_response_ready",
-                             int((time.perf_counter() - e2e_t0) * 1000),
-                             e2e_stats,
-                             {"input_duration_ms": input_duration_ms, "skipped": True})
+                if responds:
+                    skipped_extra = {"skipped": True}
+                    if input_duration_ms is not None:
+                        skipped_extra["input_duration_ms"] = input_duration_ms
+                    write_timing(writer, args, item_name, "e2e_response_ready",
+                                 int((time.perf_counter() - e2e_t0) * 1000),
+                                 e2e_stats, skipped_extra)
                 fcsv.flush()
                 continue
 
@@ -1967,11 +2148,12 @@ def main():
                               "tokens_per_sec": tokens_per_sec,
                               "total_duration_ms": int(ollama_stats.get("total_duration_ns", 0) / 1e6)})
 
-            # Log total TTS time. A response that synthesized nothing left this
-            # worker's CPU window unopened, so its snapshot would read 0.0.
-            write_timing(writer, args, item_name, "tts_total",
-                         int(tts_metrics["total_tts_time"] * 1000),
-                         tts_metrics.get("end_stats") if tts_metrics["total_tts_time"] > 0 else None)
+            if responds:
+                # Log total TTS time. A response that synthesized nothing left this
+                # worker's CPU window unopened, so its snapshot would read 0.0.
+                write_timing(writer, args, item_name, "tts_total",
+                             int(tts_metrics["total_tts_time"] * 1000),
+                             tts_metrics.get("end_stats") if tts_metrics["total_tts_time"] > 0 else None)
 
             # Output audio duration and E2E summary. An answer a later
             # utterance superseded is left on disk but reported apart from the
@@ -1986,30 +2168,36 @@ def main():
             discarded_output_duration_ms = sum(wav_duration_ms(p) for p in discarded_wavs)
             full_reply = llm_metrics["full_assistant_text"].strip()
 
-            write_timing(writer, args, item_name, "e2e_response_ready",
-                         int((time.perf_counter() - e2e_t0) * 1000),
-                         e2e_stats,
-                         {"input_duration_ms": input_duration_ms,
-                          "output_duration_ms": output_duration_ms,
-                          "discarded_output_duration_ms": discarded_output_duration_ms,
-                          "output_wav": response_wavs[0] if response_wavs else "",
-                          "output_wav_count": len(response_wavs) + len(discarded_wavs),
-                          "full_text": full_reply,
-                          "response_word_count": len(full_reply.split()) if full_reply else 0,
-                          "response_char_count": len(full_reply),
-                          "llm_chunk_count": llm_metrics["llm_chunk_count"]})
-            print(f"[TTS] Stream finished. Saved to {', '.join(response_wavs) or '(no audio)'}.")
-            if discarded_wavs:
-                print(f"[TTS] {discarded_output_duration_ms} ms of superseded audio "
-                      f"kept for inspection: {', '.join(discarded_wavs)}")
+            e2e_extra = {"output_duration_ms": output_duration_ms,
+                         "discarded_output_duration_ms": discarded_output_duration_ms,
+                         "output_wav": response_wavs[0] if response_wavs else "",
+                         "output_wav_count": len(response_wavs) + len(discarded_wavs),
+                         "full_text": full_reply,
+                         "response_word_count": len(full_reply.split()) if full_reply else 0,
+                         "response_char_count": len(full_reply),
+                         "llm_chunk_count": llm_metrics["llm_chunk_count"]}
+            # Only when an input had a duration to report. Text mode answers an
+            # utterance that arrived as text, and a 0 here would be averaged in
+            # as though the recording it came from had been empty.
+            if input_duration_ms is not None:
+                e2e_extra["input_duration_ms"] = input_duration_ms
+
+            if responds:
+                write_timing(writer, args, item_name, "e2e_response_ready",
+                             int((time.perf_counter() - e2e_t0) * 1000),
+                             e2e_stats, e2e_extra)
+                print(f"[TTS] Stream finished. Saved to {', '.join(response_wavs) or '(no audio)'}.")
+                if discarded_wavs:
+                    print(f"[TTS] {discarded_output_duration_ms} ms of superseded audio "
+                          f"kept for inspection: {', '.join(discarded_wavs)}")
 
             # Flush CSV after each item to prevent data loss
             fcsv.flush()
 
             # --- Transcript Logging ---
             transcript_record = {
-                "filename": item_filename,
-                "ori_text": ori_text,
+                "filename": item.filename,
+                "ori_text": item.ori_text,
                 "stt_text": user_text,
                 "llm_text": full_reply,
             }
@@ -2024,9 +2212,9 @@ def main():
             with open(yaml_path, "a", encoding="utf-8") as f_yaml:
                 yaml.dump([transcript_record], f_yaml, sort_keys=False, allow_unicode=True)
 
-            if args.input_mode == "file" and not args.keep_normalized:
+            if item.normalized_wav and not args.keep_normalized:
                 try:
-                    os.remove(wav_path)
+                    os.remove(item.normalized_wav)
                 except Exception:
                     pass
 
