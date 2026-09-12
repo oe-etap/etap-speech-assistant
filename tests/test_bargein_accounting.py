@@ -385,7 +385,7 @@ class BargeInAccountingTest(unittest.TestCase):
     def ttfa_candidates(self, run):
         """The two instants ttfa could plausibly have recorded, in ms from the
         anchor the pipeline itself converted."""
-        rows, tts, sources = run
+        _, tts, sources = run
         self.assert_double_fire_happened(tts)
         source = next(s for s in sources if "01_double" in s.path)
         _, anchor = source.anchors[-1]

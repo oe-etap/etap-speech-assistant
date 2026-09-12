@@ -78,9 +78,14 @@ def observe_llm_worker_sequence():
     mailbox.put("what did he")
     time.sleep(BARGE_IN_AFTER_S)
     mailbox.put("what did he inherit")
-    worker.join(timeout=30)
+    # Closed while the second utterance is still unread, which is what the STT
+    # worker does at the end of a file. take() hands over a pending utterance
+    # before it reports the close, so the barge-in still happens; waiting for
+    # the worker first would only wait for a take() that cannot return.
     mailbox.close()
     worker.join(timeout=30)
+    if worker.is_alive():
+        raise SystemExit("llm_worker did not finish; nothing below can be read")
     return recorded.log
 
 
