@@ -1528,6 +1528,9 @@ def main():
     parser.add_argument("--audio-chunk-ms", type=int, default=DEFAULT_CHUNK_MS,
                         help="Audio chunk length in milliseconds fed to the STT engine")
     parser.add_argument("--playback", action="store_true", help="Play TTS output on speakers")
+    parser.add_argument("--asr-only", action="store_true",
+                        help="Stop after the recognizer: write transcripts and "
+                             "stt_endpoint_delay, and load no LLM or TTS")
     parser.add_argument("--idle-timeout", type=float, default=10.0, help="Seconds of silence before exiting mic mode")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1702,6 +1705,16 @@ def main():
         args.piper_device = "cuda" if args.mode == "gpu" else "cpu"
     if args.coqui_device is None:
         args.coqui_device = "cuda" if args.mode == "gpu" else "cpu"
+    if args.asr_only:
+        if args.input_mode == "text":
+            parser.error("--asr-only has nothing to recognize under --input-mode "
+                         "text: the utterances are already transcribed")
+        if args.playback:
+            # There is no response to play. Failing beats ignoring the flag,
+            # which would look like a broken audio device.
+            parser.error("--asr-only synthesizes nothing, so --playback has "
+                         "nothing to play")
+
     if args.piper_num_threads is not None and args.piper_num_threads < 1:
         # 0 is ONNX Runtime's own "pick for me", which is the pinned default
         # this setting exists to get away from. Leaving it unset says that.
@@ -1713,7 +1726,8 @@ def main():
 
     # Pre-load (warmup) models so their initialization time isn't counted
     # in the latency of the first file
-    print("[INFO] Pre-loading AI models (STT, LLM, TTS)...")
+    print("[INFO] Pre-loading AI models (STT)..." if args.asr_only
+          else "[INFO] Pre-loading AI models (STT, LLM, TTS)...")
 
     # Initialize STT engine. Text input has already been recognized, so loading
     # a recognizer to sit idle beside it would cost every launch a model load
@@ -1731,53 +1745,64 @@ def main():
             compute_type=args.whisper_compute_type,
         )
 
-    # Initialize LLM engine
-    print(f"[INFO] System prompt: {prompt_label}")
-    llm_engine = OllamaEngine(
-        model=args.ollama_model,
-        url=args.ollama_url,
-        system_prompt=system_prompt,
-        max_tokens=args.llm_max_tokens,
-        temperature=args.llm_temperature,
-        seed=args.llm_seed,
-        chunk_max_chars=args.tts_chunk_max_chars,
-        # 0 and "" are how a command line asks for "leave the server alone",
-        # there being no way to pass a null through argparse.
-        num_ctx=args.llm_num_ctx or None,
-        keep_alive=args.llm_keep_alive or None,
-        num_gpu=args.llm_num_gpu,
-        num_batch=args.llm_num_batch,
-        num_thread=args.llm_num_thread,
-    )
-    if not llm_engine.warmup():
-        # A warm-up that did not leave the model resident is paid in full inside
-        # the first utterance -- 28 to 43 s on the 27B and 32B models, all of it
-        # in that item's ttfa. It happened in 11 of the 108 runs in outputs/sub1,
-        # every one of them a model above 15 GB, and the only trace was a blank
-        # llm_model_vram_mb column. One retry costs a load; not retrying costs a
-        # measurement.
-        print("[WARN] The LLM is not resident after warmup; retrying once.")
-        llm_engine.warmup()
-    placement = report_llm_placement(llm_engine, args.ollama_model)
-    start_llm_memory_monitor(args.ollama_url, placement)
+    # Initialize LLM engine. Not at all under --asr-only: the pass exists to
+    # measure the recognizer, and a resident Ollama model holds VRAM for the
+    # length of it while answering nothing, since every answer is regenerated
+    # from the frozen transcripts afterwards anyway. Skipping generation alone
+    # would leave the load paid for.
+    llm_engine = None
+    tts_engine = None
+    if args.asr_only:
+        print("[INFO] ASR only: no LLM and no TTS are loaded.")
+    else:
+        print(f"[INFO] System prompt: {prompt_label}")
+        llm_engine = OllamaEngine(
+            model=args.ollama_model,
+            url=args.ollama_url,
+            system_prompt=system_prompt,
+            max_tokens=args.llm_max_tokens,
+            temperature=args.llm_temperature,
+            seed=args.llm_seed,
+            chunk_max_chars=args.tts_chunk_max_chars,
+            # 0 and "" are how a command line asks for "leave the server alone",
+            # there being no way to pass a null through argparse.
+            num_ctx=args.llm_num_ctx or None,
+            keep_alive=args.llm_keep_alive or None,
+            num_gpu=args.llm_num_gpu,
+            num_batch=args.llm_num_batch,
+            num_thread=args.llm_num_thread,
+        )
+        if not llm_engine.warmup():
+            # A warm-up that did not leave the model resident is paid in full
+            # inside the first utterance -- 28 to 43 s on the 27B and 32B models,
+            # all of it in that item's ttfa. It happened in 11 of the 108 runs in
+            # outputs/sub1, every one of them a model above 15 GB, and the only
+            # trace was a blank llm_model_vram_mb column. One retry costs a load;
+            # not retrying costs a measurement.
+            print("[WARN] The LLM is not resident after warmup; retrying once.")
+            llm_engine.warmup()
+        placement = report_llm_placement(llm_engine, args.ollama_model)
+        start_llm_memory_monitor(args.ollama_url, placement)
 
-    # Initialize TTS engine
-    if args.tts_engine == "piper":
-        tts_engine = PiperEngine(
-            voice_path=args.piper_voice,
-            exe_path=args.piper_exe,
-            use_exe=args.piper_use_exe,
-            device=args.piper_device,
-            num_threads=args.piper_num_threads,
-        )
-    elif args.tts_engine == "coqui":
-        tts_engine = CoquiEngine(
-            model_name=args.coqui_voice,
-            language=args.coqui_language,
-            speaker=args.coqui_speaker,
-            device=args.coqui_device,
-        )
-    tts_engine.warmup()
+        # Initialize TTS engine. A loaded Piper holds its ONNX Runtime thread
+        # pool whether or not it is asked to speak, which is the other half of
+        # why --asr-only stops short of here.
+        if args.tts_engine == "piper":
+            tts_engine = PiperEngine(
+                voice_path=args.piper_voice,
+                exe_path=args.piper_exe,
+                use_exe=args.piper_use_exe,
+                device=args.piper_device,
+                num_threads=args.piper_num_threads,
+            )
+        elif args.tts_engine == "coqui":
+            tts_engine = CoquiEngine(
+                model_name=args.coqui_voice,
+                language=args.coqui_language,
+                speaker=args.coqui_speaker,
+                device=args.coqui_device,
+            )
+        tts_engine.warmup()
 
     run_dir = os.path.join(args.out_dir, timestamp)
     os.makedirs(run_dir, exist_ok=True)
@@ -1834,6 +1859,12 @@ def main():
     ]
 
     trigger_on_endpoint = triggers_on_endpoint(args)
+
+    # Whether an answer is produced at all. Under --asr-only the stages below the
+    # recognizer have nothing to report, so they write no row -- e2e_response_ready
+    # included: with neither an LLM nor a TTS underneath it, it would time the
+    # recognizer a second time under a name that says it timed the whole chain.
+    responds = not args.asr_only
 
     # Signals the microphone source to stop capturing
     shutdown_event = threading.Event()
@@ -1909,16 +1940,17 @@ def main():
                           trigger_on_endpoint, item.ref_speech_end_s),
                     daemon=True,
                 ))
-            workers.append(threading.Thread(
-                target=llm_worker,
-                args=(llm_engine, mailbox, tts_queue, llm_metrics),
-                daemon=True,
-            ))
-            workers.append(threading.Thread(
-                target=tts_worker,
-                args=(tts_engine, tts_queue, out_wav, tts_metrics, args.playback),
-                daemon=True,
-            ))
+            if responds:
+                workers.append(threading.Thread(
+                    target=llm_worker,
+                    args=(llm_engine, mailbox, tts_queue, llm_metrics),
+                    daemon=True,
+                ))
+                workers.append(threading.Thread(
+                    target=tts_worker,
+                    args=(tts_engine, tts_queue, out_wav, tts_metrics, args.playback),
+                    daemon=True,
+                ))
 
             for worker in workers:
                 worker.start()
@@ -2024,12 +2056,13 @@ def main():
 
             if not user_text:
                 print("[Warn] No text recognized. Skipping to next file.")
-                skipped_extra = {"skipped": True}
-                if input_duration_ms is not None:
-                    skipped_extra["input_duration_ms"] = input_duration_ms
-                write_timing(writer, args, item_name, "e2e_response_ready",
-                             int((time.perf_counter() - e2e_t0) * 1000),
-                             e2e_stats, skipped_extra)
+                if responds:
+                    skipped_extra = {"skipped": True}
+                    if input_duration_ms is not None:
+                        skipped_extra["input_duration_ms"] = input_duration_ms
+                    write_timing(writer, args, item_name, "e2e_response_ready",
+                                 int((time.perf_counter() - e2e_t0) * 1000),
+                                 e2e_stats, skipped_extra)
                 fcsv.flush()
                 continue
 
@@ -2115,11 +2148,12 @@ def main():
                               "tokens_per_sec": tokens_per_sec,
                               "total_duration_ms": int(ollama_stats.get("total_duration_ns", 0) / 1e6)})
 
-            # Log total TTS time. A response that synthesized nothing left this
-            # worker's CPU window unopened, so its snapshot would read 0.0.
-            write_timing(writer, args, item_name, "tts_total",
-                         int(tts_metrics["total_tts_time"] * 1000),
-                         tts_metrics.get("end_stats") if tts_metrics["total_tts_time"] > 0 else None)
+            if responds:
+                # Log total TTS time. A response that synthesized nothing left this
+                # worker's CPU window unopened, so its snapshot would read 0.0.
+                write_timing(writer, args, item_name, "tts_total",
+                             int(tts_metrics["total_tts_time"] * 1000),
+                             tts_metrics.get("end_stats") if tts_metrics["total_tts_time"] > 0 else None)
 
             # Output audio duration and E2E summary. An answer a later
             # utterance superseded is left on disk but reported apart from the
@@ -2148,13 +2182,14 @@ def main():
             if input_duration_ms is not None:
                 e2e_extra["input_duration_ms"] = input_duration_ms
 
-            write_timing(writer, args, item_name, "e2e_response_ready",
-                         int((time.perf_counter() - e2e_t0) * 1000),
-                         e2e_stats, e2e_extra)
-            print(f"[TTS] Stream finished. Saved to {', '.join(response_wavs) or '(no audio)'}.")
-            if discarded_wavs:
-                print(f"[TTS] {discarded_output_duration_ms} ms of superseded audio "
-                      f"kept for inspection: {', '.join(discarded_wavs)}")
+            if responds:
+                write_timing(writer, args, item_name, "e2e_response_ready",
+                             int((time.perf_counter() - e2e_t0) * 1000),
+                             e2e_stats, e2e_extra)
+                print(f"[TTS] Stream finished. Saved to {', '.join(response_wavs) or '(no audio)'}.")
+                if discarded_wavs:
+                    print(f"[TTS] {discarded_output_duration_ms} ms of superseded audio "
+                          f"kept for inspection: {', '.join(discarded_wavs)}")
 
             # Flush CSV after each item to prevent data loss
             fcsv.flush()
