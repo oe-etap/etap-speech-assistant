@@ -38,11 +38,12 @@ regardless of what that file's import chain grows.
 
 import argparse
 import csv
+import hashlib
 import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import run_statistics as rstat
 
@@ -142,15 +143,35 @@ def read_run(path: Path) -> Optional[RunRecord]:
     return run
 
 
-def find_csvs(corpus: Path) -> List[Path]:
-    """Every latency CSV under a tree, or the single file named directly.
+def find_csvs(corpus: Path) -> Tuple[List[Path], List[Path]]:
+    """Every distinct latency CSV under a tree, and the copies that were dropped.
 
     Same glob as `aggregate_logs.py`'s `find_latest_csv_logs`, so a corpus
-    that counts as N files there counts the same way here.
+    that counts as N files there counts the same way here -- except that a run
+    archived at two paths is counted once. 28 of the 175 CSVs under `outputs/`
+    are byte-identical pairs, `outputs/text-only/<cell>/<ts>/` being a copy of
+    `outputs/sub1/run1/<cell>/<ts>/`; counting both inflated the item total by
+    a quarter (16594 against 13234) and the outlier counts with it, while the
+    medians barely moved. Keyed on content rather than on the (cell, timestamp)
+    identity `campaign_report.py` dedupes by, because this script never derives
+    that identity and byte-equality is the stronger claim anyway.
     """
     if corpus.is_file():
-        return [corpus]
-    return sorted(corpus.glob("**/latency_log_*.csv"))
+        return [corpus], []
+    kept: List[Path] = []
+    dropped: List[Path] = []
+    seen: Set[str] = set()
+    for path in sorted(corpus.glob("**/latency_log_*.csv")):
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            continue
+        if digest in seen:
+            dropped.append(path)
+        else:
+            seen.add(digest)
+            kept.append(path)
+    return kept, dropped
 
 
 @dataclass
@@ -168,6 +189,7 @@ class Residuals:
     double_fire: List[float] = field(default_factory=list)
     outliers: List[Outlier] = field(default_factory=list)
     csvs_seen: int = 0
+    duplicate_csvs: List[Path] = field(default_factory=list)
     csvs_with_all_stages: int = 0
     file_mode_items: int = 0
     double_fire_incidence: int = 0
@@ -176,8 +198,9 @@ class Residuals:
 def collect(corpus: Path, threshold: float) -> Residuals:
     """Walk the corpus once, sorting every qualifying item into its stratum."""
     result = Residuals()
-    paths = find_csvs(corpus)
+    paths, duplicates = find_csvs(corpus)
     result.csvs_seen = len(paths)
+    result.duplicate_csvs = duplicates
 
     for path in paths:
         run = read_run(path)
@@ -228,8 +251,10 @@ def stratum_line(label: str, values: Sequence[float], threshold: float) -> str:
 
 def format_report(result: Residuals, threshold: float) -> str:
     lines = [
-        f"CSVs under corpus: {result.csvs_seen} "
-        f"({result.csvs_with_all_stages} hold an item with all four stages)",
+        f"CSVs under corpus: {result.csvs_seen} distinct "
+        f"({result.csvs_with_all_stages} hold an item with all four stages)"
+        + (f", {len(result.duplicate_csvs)} byte-identical copies dropped"
+           if result.duplicate_csvs else ""),
         "",
         stratum_line("items after the first", result.after_first, threshold),
         stratum_line("first item of each run", result.first_item, threshold),
