@@ -1254,11 +1254,14 @@ heard — not before the first chunk of the answer that was thrown away, a whole
 generation earlier. `stt_endpoint_delay` moves with it, both of them anchored on
 the last fire: on the `metadata` anchor every fire reads the same value, and on
 `stt_word_timings` the anchor moves with each fire and the last one is what the
-row carries. So the decomposition above still closes on these items, at +7 to
-+9 ms against +2 to +3 ms on a single fire, the difference being one more trip
-through the cancel path — which sits inside `ttfa` and inside none of the three
-terms. `endpoint_fire_count` on the `stt` row says which items these are.
-Asserted, rather than read off the code, in `tests/test_bargein_accounting.py`.
+row carries. So the decomposition above still closes on these items: over 00004,
+whose 1.7 s internal pause makes the default endpointer fire twice, the residual
+is +3 ms against +2 ms on 00005, which fires once. The extra trip through the
+cancel path sits inside `ttfa` and inside none of the three terms, and costs a
+handoff rather than a generation — which is also why the 186 double-WAV items in
+`outputs/` have the same +4 ms median residual as the other 16 420.
+`endpoint_fire_count` on the `stt` row says which items these are. Asserted,
+rather than read off the code, in `tests/test_bargein_accounting.py`.
 
 ---
 

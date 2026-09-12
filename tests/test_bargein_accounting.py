@@ -68,11 +68,12 @@ TOLERANCE_MS = 5
 
 # The decomposition ttfa = stt_endpoint_delay + llm_ttfc + tts_first_chunk does
 # not close exactly: the queue handoffs on either side of the LLM request sit
-# inside ttfa and inside none of the three terms. Measured over three repeats of
-# this test, +2 to +3 ms on a single fire and +7 to +9 ms on a double, the extra
-# ~5 ms being the second trip through llm_worker's cancel path. Same direction
-# and same order as the +4 ms median over the 16 422 archived items. The bound
-# is what separates a handoff from a whole generation, which would be 800 ms.
+# inside ttfa and inside none of the three terms. Over three repeats here, +2 to
+# +3 ms on a single fire and +7 to +9 ms on a double. The real pipeline is
+# cheaper at it -- Vosk, gemma3:1b and Piper over 00004 and 00005 give +3 and
+# +2 ms -- so the bound is set by this harness, not by production. Either way it
+# is a handoff; a ttfa taken from the discarded generation would be off by the
+# 800 ms between the two candidate chunks.
 HANDOFF_TOLERANCE_MS = 30
 
 
