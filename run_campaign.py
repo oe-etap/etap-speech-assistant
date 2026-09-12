@@ -572,6 +572,16 @@ def load_cells(args):
 
 
 def main():
+    # A campaign runs for hours to days and is normally started under nohup
+    # with its stdout redirected to a file for `tail -f`. Redirected-to-a-file
+    # stdout is fully (block) buffered by default, so without this an operator
+    # watching that file sees nothing until the whole campaign -- or a buffer
+    # flush many launches later -- finishes.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except AttributeError:
+        pass  # stdout without reconfigure() (e.g. already replaced); not fatal.
+
     argv, extra_args = split_extra_args(sys.argv[1:])
     args = build_arg_parser().parse_args(argv)
 
