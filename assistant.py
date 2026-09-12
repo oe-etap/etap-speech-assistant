@@ -1649,6 +1649,23 @@ def main():
 
     # Prepare CSV
     csv_exists = os.path.exists(args.latency_csv)
+    if csv_exists:
+        # DictWriter never reads an existing file, so it would otherwise append
+        # rows in the current field order under whatever header is already
+        # there. Harmless for a file this run itself started, but pointing
+        # --latency-csv at a CSV from before cell_id/launch_id existed would
+        # silently shift every value two columns over rather than fail loudly.
+        with open(args.latency_csv, "r", newline="", encoding="utf-8") as fexisting:
+            existing_header = next(csv.reader(fexisting), [])
+        if existing_header and existing_header != fieldnames:
+            parser.error(
+                f"--latency-csv {args.latency_csv} already exists with a "
+                f"different header than this run would write.\n"
+                f"  existing: {existing_header}\n"
+                f"  expected: {fieldnames}\n"
+                f"Appending would misalign columns rather than extend the file; "
+                f"point at a fresh path instead."
+            )
     with open(args.latency_csv, "a", newline="", encoding="utf-8") as fcsv:
         writer = csv.DictWriter(fcsv, fieldnames=fieldnames)
         if not csv_exists:
