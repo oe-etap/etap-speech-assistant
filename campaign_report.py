@@ -640,7 +640,7 @@ def write_tsv(path: Path, rows: List[Dict[str, Any]]) -> None:
                              for key, value in row.items()})
 
 
-def write_json(path: Path, root: Path, campaign: Campaign,
+def write_json(path: Path, root: Path, campaign: Campaign, warnings: List[str],
                rows: List[Dict[str, Any]]) -> None:
     payload = {
         "campaign_root": str(root),
@@ -649,7 +649,11 @@ def write_json(path: Path, root: Path, campaign: Campaign,
         "evaluation_csvs": len(campaign.evaluation_runs),
         "cells": sorted({run.cell for run in campaign.latency_runs}
                         | {run.cell for run in campaign.evaluation_runs}),
-        "warnings": campaign.warnings,
+        # The full list built in main(): load-time warnings plus anything
+        # found while resolving --compare, not just campaign.warnings - a
+        # --quiet, --json-only run must not lose a warning simply because the
+        # text report was the only place it used to be printed.
+        "warnings": warnings,
         "rows": rows,
     }
     with path.open("w", encoding="utf-8") as handle:
@@ -806,6 +810,13 @@ def main() -> int:
         rows += contrast_rows(metric_grouped, metric_launch_values,
                               baseline, contrast, RESPONSE_METRICS, digits=4)
 
+    # Printed to stderr unconditionally, the way aggregate_logs.py's own
+    # main() prints analysis.warnings: --quiet silences the report, not the
+    # warnings, since a --json-only run with a typo'd --compare cell must
+    # still say so somewhere the caller will see it.
+    for warning in warnings:
+        print(f"WARNING: {warning}", file=sys.stderr)
+
     if not args.quiet:
         print(render_text_report(root, campaign, warnings, rows))
 
@@ -813,7 +824,7 @@ def main() -> int:
         write_tsv(Path(args.tsv), rows)
         print(f"Summary TSV written to: {Path(args.tsv).resolve()}")
     if args.json:
-        write_json(Path(args.json), root, campaign, rows)
+        write_json(Path(args.json), root, campaign, warnings, rows)
         print(f"Summary JSON written to: {Path(args.json).resolve()}")
     if args.tidy_latency_csv:
         write_tidy_csv(Path(args.tidy_latency_csv), tidy_latency_rows(campaign.latency_runs),
