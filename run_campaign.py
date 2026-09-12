@@ -345,6 +345,18 @@ def _log_mentions(log_path, needle):
         return False
 
 
+def _out_dir_ever_warmup_retried(out_dir):
+    """Whether any driver log under out_dir ever recorded the warm-up retry.
+
+    Skipping a completed launch must not re-derive its record from scratch:
+    an earlier invocation may have seen the retry fire and this one must not
+    quietly drop that from the manifest just because nothing ran this time.
+    The log files, unlike the manifest, are never overwritten, so they are
+    the source of truth here too."""
+    return any(_log_mentions(p, WARMUP_RETRY_NEEDLE)
+               for p in glob.glob(os.path.join(out_dir, "driver_launch_*.log")))
+
+
 def build_command(python_bin, assistant_script, config_path, out_dir, cell_id, launch_id, extra_args):
     return [python_bin, assistant_script,
             "--config", config_path,
@@ -360,13 +372,15 @@ def run_one_launch(args, extra_args, order_index, total, lp, campaign_root):
     if prior is not None:
         print(f"[SKIP] {order_index}/{total} round={lp.round} {lp.cell_id}/{lp.launch_id}: "
               f"already complete at {prior}")
+        prior_logs = sorted(glob.glob(os.path.join(out_dir, "driver_launch_*.log")))
         return {
             "order_index": order_index, "round": lp.round, "cell_id": lp.cell_id,
             "launch_id": lp.launch_id, "config_path": lp.config_path, "out_dir": out_dir,
             "run_dir": prior, "command": None, "pid": None,
             "start_ts": None, "end_ts": None, "duration_s": None,
             "exit_code": None, "status": "skipped_already_complete",
-            "warmup_retry": False, "log_path": None,
+            "warmup_retry": _out_dir_ever_warmup_retried(out_dir),
+            "log_path": prior_logs[-1] if prior_logs else None,
         }
 
     stale = find_run_dirs(out_dir)
