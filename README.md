@@ -200,6 +200,11 @@ Each run creates `outputs/<YYYYMMDD_HHMMSS>/` containing:
   under `audios/` ships in. Recordings with no such file, no matching row, or a
   live microphone get `null` instead; nothing else changes.
 
+  `llm_text` is empty when the generation failed, and the reason sits beside it
+  in `llm_error`. The exception never goes in `llm_text`: the evaluation
+  package scores that field, and an error message there would be graded as
+  though the assistant had answered.
+
   `stt_engine` records which recognizer produced `stt_text`, so the provenance
   travels with the text rather than with the directory it was written in. A
   text-mode run passes the incoming value through unchanged rather than
@@ -210,7 +215,7 @@ Each run creates `outputs/<YYYYMMDD_HHMMSS>/` containing:
 
 The CSV contains:
 
-- `stage`: one of `stt`, `stt_endpoint_delay`, `llm_prompt_eval`, `llm_ttft`, `llm_first_chunk_fill`, `llm_ttfc`, `tts_first_chunk`, `ttfa`, `llm_eval`, `tts_total`, `e2e_response_ready`. A stage a mode cannot measure writes **no row**, never a zero: `--input-mode text` omits `stt`, `stt_endpoint_delay` and `ttfa`, and `--asr-only` writes only the first two of those. Keys inside `extra_json` follow the same rule, so `input_duration_ms` and `stt_rtf` are absent where no audio had a duration
+- `stage`: one of `stt`, `stt_endpoint_delay`, `llm_prompt_eval`, `llm_ttft`, `llm_first_chunk_fill`, `llm_ttfc`, `tts_first_chunk`, `ttfa`, `llm_eval`, `tts_total`, `e2e_response_ready`. A stage a mode cannot measure writes **no row**, never a zero: `--input-mode text` omits `stt`, `stt_endpoint_delay` and `ttfa`, and `--asr-only` writes only the first two of those. Keys inside `extra_json` follow the same rule, so `input_duration_ms` and `stt_rtf` are absent where no audio had a duration. The same applies to an item that produced no reply: a failed generation writes only `e2e_response_ready`, carrying `llm_failed` and `llm_error`, and none of the `llm_*`, `ttfa` or `tts_*` rows. That is not tidiness — before it, an unreachable LLM left a full row set whose `ttfa` timed the text-to-speech of the exception, 4081 ms against the same recording's real 1435 ms: high enough to read as a slow configuration rather than as a failure, and indistinguishable from one by aggregation time
 - `duration_ms`: stage duration in milliseconds
 - `input_mode`, `audio_pacing`, `utterance_trigger`: how the audio reached the pipeline and what released it to the LLM. Which stages carry a value, and what they include, depends on these, so runs that differ in them must not be pooled. `utterance_trigger` records the behaviour that applied, not the setting that was requested.
 - `stt_engine`: **which recognizer produced the text this run answered** — not necessarily one that ran here. Under `--input-mode file`, `mic` and `--asr-only` a recognizer does run and this is it. Under `--input-mode text` none runs, so the value is read from the transcripts file's own `stt_engine` field and `--stt-engine` is ignored (the run says so on stderr when the two differ). That is why the column stays a run-context column rather than becoming a grouping key: the same LLM answering a Vosk transcript and a Whisper transcript is not answering the same question, so those two cells must not pool, exactly as if the recognizer had run in-process.

@@ -472,7 +472,12 @@ class OllamaEngine:
                 yield {"text": "", "ollama_stats": None, "cancelled": True,
                        "first_token_t": first_token_t}
             else:
-                yield {"text": f"(LLM call failed: {e})", "ollama_stats": None,
-                       "cancelled": False, "first_token_t": first_token_t}
+                # An empty text with an explicit flag, not the message in the
+                # text field: a caller that forwards `text` onward without
+                # checking then synthesizes nothing rather than speaking the
+                # exception and logging it as the assistant's reply.
+                yield {"text": "", "ollama_stats": None,
+                       "cancelled": False, "failed": True, "error": str(e),
+                       "first_token_t": first_token_t}
         finally:
             self._current_response = None
