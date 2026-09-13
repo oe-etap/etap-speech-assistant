@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Why both response WAVs survive a barge-in.
+Why a barge-in used to leave two response WAVs behind, and what replaced that.
 
 The audit finding this re-checks: when the endpointer fires a second time,
 llm_worker puts `end_of_response` at the end of one iteration and the `cancel`
 only at the top of the next. The TTS queue is FIFO, so by the time the cancel is
 read, close_response() has already advanced response_index; the cancel then
-computes a partial path for an `_r2.wav` that was never opened, os.path.exists
-is False, and the finished WAV of the answer nobody heard is not deleted.
+computes a partial path for an `_r2.wav` that was never opened and os.path.exists
+is False. Deleting only that path therefore deleted nothing, and the finished
+WAV of the answer nobody heard stayed on disk.
+
+That race is still here -- it is a property of the message order, not a bug to
+fix -- so the cancel now works from `out_wavs` instead of from a guessed path:
+every superseded answer is timed into discarded_output_duration_ms, counted in
+discarded_wav_count, and then deleted. The cost of the wasted work is kept; the
+audio is not, for the same reason the discarded generation's text is not.
 
 Run this after touching llm_worker, tts_worker or the queue between them. It
 does not assume the message sequence -- it observes it, by running the real
@@ -135,15 +142,14 @@ def main():
         tts_metrics = replay_into_tts_worker(sequence, work_dir)
         on_disk = sorted(f for f in os.listdir(work_dir) if f.endswith(".wav"))
         surviving = [os.path.basename(p) for p in tts_metrics["out_wavs"]]
-        discarded = [os.path.basename(p) for p in tts_metrics["discarded_wavs"]]
         synthesis_ms = tts_metrics["total_tts_time"] * 1000
-        discarded_ms = sum(assistant.wav_duration_ms(p)
-                           for p in tts_metrics["discarded_wavs"])
+        discarded_ms = tts_metrics["discarded_output_duration_ms"]
+        discarded_n = tts_metrics["discarded_wav_count"]
 
         print("\nWhat tts_worker left behind:")
         print(f"  on disk         {on_disk}")
         print(f"  out_wavs        {surviving}")
-        print(f"  discarded_wavs  {discarded}")
+        print(f"  discarded       {discarded_n} answer(s), deleted after timing")
         print(f"  total_tts_time  {synthesis_ms:.0f} ms "
               f"({survived} surviving chunks, {superseded} superseded)")
         print(f"  discarded audio {discarded_ms} ms")
@@ -151,15 +157,15 @@ def main():
         checks = [
             ("cancel arrives directly after end_of_response, so the delete "
              "looks for a WAV that was never opened", race_present),
-            ("both response WAVs are still on disk", len(on_disk) == 2),
+            ("only the surviving answer is left on disk", len(on_disk) == 1),
             ("only the surviving answer is in out_wavs", len(surviving) == 1),
-            ("the superseded answer is accounted for separately",
-             len(discarded) == 1),
+            ("the superseded answer is counted, not kept", discarded_n == 1),
             (f"total_tts_time covers the {survived} surviving chunks and not "
              f"the {superseded} superseded ones",
              abs(synthesis_ms - survived * TTS_SYNTH_S * 1000)
              <= 0.2 * survived * TTS_SYNTH_S * 1000),
-            (f"the discarded WAV holds the {superseded} superseded chunks",
+            (f"the superseded answer's {superseded} chunks were timed before "
+             f"being deleted",
              discarded_ms == round(superseded * TTS_AUDIO_S * 1000)),
         ]
         print()
@@ -167,8 +173,9 @@ def main():
             print(f"  [{'ok  ' if held else 'FAIL'}] {description}")
 
         if all(held for _, held in checks):
-            print("\nThe finding holds: a barge-in leaves both WAVs on disk, and "
-                  "the metrics now cover only the answer that survived it.")
+            print("\nThe race still holds. A barge-in now leaves only the "
+                  "surviving answer on disk, and every metric on the row "
+                  "describes that same answer.")
             return 0
         print("\nThe finding no longer holds. The cancel path in tts_worker and "
               "the message order in llm_worker have to be re-read together "

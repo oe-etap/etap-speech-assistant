@@ -240,13 +240,25 @@ def collect(corpus: Path, threshold: float) -> Residuals:
 
 
 # ---------- Reporting ----------
-def stratum_line(label: str, values: Sequence[float], threshold: float) -> str:
+def stratum_line(label: str, values: Sequence[float], threshold: float,
+                 quantiles: bool = True) -> str:
+    """One stratum's line. `quantiles=False` reports the split instead of a p95.
+
+    The first-item stratum is bimodal rather than heavy-tailed: over the
+    archived runs 136 of its 144 values are single-digit milliseconds and the
+    other 8 are between 3.5 s and 50 s, with nothing in between. Any percentile
+    lands in that gap, interpolating between a warm launch and a failed warm-up
+    and describing neither, so that stratum reports how many fell on each side.
+    """
     if not values:
         return f"{label:<26} n=0 (no qualifying items)"
     over = sum(1 for v in values if abs(v) > threshold)
-    return (f"{label:<26} n={len(values):<7} median={rstat.percentile(values, 0.5):+.0f} ms"
-            f"  p95={rstat.percentile(values, 0.95):+.0f} ms  max={max(values):.0f} ms"
-            f"  |resid|>{threshold:.0f}ms: {over}")
+    head = f"{label:<26} n={len(values):<7} median={rstat.percentile(values, 0.5):+.0f} ms"
+    if quantiles:
+        head += f"  p95={rstat.percentile(values, 0.95):+.0f} ms"
+    else:
+        head += f"  {len(values) - over} within {threshold:.0f} ms"
+    return f"{head}  max={max(values):.0f} ms  |resid|>{threshold:.0f}ms: {over}"
 
 
 def format_report(result: Residuals, threshold: float) -> str:
@@ -257,7 +269,8 @@ def format_report(result: Residuals, threshold: float) -> str:
            if result.duplicate_csvs else ""),
         "",
         stratum_line("items after the first", result.after_first, threshold),
-        stratum_line("first item of each run", result.first_item, threshold),
+        stratum_line("first item of each run", result.first_item, threshold,
+                     quantiles=False),
     ]
 
     all_values = result.after_first + result.first_item
