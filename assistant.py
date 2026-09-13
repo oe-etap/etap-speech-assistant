@@ -1389,6 +1389,36 @@ def load_transcript_items(path):
     return records
 
 
+def transcript_stt_engine(records, path):
+    """Which recognizer produced these transcripts, or "" if they do not say.
+
+    A text-mode run loads no recognizer, so the `stt_engine` on its rows cannot
+    mean "what ran here". It means what produced the text that ran, which is the
+    thing two text-mode cells have to agree on before their figures may be
+    pooled: the same LLM answering a Vosk transcript and a Whisper transcript is
+    not answering the same question. That is why it stays in
+    `aggregate_logs.py`'s RUN_CONTEXT_COLUMNS rather than becoming a grouping
+    key.
+
+    Records disagreeing on it are refused rather than merged. One file mixing
+    two recognizers is not one experiment, and picking a winner here would
+    stamp every row with a value true of only some of them.
+
+    Transcripts written before this field existed carry nothing; those runs
+    report an empty engine, which is honest and, being a distinct value, still
+    keeps them from pooling with runs that name one.
+    """
+    engines = sorted({str(record.get("stt_engine") or "").strip()
+                      for record in records} - {""})
+    if len(engines) > 1:
+        raise ValueError(
+            f"{path}: records name more than one recognizer "
+            f"({', '.join(engines)}); one transcripts file is one recognizer's "
+            f"output, and rows stamped with a single engine would misdescribe "
+            f"most of them")
+    return engines[0] if engines else ""
+
+
 def plan_items(args, run_dir, shutdown_event, transcripts=None):
     """Yield the items this run processes, one ItemWork each, in run order.
 
@@ -1672,8 +1702,22 @@ def main():
         # model load has been paid for throws the load away.
         try:
             transcript_records = load_transcript_items(args.transcripts)
+            # Overrides --stt-engine rather than being checked against it: no
+            # recognizer runs here, so the flag describes nothing this run did,
+            # while the transcripts know what produced the text.
+            transcript_engine = transcript_stt_engine(transcript_records,
+                                                      args.transcripts)
         except (OSError, ValueError) as e:
             parser.error(f"--transcripts could not be loaded: {e}")
+        if transcript_engine and transcript_engine != args.stt_engine:
+            print(f"[INFO] --stt-engine {args.stt_engine!r} ignored; these "
+                  f"transcripts came from {transcript_engine!r}.")
+        elif not transcript_engine:
+            print(f"[WARN] {args.transcripts} does not say which recognizer "
+                  f"produced it, so stt_engine is left empty. Runs whose input "
+                  f"provenance is unknown cannot be pooled with runs that name "
+                  f"one.")
+        args.stt_engine = transcript_engine
     else:
         if not args.audio:
             parser.error("--audio is required when --input-mode is 'file' (either in CLI or config)")
@@ -2205,11 +2249,16 @@ def main():
             fcsv.flush()
 
             # --- Transcript Logging ---
+            # stt_engine travels with the text so that a later text-mode run
+            # can stamp its rows with what recognized the words it answered.
+            # In text mode this passes the incoming provenance through rather
+            # than claiming this run produced anything.
             transcript_record = {
                 "filename": item.filename,
                 "ori_text": item.ori_text,
                 "stt_text": user_text,
                 "llm_text": full_reply,
+                "stt_engine": args.stt_engine,
             }
 
             # JSONL Logging
