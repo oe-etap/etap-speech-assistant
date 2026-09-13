@@ -2,7 +2,7 @@
 
 Audio -> STT -> LLM -> TTS, mostly offline. The only network-like dependency is the local Ollama HTTP API, and Ollama model downloads happen outside this script.
 
-Input comes either from pre-recorded English audio files or from a live microphone. The three pipeline stages run as concurrent workers and stream into each other, so the TTS starts on the first sentence while the LLM is still generating the rest. The script writes response WAVs and logs latency plus best-effort CPU/RAM/GPU statistics.
+Input comes from pre-recorded English audio files, from a live microphone, or from a transcripts file when the recognizer is being left out of the loop on purpose. The three pipeline stages run as concurrent workers and stream into each other, so the TTS starts on the first sentence while the LLM is still generating the rest. The script writes response WAVs and logs latency plus best-effort CPU/RAM/GPU statistics.
 
 ## Features
 
@@ -11,6 +11,8 @@ Input comes either from pre-recorded English audio files or from a live micropho
 - Saves the exact runtime configuration to `config_used.yaml`
 - Aggregates its own latency log when the run finishes, so every run folder carries the distribution it measured and not just the raw rows (`--no-summary` opts out)
 - File input via `--audio file1.wav file2.mp3 ...`, or live capture via `--input-mode mic`
+- The recognizer can be split out of the loop entirely: `--asr-only` runs the realtime pass alone and freezes its transcripts, and `--input-mode text --transcripts T.jsonl` answers those at full speed with no audio and no pacing — see [Splitting the recognizer out of the loop](#splitting-the-recognizer-out-of-the-loop)
+- `transcript_stability.py` compares two or more ASR passes over the same recordings, reporting how many items they agree on, the pairwise word error rate, and how many disagree on `endpoint_fire_count`
 - File input can be paced at 1x speed (`--audio-pacing realtime`) so that STT overlaps with the speech exactly as it would on a microphone — this is what makes file-based latency numbers carry over to a live deployment
 - Concurrent STT / LLM / TTS workers; a new utterance can interrupt an answer still being generated
 - English-only STT prompt flow and English TTS defaults
@@ -137,7 +139,9 @@ python assistant.py --audio .\a.wav .\b.mp3 .\c.flac --stt-engine whisper --tts-
 
 Input and pacing:
 
-- `--input-mode {file,mic}`: file input or live capture, default `file`
+- `--input-mode {file,mic,text}`: audio files, live capture, or a transcripts file, default `file`. `text` needs `--transcripts` and not `--audio`, loads no recognizer, and writes no `stt`, `stt_endpoint_delay` or `ttfa` row
+- `--transcripts PATH`: the `.jsonl`, `.ndjson` or `.yaml` file supplying the utterances under `--input-mode text`. The same formats and the same flag name `evaluation/cli.py` takes, and the schema a run's own `transcripts.jsonl` is in, so a pass feeds a run unconverted. `stt_text` is the utterance; `filename` and `ori_text` are carried through, and a record with no `filename` is rejected before any model loads
+- `--asr-only`: stop after the recognizer. Writes `stt`, `stt_endpoint_delay` and the transcripts, and constructs neither the LLM nor the TTS, so no Ollama model holds VRAM and no Piper voice holds its thread pool for the length of the pass. Refuses `--playback`, having nothing to play
 - `--audio-pacing {realtime,fast}`: how file input is fed to the STT, default `realtime`. `realtime` delivers at 1x speed like a microphone and is required for `ttfa`; `fast` reads as quickly as possible, which suits throughput runs and per-stage costs
 - `--file-realtime-trigger {endpoint,end-of-file}`: what starts the LLM under file input with realtime pacing, default `endpoint`. See [Trailing silence in input files](#trailing-silence-in-input-files)
 - `--audio-chunk-ms N`: chunk length handed to the STT, default `100`. Costs about 0.4 ms of response time per ms of chunk and nothing else measurable; see [Chunk size](#chunk-size)
@@ -200,7 +204,7 @@ Each run creates `outputs/<YYYYMMDD_HHMMSS>/` containing:
 
 The CSV contains:
 
-- `stage`: one of `stt`, `stt_endpoint_delay`, `llm_prompt_eval`, `llm_ttft`, `llm_first_chunk_fill`, `llm_ttfc`, `tts_first_chunk`, `ttfa`, `llm_eval`, `tts_total`, `e2e_response_ready`
+- `stage`: one of `stt`, `stt_endpoint_delay`, `llm_prompt_eval`, `llm_ttft`, `llm_first_chunk_fill`, `llm_ttfc`, `tts_first_chunk`, `ttfa`, `llm_eval`, `tts_total`, `e2e_response_ready`. A stage a mode cannot measure writes **no row**, never a zero: `--input-mode text` omits `stt`, `stt_endpoint_delay` and `ttfa`, and `--asr-only` writes only the first two of those. Keys inside `extra_json` follow the same rule, so `input_duration_ms` and `stt_rtf` are absent where no audio had a duration
 - `duration_ms`: stage duration in milliseconds
 - `input_mode`, `audio_pacing`, `utterance_trigger`: how the audio reached the pipeline and what released it to the LLM. Which stages carry a value, and what they include, depends on these, so runs that differ in them must not be pooled. `utterance_trigger` records the behaviour that applied, not the setting that was requested.
 - `cell_id`, `launch_id`: which configuration cell this is, and which repetition of that cell this process is — set by `--cell-id` and `--launch-id`, and defaulting to the config file's basename and empty. They are a different kind of identity from the three above: two launches of one cell **are** the same experiment, and pooling them is the point of replicating, so these are grouping keys rather than compatibility guards and deliberately sit outside `aggregate_logs.py`'s `RUN_CONTEXT_COLUMNS`. Identity that lives only in a directory layout does not survive the concatenated CSV a campaign publishes, which is why it rides on every row
@@ -310,6 +314,83 @@ is what `speech_end_source` is there to make visible.
 `stt_endpoint_delay` measures from the end of speech to the finished transcript. On file input that is the flush once the stream ends; on a microphone it is the endpointer waiting out the silence, which is usually the largest single component of what a user perceives.
 
 Both stages are **blank under `fast` pacing**: the audio does not advance at wall-clock speed there, so no offset within it corresponds to an instant. Use `realtime` for any latency claim; `fast` remains useful for throughput and for the per-stage costs (`stt`, `llm_ttfc`, `tts_first_chunk`, `e2e_response_ready`), which stay valid.
+
+### Splitting the recognizer out of the loop
+
+Realtime pacing is what makes a file-based latency figure carry over to a live
+deployment, and it is also what bounds throughput: the audio is fed at 1x, so a
+sweep over many configurations spends most of its wall clock playing the same
+recordings again. The way out is to pay it once. `--asr-only` runs the
+recognizer alone and freezes what it heard; `--input-mode text` answers those
+frozen transcripts with no audio, no pacing and no recognizer, so a
+configuration cell runs at the speed of the LLM and the TTS alone.
+
+```bash
+# Once: the realtime pass. Writes stt, stt_endpoint_delay and the transcripts.
+python assistant.py --asr-only --audio ./audios --out-dir outputs/asr
+
+# Then, per configuration cell: its own transcripts file, unconverted.
+python assistant.py --config configs/17-gemma3_1b_it_q4_K_M-t0_0-vosk_cpu.yaml \
+  --input-mode text --transcripts outputs/asr/<timestamp>/transcripts.jsonl \
+  --out-dir outputs/17-text
+```
+
+Neither mode invents a measurement it cannot make. A stage that has no meaning
+writes no row at all, because `aggregate_logs.py` cannot tell a zero from a
+measurement and a placeholder would drag the aggregate down silently:
+
+| | `stt` | `stt_endpoint_delay` | LLM stages | `tts_*` | `ttfa` | `e2e_response_ready` |
+|---|---|---|---|---|---|---|
+| file / mic | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ whole item |
+| `--asr-only` | ✅ | ✅ | – | – | – | – |
+| `--input-mode text` | – | – | ✅ | ✅ | – | ✅ from the request |
+
+`ttfa` is not measured in text mode and is not meant to be: no one spoke, so no
+instant exists to measure from. It is reconstructed afterwards from the
+`stt_endpoint_delay` the ASR pass recorded for the same recording plus the
+`llm_ttfc` and `tts_first_chunk` of the cell, which
+[Relationships Between Metrics](#relationships-between-metrics) reports holding
+to within a few ms. That join is on the `item` column, which is why text mode
+derives it from the transcript's `filename` exactly as file mode derives it from
+the audio file's name — the same recording gets the same item in both.
+
+The TTS keeps running in text mode for the same reason. `tts_first_chunk` is one
+of the three terms, and Piper's first chunk costs ~226 ms pinned against ~123 ms
+at 12 unpinned threads only *while the LLM generates underneath it*; idle, the
+same settings are within 2 ms of each other (see
+[Piper's threads on the CPU](#pipers-threads-on-the-cpu)). A text-mode run
+without the TTS would measure a machine that never runs.
+
+Skipping the initialisation is the point of `--asr-only`, not just skipping
+generation: a resident Ollama model holds VRAM for the length of the pass and a
+loaded Piper holds its ONNX Runtime thread pool whether or not it is asked to
+speak. Over three of the recordings under `audios/` with
+`gemma3:1b-it-q4_K_M` on the CPU, the pass leaves `ollama ps` empty throughout
+and runs 19 process threads against the full chain's 32, finishing in 25 s
+against 35 s. The cells that follow are where the saving compounds. Comparing
+the same three recordings answered from text against answered from audio,
+`llm_eval` lands at 386/1683/626 ms against 426/1726/657 — the same range, the
+recognizer no longer competing for the CPU — while `e2e_response_ready` drops
+from 7.9-9.5 s to 1.8-2.9 s, which is the speech it no longer waits through.
+
+One caveat on freezing a pass. Realtime pacing does not repeat its chunk
+delivery schedule exactly, and Vosk's endpointer can only fire on a chunk
+boundary, so two passes over one folder need not produce one transcript:
+identical runs flip about 4% of transcripts while the corpus word error rate
+stays stable to ±0.001. Every cell must therefore read the *same* frozen file or
+the cells stop being exactly paired. `transcript_stability.py` measures the
+disagreement for a given recording set — standard library only, like the rest of
+the analysis tooling:
+
+```bash
+python3 transcript_stability.py outputs/asr/<ts-1> outputs/asr/<ts-2>
+```
+
+It reports how many items are identical across every pass, the pairwise word
+error rate over all common items and over the differing ones alone, and how many
+passes disagree on `endpoint_fire_count`. The corpus figure is the one to quote
+as launch-level ASR variability; the per-item count is the one that decides how
+much the choice of canonical pass matters.
 
 ### Tuning the endpointer
 
@@ -1121,7 +1202,7 @@ under investigation, the pooled interval is understating it.
 - GPU stats come from NVML (`nvidia-ml-py`). The level fields are read in process at each stage boundary like the CPU and RAM ones; utilisation is collected continuously by a background thread instead, every tenth of a second, which is often enough to keep up with a driver that produces a sample per frame. Where NVML cannot be initialised the code falls back to `nvidia-smi`, and the same thread runs it once a second so its subprocess stays off the measured path — the levels are then up to a second old and utilisation is averaged from readings that coarse. Individual fields the driver does not support are stored blank, as are all of them when neither source is usable.
 - `gpu_mem_used_mb` is read through NVML's v2 memory query, which reports the framebuffer the driver reserves for itself separately from what is allocated. The original query folds the two together — it defines `used` as total minus free, and the reservation is 2192 MiB of the 32 GB vGPU here, present with nothing running at all — while `nvidia-smi` shows only the allocated part. The v2 query is what keeps this column agreeing with `nvidia-smi` and with the fallback path.
 - `gpu_util_percent` is built from the driver's per-process samples, summed across processes so that it describes the device as it always has. Where those are unavailable it falls back to the utilisation counter, whose rolling average lags the work and outlives it by an interval that varies by card; the figure is then only as well placed as that counter. See [Utilisation is a span, not an instant](#utilisation-is-a-span-not-an-instant).
-- `e2e_response_ready` runs from the start of processing to the complete response, in every mode. On file input it therefore includes the delivery of the audio; on a microphone it covers the whole session. It is a wall-clock span, not a latency — for latency use `ttfa`.
+- `e2e_response_ready` runs from the start of processing to the complete response. On file input it therefore includes the delivery of the audio; on a microphone it covers the whole session. Under `--input-mode text` there is no speech to deliver, so it runs from the request instead and is several seconds shorter over the same recordings — 1.8-2.9 s against 7.9-9.5 s over three of those under `audios/`. The two are not comparable and `input_mode` keeps them from being pooled. It is a wall-clock span, not a latency — for latency use `ttfa`.
 - `stt_rtf` is `stt` divided by the audio duration. It expresses a real-time factor only under `fast` pacing. Under `realtime` pacing `stt` includes waiting for the audio to arrive, which puts the ratio above 1 and makes it a measure of something else.
 - Response length varies enough between runs to hide whatever is under test: `llm_eval`, `tts_total` and `e2e_response_ready` all scale with it. The default `llm-temperature: 0` removes that variance, so a run repeats exactly; raising it needs an `llm-seed` to stay reproducible. `ttfa` and `stt_endpoint_delay` are unaffected either way, as both conclude before the response length is known.
 - Greedy decoding is not how the model would be run in production, so absolute `llm_eval`, `tts_total` and `e2e_response_ready` figures are not a forecast of live behaviour — they are a stable baseline for comparing one configuration against another. Sampling at a realistic temperature, with a seed, is a separate experiment.
@@ -1395,10 +1476,10 @@ the 0.33.3 upgrade — though `--swa-full` trades VRAM for it, which grows with
 
 | | |
 |---|---|
-| **What it measures** | The wall-clock span of the whole item, from the start of processing to the complete response. One definition in every mode: on file input it therefore includes delivering the audio, and on a microphone it covers the entire session. A span, not a latency — for latency use `ttfa`. |
+| **What it measures** | The wall-clock span of the whole item, from the start of processing to the complete response. On file input that includes delivering the audio, and on a microphone it covers the entire session. Under `--input-mode text` processing starts at the request, there being no speech to wait through, so the same stage covers a strictly smaller span — comparable across text-mode runs and not against file-mode ones, which is what `input_mode` in `RUN_CONTEXT_COLUMNS` enforces. Omitted entirely under `--asr-only`: with no LLM and no TTS beneath it, it would time the recognizer a second time. A span, not a latency — for latency use `ttfa`. |
 | **Measurement point** | `e2e_t0`, set before the workers start → after they have drained and the response WAVs are closed. |
 | **duration_ms** | Whole-item wall-clock time. |
-| **extra_json** | `input_duration_ms` – length of input audio; `output_duration_ms` – length of the surviving response audio, the same set of WAVs `tts_total` covers; `discarded_output_duration_ms` – length of the response audio a later utterance superseded, 0 on an item whose endpointer fired once. The superseded audio is timed and then deleted, so only the surviving reply is left on disk: what the wasted synthesis cost is on the row, the reply nobody heard is not kept. The discarded generation's *text* is not kept either, and audio without its text answers no question the text could not answer better; `output_wav` – path of the surviving response WAV; `output_wav_count` – response WAVs the item wrote, superseded ones included, so above one identifies a double fire even without the `stt` row; `full_text` – full text response of the LLM; `response_word_count`, `response_char_count` – size of the response; `llm_chunk_count` – number of sentence-level chunks. |
+| **extra_json** | `input_duration_ms` – length of input audio (ms); `stt_rtf` – `stt / input_duration` (a genuine real-time factor only under `fast` pacing; under `realtime` it exceeds 1 because the wait is included); `trailing_silence_ms` – gap between the end of speech and the end of the audio; `speech_end_source` – `metadata` where a `speech_end_ms` column supplied the anchor, `stt_word_timings` where the engine's own timings did; `endpoint_fire_count` – utterances the STT finalized, on every row so that a blank never has to be read as one. Above one is the endpointer calling the utterance over before the speaker had finished, which throws an answer away: 1.1% of the archived file-mode items. |
 
 ---
 
@@ -1416,3 +1497,4 @@ the 0.33.3 upgrade — though `--swa-full` trades VRAM for it, which grows with
 | `tokens_per_sec ≈ eval_tokens / (llm_eval / 1000)` | ✅ By definition |
 | `stt_rtf = stt / input_duration_ms` | ✅ By definition — but only a real-time factor under `fast` pacing |
 | `ttfa` and `stt_endpoint_delay` present | ❌ Only under `realtime` pacing or mic input, and only when something located the end of speech — the metadata's `speech_end_ms` or the engine's word timings |
+| `ttfa` present under `--input-mode text` | ❌ Never, nor is `stt` or `stt_endpoint_delay`: nothing spoke, so no instant exists to measure from. Reconstruct it as the sum above, using `stt_endpoint_delay` from the `--asr-only` pass over the same recordings |
