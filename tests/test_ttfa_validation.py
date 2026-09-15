@@ -68,11 +68,36 @@ class StratifiedPickTest(unittest.TestCase):
         for band in bands:
             self.assertTrue(set(band) & set(chosen), f"band {band} unrepresented")
 
-    def test_the_hardest_recording_is_always_in(self):
-        """The case the experiment exists to cover cannot be left to the draw."""
+    def test_nothing_is_forced_in_by_default(self):
+        """The hardest recording takes its chances like any other."""
+        misses = [seed for seed in range(25)
+                  if HARDEST not in val.stratified_pick(KEYS, wanted=3, strata=3, seed=seed)[0]]
+        self.assertTrue(misses, "the hardest recording was in every draw")
+
+    def test_by_default_no_recording_is_favoured(self):
+        draws = 3000
+        counts = dict.fromkeys(KEYS, 0)
+        for seed in range(draws):
+            for name in val.stratified_pick(KEYS, wanted=3, strata=3, seed=seed)[0]:
+                counts[name] += 1
+        for name, count in counts.items():          # one drawn from each band of four
+            self.assertAlmostEqual(count / draws, 1 / 4, delta=0.04, msg=name)
+
+    def test_force_hardest_puts_the_hardest_recording_in(self):
+        """The opt-in for when chance must not drop the one case to cover."""
         for seed in range(25):
-            chosen, _ = val.stratified_pick(KEYS, wanted=3, strata=3, seed=seed)
+            chosen, _ = val.stratified_pick(KEYS, wanted=3, strata=3, seed=seed,
+                                            force_hardest=True)
             self.assertIn(HARDEST, chosen, f"seed {seed} dropped the hardest item")
+
+    def test_forcing_changes_nothing_but_the_swap(self):
+        """Same seed, same draw: the option only trades the easiest item for the hardest."""
+        for seed in range(25):
+            plain, _ = val.stratified_pick(KEYS, wanted=3, strata=3, seed=seed)
+            forced, _ = val.stratified_pick(KEYS, wanted=3, strata=3, seed=seed,
+                                            force_hardest=True)
+            expected = plain if HARDEST in plain else plain[1:] + [HARDEST]
+            self.assertEqual(forced, expected, f"seed {seed}")
 
     def test_the_draw_is_reproducible_and_seed_dependent(self):
         first = val.stratified_pick(KEYS, wanted=6, strata=3, seed=7)[0]
@@ -102,7 +127,7 @@ class WarmupRecordingTest(unittest.TestCase):
         pool = {name: key for name, key in KEYS.items() if name != warmup}
         chosen, _ = val.stratified_pick(pool, wanted=3, strata=3, seed=1)
         self.assertNotIn(warmup, chosen)
-        self.assertIn(HARDEST, chosen)
+        self.assertEqual(len(chosen), 3)
 
     def test_the_subset_folder_puts_it_ahead_of_every_chosen_item(self):
         tmp = tempfile.mkdtemp(prefix="ttfa-val-warm-")
@@ -119,7 +144,7 @@ class WarmupRecordingTest(unittest.TestCase):
 
 
 class RandomPickTest(unittest.TestCase):
-    """A simple random sample: the design that cannot be said to have chosen."""
+    """A simple random sample: no bands, no key, and no way to force anything in."""
 
     POOL = sorted(KEYS)[1:]          # the warm-up already taken out: 11 recordings
 
@@ -138,7 +163,7 @@ class RandomPickTest(unittest.TestCase):
         self.assertGreater(len(others), 1)
 
     def test_nothing_is_forced_in(self):
-        """Unlike the stratified pick, the hardest recording takes its chances."""
+        """With no swap to opt into, the hardest recording always takes its chances."""
         misses = [seed for seed in range(25)
                   if HARDEST not in val.random_pick(self.POOL, wanted=3, seed=seed)]
         self.assertTrue(misses, "the hardest recording was in every draw")
@@ -318,6 +343,31 @@ class PlannedCommandsTest(unittest.TestCase):
     def test_stratified_sampling_still_insists_on_its_key(self):
         with self.assertRaises(SystemExit):
             self.plan("--key-column", "no_such_column")
+
+    def test_stratified_sampling_forces_nothing_in_unless_asked(self):
+        _, plain = self.plan()
+        self.assertIn("nothing forced in", plain)
+        _, forced = self.plan("--force-hardest")
+        self.assertIn("the hardest one forced in if the draw missed it", forced)
+
+    def test_random_sampling_refuses_force_hardest(self):
+        with self.assertRaises(SystemExit):
+            self.plan("--sampling", "random", "--force-hardest")
+
+    def test_a_stratified_subset_records_whether_it_forced(self):
+        for forced in (False, True):
+            out_dir = os.path.join(self.tmp, f"forced-{forced}")
+            flags = ["--force-hardest"] if forced else []
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = val.main(self.argv(out_dir, "--items", "3", "--stop-after", "subset",
+                                          *flags))
+            self.assertEqual(code, 0)
+            with open(os.path.join(out_dir, "subset.json"), encoding="utf-8") as handle:
+                record = json.load(handle)
+            self.assertEqual(record["sampling"], "stratified")
+            self.assertIs(record["force_hardest"], forced)
+            if forced:
+                self.assertIn(HARDEST, record["items"])
 
     def test_a_random_subset_records_how_it_was_drawn(self):
         with contextlib.redirect_stdout(io.StringIO()):

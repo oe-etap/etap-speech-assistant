@@ -26,17 +26,21 @@ nothing to overlap, and an item it worries over leaves the most. The default
 key is `max_internal_pause_ms` from the corpus metadata, which
 `validate_metadata.py` already reports under exactly that description; pass
 `--key-from-asr` instead once a real ASR pass exists, since a measured
-`stt_endpoint_delay` beats a proxy for it.
+`stt_endpoint_delay` beats a proxy for it. Within each band the draw is random
+and nothing is forced in, so the subset is still a random sample -- one whose
+share of every band is fixed instead of left to chance. `--force-hardest`
+swaps the hardest recording in for the easiest one drawn whenever the draw
+missed it. It is off by default: a subset built to contain a particular
+recording looks selected, whatever the motive.
 
 `--sampling random` draws a simple random sample instead: `--items` recordings
-out of the whole corpus, each one equally likely, no bands and nothing forced
-in. It answers a different question -- how well the reconstruction holds on
-this corpus, rather than where it strains -- and it is the one design that
-cannot be read as having chosen its items: a subset built to contain hard
-recordings looks selected, whatever the motive. The price is that rare cases
-arrive only by chance. Under either design the subset phase prints the draw's
-distribution beside the pool's and keeps it in `subset.json`, so how
-representative the sample came out is on the record rather than assumed.
+out of the whole corpus, each one equally likely, with no bands and no key
+needed. It is the simpler design to explain; the price is that how the draw
+falls across the key is left to chance too. Without `--force-hardest`, rare
+cases arrive only by chance under both designs; either way the subset phase
+prints the draw's distribution beside the pool's and keeps it in
+`subset.json`, so how representative the sample came out is on the record
+rather than assumed.
 
 Cells are named, never discovered: "2-3 LLM configurations spanning the size
 range" is a judgement about the model lineup, not something a script should
@@ -192,15 +196,21 @@ def pick_warmup(keys):
     return min(keys) if keys else None
 
 
-def stratified_pick(keys, wanted, strata, seed):
+def stratified_pick(keys, wanted, strata, seed, force_hardest=False):
     """`wanted` items spread evenly over `strata` bands of the hardness key.
 
     Equal-count bands rather than equal-width ones: the key is heavy-tailed,
     so equal-width bands would put almost everything in the first one and
-    leave the hard band a lottery. The remainder goes to the harder bands,
-    and the single hardest recording is forced in if the draw missed it --
-    with a small corpus the top band is thin enough that chance can drop the
-    one case the experiment exists to cover.
+    leave the hard band a lottery. The remainder goes to the harder bands.
+    Each band's share is a random draw from it, so within a band no recording
+    is likelier than another.
+
+    `force_hardest` swaps the single hardest recording in for the easiest one
+    drawn if the draw missed it -- with a small corpus the top band is thin
+    enough that chance can drop the one case the experiment exists to cover.
+    It is off by default because it turns a sample into a selection: a
+    recording placed in the subset on purpose reads as chosen, whatever the
+    motive.
     """
     if not keys:
         die("no items carry the hardness key")
@@ -226,7 +236,7 @@ def stratified_pick(keys, wanted, strata, seed):
         chosen.extend(pool[:quota])
 
     hardest = ordered[-1]
-    if hardest not in chosen and chosen:
+    if force_hardest and hardest not in chosen and chosen:
         chosen.sort(key=lambda name: (keys[name], name))
         chosen[0] = hardest
 
@@ -384,12 +394,18 @@ def main(argv=None):
                         help="How many recordings the subset holds (default: 12).")
     parser.add_argument("--sampling", choices=SAMPLING_DESIGNS, default="stratified",
                         help="How the subset is drawn. 'stratified' (default) spreads "
-                             "--items over --strata equal-count bands of the hardness key "
-                             "and forces the hardest recording in; 'random' is a simple "
-                             "random sample of the whole corpus with nothing forced in.")
+                             "--items over --strata equal-count bands of the hardness key, "
+                             "drawn at random within each band; 'random' is a simple random "
+                             "sample of the whole corpus. Neither forces anything in by "
+                             "default.")
     parser.add_argument("--strata", type=int, default=3,
                         help="Equal-count bands of the hardness key to spread them over "
                              "(default: 3). Ignored by --sampling random.")
+    parser.add_argument("--force-hardest", action="store_true",
+                        help="Stratified sampling only: if the draw missed the hardest "
+                             "recording, swap it in for the easiest one drawn. Off by "
+                             "default, because a subset with a recording placed in it is a "
+                             "selection rather than a sample.")
     parser.add_argument("--key-column", default=DEFAULT_KEY_COLUMN,
                         help=f"metadata.csv column to stratify on (default: "
                              f"{DEFAULT_KEY_COLUMN}). Under --sampling random it is only "
@@ -414,6 +430,10 @@ def main(argv=None):
 
     if args.items < 1 or args.replicates < 1:
         die("--items and --replicates must both be at least 1")
+    if args.force_hardest and args.sampling != "stratified":
+        # Refused rather than ignored: whoever passes it expects the hardest
+        # recording in the subset, and a random draw would quietly not deliver it.
+        die("--force-hardest only applies to --sampling stratified")
 
     subset_dir = os.path.join(args.out_dir, "subset")
     asr_root = os.path.join(args.out_dir, "asr")
@@ -453,8 +473,12 @@ def main(argv=None):
         warmup = pick_warmup(keys)
         pool = [name for name in keys if name != warmup]
         chosen, bands = stratified_pick({name: keys[name] for name in pool},
-                                        args.items, args.strata, args.seed)
-        print(f"[INFO] stratified on {key_name} over {len(pool)} candidate recordings")
+                                        args.items, args.strata, args.seed,
+                                        force_hardest=args.force_hardest)
+        forcing = ("the hardest one forced in if the draw missed it" if args.force_hardest
+                   else "nothing forced in")
+        print(f"[INFO] stratified on {key_name} over {len(pool)} candidate recordings, "
+              f"seed {args.seed}, {forcing}")
         for index, band in enumerate(bands, start=1):
             taken = [name for name in chosen if name in band]
             print(f"  band {index}: key {keys[band[0]]:.0f}..{keys[band[-1]]:.0f} ms, "
@@ -469,11 +493,12 @@ def main(argv=None):
     summary = distribution_summary(chosen, pool, series)
     print_distribution_summary(summary)
 
-    if (args.sampling == "stratified" and chosen and warmup is not None
+    if (args.force_hardest and chosen and warmup is not None
             and keys[warmup] > max(keys[name] for name in chosen)):
-        # Sort order and hardness are unrelated, so this is chance rather
-        # than a rule -- but when it happens the hard end of the stratification
-        # is gone and nothing downstream would say so.
+        # Only a forced draw promises the hardest recording, so only a forced
+        # draw can lose it. Sort order and hardness are unrelated, so this is
+        # chance rather than a rule -- but when it happens the recording the
+        # forcing exists for is gone and nothing downstream would say so.
         print(f"[WARN] {warmup} sorts first and is also the hardest recording "
               f"({keys[warmup]:.0f} ms); the warm-up exclusion will spend it. Rename "
               "it, or draw from a corpus whose first-sorting recording is easier.",
@@ -486,6 +511,7 @@ def main(argv=None):
         with open(os.path.join(args.out_dir, "subset.json"), "w", encoding="utf-8") as handle:
             json.dump({"sampling": args.sampling, "key": key_name, "seed": args.seed,
                        "strata": args.strata if args.sampling == "stratified" else None,
+                       "force_hardest": args.force_hardest,
                        "warmup_item": warmup,
                        "items": {name: keys.get(name) for name in chosen},
                        "distribution": summary},
