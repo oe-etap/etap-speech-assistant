@@ -35,3 +35,11 @@ file-name;out-dir;ollama-model;stt-engine;whisper-device;llm-temperature;seed
 34-gemma3_4b_it_q4_K_M-t0_0-whisper-gpu.yaml;34-gemma3_4b_it_q4_K_M-t0_0-whisper-gpu;gemma3:4b-it-q4_K_M;whisper;cuda;0;null
 35-gemma3_27b_it_q4_K_M-t0_0-whisper-gpu.yaml;35-gemma3_27b_it_q4_K_M-t0_0-whisper-gpu;gemma3:27b-it-q4_K_M;whisper;cuda;0;null
 36-qwen2_5_32b_instruct_q4_K_M-t0_0-whisper-gpu.yaml;36-qwen2_5_32b_instruct_q4_K_M-t0_0-whisper-gpu;qwen2.5:32b-instruct-q4_K_M;whisper;cuda;0;null
+37-qwen2_5_7b_instruct_q8_0-t0_0-vosk_cpu.yaml;37-qwen2_5_7b_instruct_q8_0-t0_0-vosk_cpu;qwen2.5:7b-instruct-q8_0;vosk;cuda;0;null
+38-qwen2_5_7b_instruct_fp16-t0_0-vosk_cpu.yaml;38-qwen2_5_7b_instruct_fp16-t0_0-vosk_cpu;qwen2.5:7b-instruct-fp16;vosk;cuda;0;null
+39-gemma3_4b_it_q8_0-t0_0-vosk_cpu.yaml;39-gemma3_4b_it_q8_0-t0_0-vosk_cpu;gemma3:4b-it-q8_0;vosk;cuda;0;null
+40-gemma3_4b_it_fp16-t0_0-vosk_cpu.yaml;40-gemma3_4b_it_fp16-t0_0-vosk_cpu;gemma3:4b-it-fp16;vosk;cuda;0;null
+41-qwen2_5_7b_instruct_q8_0-t0_0-whisper-gpu.yaml;41-qwen2_5_7b_instruct_q8_0-t0_0-whisper-gpu;qwen2.5:7b-instruct-q8_0;whisper;cuda;0;null
+42-qwen2_5_7b_instruct_fp16-t0_0-whisper-gpu.yaml;42-qwen2_5_7b_instruct_fp16-t0_0-whisper-gpu;qwen2.5:7b-instruct-fp16;whisper;cuda;0;null
+43-gemma3_4b_it_q8_0-t0_0-whisper-gpu.yaml;43-gemma3_4b_it_q8_0-t0_0-whisper-gpu;gemma3:4b-it-q8_0;whisper;cuda;0;null
+44-gemma3_4b_it_fp16-t0_0-whisper-gpu.yaml;44-gemma3_4b_it_fp16-t0_0-whisper-gpu;gemma3:4b-it-fp16;whisper;cuda;0;null
