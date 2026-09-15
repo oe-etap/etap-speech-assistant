@@ -20,6 +20,7 @@ Run:  python -m unittest discover -s tests -v
 import csv
 import io
 import contextlib
+import json
 import os
 import sys
 import tempfile
@@ -67,11 +68,36 @@ class StratifiedPickTest(unittest.TestCase):
         for band in bands:
             self.assertTrue(set(band) & set(chosen), f"band {band} unrepresented")
 
-    def test_the_hardest_recording_is_always_in(self):
-        """The case the experiment exists to cover cannot be left to the draw."""
+    def test_nothing_is_forced_in_by_default(self):
+        """The hardest recording takes its chances like any other."""
+        misses = [seed for seed in range(25)
+                  if HARDEST not in val.stratified_pick(KEYS, wanted=3, strata=3, seed=seed)[0]]
+        self.assertTrue(misses, "the hardest recording was in every draw")
+
+    def test_by_default_no_recording_is_favoured(self):
+        draws = 3000
+        counts = dict.fromkeys(KEYS, 0)
+        for seed in range(draws):
+            for name in val.stratified_pick(KEYS, wanted=3, strata=3, seed=seed)[0]:
+                counts[name] += 1
+        for name, count in counts.items():          # one drawn from each band of four
+            self.assertAlmostEqual(count / draws, 1 / 4, delta=0.04, msg=name)
+
+    def test_force_hardest_puts_the_hardest_recording_in(self):
+        """The opt-in for when chance must not drop the one case to cover."""
         for seed in range(25):
-            chosen, _ = val.stratified_pick(KEYS, wanted=3, strata=3, seed=seed)
+            chosen, _ = val.stratified_pick(KEYS, wanted=3, strata=3, seed=seed,
+                                            force_hardest=True)
             self.assertIn(HARDEST, chosen, f"seed {seed} dropped the hardest item")
+
+    def test_forcing_changes_nothing_but_the_swap(self):
+        """Same seed, same draw: the option only trades the easiest item for the hardest."""
+        for seed in range(25):
+            plain, _ = val.stratified_pick(KEYS, wanted=3, strata=3, seed=seed)
+            forced, _ = val.stratified_pick(KEYS, wanted=3, strata=3, seed=seed,
+                                            force_hardest=True)
+            expected = plain if HARDEST in plain else plain[1:] + [HARDEST]
+            self.assertEqual(forced, expected, f"seed {seed}")
 
     def test_the_draw_is_reproducible_and_seed_dependent(self):
         first = val.stratified_pick(KEYS, wanted=6, strata=3, seed=7)[0]
@@ -101,7 +127,7 @@ class WarmupRecordingTest(unittest.TestCase):
         pool = {name: key for name, key in KEYS.items() if name != warmup}
         chosen, _ = val.stratified_pick(pool, wanted=3, strata=3, seed=1)
         self.assertNotIn(warmup, chosen)
-        self.assertIn(HARDEST, chosen)
+        self.assertEqual(len(chosen), 3)
 
     def test_the_subset_folder_puts_it_ahead_of_every_chosen_item(self):
         tmp = tempfile.mkdtemp(prefix="ttfa-val-warm-")
@@ -115,6 +141,64 @@ class WarmupRecordingTest(unittest.TestCase):
         present = sorted(name for name in os.listdir(dest) if name.endswith(".wav"))
         self.assertEqual(present[0], warmup)
         self.assertEqual(len(present), len(chosen) + 1)
+
+
+class RandomPickTest(unittest.TestCase):
+    """A simple random sample: no bands, no key, and no way to force anything in."""
+
+    POOL = sorted(KEYS)[1:]          # the warm-up already taken out: 11 recordings
+
+    def test_the_draw_has_the_asked_size_and_stays_in_the_pool(self):
+        chosen = val.random_pick(self.POOL, wanted=5, seed=3)
+        self.assertEqual(len(chosen), 5)
+        self.assertEqual(len(set(chosen)), 5)
+        self.assertLessEqual(set(chosen), set(self.POOL))
+
+    def test_the_draw_is_reproducible_and_seed_dependent(self):
+        first = val.random_pick(self.POOL, wanted=5, seed=7)
+        self.assertEqual(first, val.random_pick(self.POOL, wanted=5, seed=7))
+        self.assertEqual(first, val.random_pick(list(reversed(self.POOL)), wanted=5, seed=7),
+                         "the order the caller gathered the names in must not matter")
+        others = {tuple(val.random_pick(self.POOL, wanted=5, seed=s)) for s in range(1, 12)}
+        self.assertGreater(len(others), 1)
+
+    def test_nothing_is_forced_in(self):
+        """With no swap to opt into, the hardest recording always takes its chances."""
+        misses = [seed for seed in range(25)
+                  if HARDEST not in val.random_pick(self.POOL, wanted=3, seed=seed)]
+        self.assertTrue(misses, "the hardest recording was in every draw")
+
+    def test_no_recording_is_favoured(self):
+        draws, wanted = 3000, 3
+        counts = dict.fromkeys(self.POOL, 0)
+        for seed in range(draws):
+            for name in val.random_pick(self.POOL, wanted=wanted, seed=seed):
+                counts[name] += 1
+        expected = wanted / len(self.POOL)
+        for name, count in counts.items():
+            self.assertAlmostEqual(count / draws, expected, delta=0.04, msg=name)
+
+    def test_asking_for_more_than_there_is_takes_everything(self):
+        self.assertEqual(val.random_pick(self.POOL, wanted=99, seed=1), self.POOL)
+
+
+class DistributionSummaryTest(unittest.TestCase):
+
+    def test_the_draw_and_the_pool_side_by_side(self):
+        values = {f"{index:02d}.wav": float(index) for index in range(1, 11)}
+        summary = val.distribution_summary(["01.wav", "10.wav"], sorted(values), {"x": values})
+        self.assertEqual(summary["x"]["corpus"]["n"], 10)
+        self.assertEqual(summary["x"]["subset"]["n"], 2)
+        self.assertEqual(summary["x"]["corpus"]["quantiles"][0], 1.0)
+        self.assertEqual(summary["x"]["corpus"]["quantiles"][-1], 10.0)
+        self.assertEqual(summary["x"]["subset"]["quantiles"][3], 5.5)
+
+    def test_a_missing_value_is_left_out_not_counted_as_zero(self):
+        summary = val.distribution_summary(["a.wav", "b.wav"], ["a.wav", "b.wav", "c.wav"],
+                                           {"x": {"a.wav": 4.0, "c.wav": 6.0}})
+        self.assertEqual(summary["x"]["corpus"]["n"], 2)
+        self.assertEqual(summary["x"]["subset"]["n"], 1)
+        self.assertEqual(summary["x"]["subset"]["quantiles"][0], 4.0)
 
 
 class SubsetFolderTest(unittest.TestCase):
@@ -231,6 +315,76 @@ class PlannedCommandsTest(unittest.TestCase):
     def test_a_dry_run_writes_no_subset(self):
         self.plan()
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "subset")))
+
+    def argv(self, out_dir, *extra):
+        return ["--out-dir", out_dir, "--audio-dir", self.audio,
+                "--cells", "17-small", "21-large",
+                "--configs-dir", os.path.join(self.tmp, "configs"),
+                "--seed", "5"] + list(extra)
+
+    def test_a_dry_run_creates_no_output_directory(self):
+        out_dir = os.path.join(self.tmp, "not-yet")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(val.main(self.argv(out_dir, "--items", "6", "--dry-run")), 0)
+        self.assertFalse(os.path.exists(out_dir))
+
+    def test_random_sampling_draws_without_bands_or_forcing(self):
+        code, out = self.plan("--sampling", "random")
+        self.assertEqual(code, 0)
+        self.assertIn("simple random sample: 6 of 11 recordings", out)
+        self.assertNotIn("band ", out)
+        self.assertIn(f"plus {sorted(KEYS)[0]} first", out)
+
+    def test_random_sampling_needs_no_hardness_key(self):
+        code, out = self.plan("--sampling", "random", "--key-column", "no_such_column")
+        self.assertEqual(code, 0)
+        self.assertIn("duration_ms", out)
+
+    def test_stratified_sampling_still_insists_on_its_key(self):
+        with self.assertRaises(SystemExit):
+            self.plan("--key-column", "no_such_column")
+
+    def test_stratified_sampling_forces_nothing_in_unless_asked(self):
+        _, plain = self.plan()
+        self.assertIn("nothing forced in", plain)
+        _, forced = self.plan("--force-hardest")
+        self.assertIn("the hardest one forced in if the draw missed it", forced)
+
+    def test_random_sampling_refuses_force_hardest(self):
+        with self.assertRaises(SystemExit):
+            self.plan("--sampling", "random", "--force-hardest")
+
+    def test_a_stratified_subset_records_whether_it_forced(self):
+        for forced in (False, True):
+            out_dir = os.path.join(self.tmp, f"forced-{forced}")
+            flags = ["--force-hardest"] if forced else []
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = val.main(self.argv(out_dir, "--items", "3", "--stop-after", "subset",
+                                          *flags))
+            self.assertEqual(code, 0)
+            with open(os.path.join(out_dir, "subset.json"), encoding="utf-8") as handle:
+                record = json.load(handle)
+            self.assertEqual(record["sampling"], "stratified")
+            self.assertIs(record["force_hardest"], forced)
+            if forced:
+                self.assertIn(HARDEST, record["items"])
+
+    def test_a_random_subset_records_how_it_was_drawn(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = val.main(self.argv(self.tmp, "--sampling", "random", "--items", "4",
+                                      "--stop-after", "subset"))
+        self.assertEqual(code, 0)
+        with open(os.path.join(self.tmp, "subset.json"), encoding="utf-8") as handle:
+            record = json.load(handle)
+        self.assertEqual(record["sampling"], "random")
+        self.assertIsNone(record["strata"])
+        self.assertEqual(len(record["items"]), 4)
+        self.assertEqual(record["distribution"]["duration_ms"]["subset"]["n"], 4)
+        wavs = sorted(name for name in os.listdir(os.path.join(self.tmp, "subset"))
+                      if name.endswith(".wav"))
+        self.assertEqual(len(wavs), 5)
+        self.assertEqual(wavs[0], record["warmup_item"])
+        self.assertEqual(self.commands, [])
 
 
 def _rmtree(path):
