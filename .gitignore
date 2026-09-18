@@ -9,7 +9,8 @@ env/
 outputs/
 .latency/
 .DS_Store
-audios/
+audios/*
+!audios/heyval/metadata.csv
 vosk/
 piper/
 prompts/
