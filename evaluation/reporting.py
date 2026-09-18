@@ -668,10 +668,13 @@ def _caveats(sections: _Sections) -> List[str]:
         "Zheng et al. (2023) document",
         "position, verbosity and self-preference bias in LLM judges, and a small "
         "local judge is weaker",
-        "than the models those results were obtained with. Do not report a judge "
-        "mean as a quality",
-        "estimate until it has been calibrated against human ratings on a "
-        "subsample of this dataset.",
+        "than the models those results were obtained with. Human calibration "
+        "(Tier 4) and MOS /",
+        "listening tests were not collected on this campaign. Report rank order "
+        "and agreement with",
+        "verifiable metrics; do not treat the mean as an absolute quality "
+        "percentage, a MOS",
+        "substitute, or a calibrated instrument.",
         "",
         "Self-consistency scores use a token-overlap support kernel by default, "
         "not the BERTScore, NLI",

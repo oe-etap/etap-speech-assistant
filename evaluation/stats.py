@@ -512,6 +512,111 @@ def _rank(values: Sequence[float]) -> List[float]:
     return ranks
 
 
+@dataclass
+class BlandAltmanResult:
+    """Agreement between two measurement methods on the same items.
+
+    Bland and Altman (1986): plot (and report) the difference against the mean,
+    with the mean difference (bias) and the 95% limits of agreement
+    (bias ± 1.96 SD of the differences). A correlation between the two methods
+    is not evidence of agreement, which is why this is the figure used to
+    decide whether a reconstructed TTFA can stand in for a measured one.
+
+    Status: validated (published sampling theory for method comparison).
+    """
+
+    n: int
+    bias: Optional[float] = None
+    sd_diff: Optional[float] = None
+    loa_low: Optional[float] = None
+    loa_high: Optional[float] = None
+    mae: Optional[float] = None
+    rmse: Optional[float] = None
+    spearman: Optional[float] = None
+    within_5ms: Optional[float] = None
+    within_50ms: Optional[float] = None
+    within_100ms: Optional[float] = None
+
+    def as_dict(self) -> Dict[str, Optional[float]]:
+        return {
+            "n": self.n,
+            "bias": _r(self.bias, 2),
+            "sd_diff": _r(self.sd_diff, 2),
+            "loa_low": _r(self.loa_low, 2),
+            "loa_high": _r(self.loa_high, 2),
+            "mae": _r(self.mae, 2),
+            "rmse": _r(self.rmse, 2),
+            "spearman": _r(self.spearman),
+            "pct_within_5ms": _r(self.within_5ms),
+            "pct_within_50ms": _r(self.within_50ms),
+            "pct_within_100ms": _r(self.within_100ms),
+        }
+
+
+def bland_altman(method_a: Sequence[float], method_b: Sequence[float]
+                 ) -> BlandAltmanResult:
+    """Bland-Altman agreement of two paired measurements.
+
+    `method_a` is the candidate (reconstructed), `method_b` the reference
+    (measured). Bias is mean(b - a): a positive bias means the candidate
+    underestimates the reference. Pairs with a missing value on either side
+    are dropped.
+    """
+    pairs = []
+    for left, right in zip(method_a, method_b):
+        try:
+            a, b = float(left), float(right)
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(a) or math.isnan(b):
+            continue
+        pairs.append((a, b))
+    if not pairs:
+        return BlandAltmanResult(n=0)
+
+    diffs = [b - a for a, b in pairs]
+    abs_diffs = [abs(d) for d in diffs]
+    bias = statistics.fmean(diffs)
+    sd = statistics.stdev(diffs) if len(diffs) > 1 else 0.0
+    return BlandAltmanResult(
+        n=len(pairs),
+        bias=bias,
+        sd_diff=sd,
+        loa_low=bias - 1.96 * sd,
+        loa_high=bias + 1.96 * sd,
+        mae=statistics.fmean(abs_diffs),
+        rmse=math.sqrt(statistics.fmean(d * d for d in diffs)),
+        spearman=spearman([a for a, _ in pairs], [b for _, b in pairs]),
+        within_5ms=sum(1 for d in abs_diffs if d <= 5.0) / len(abs_diffs),
+        within_50ms=sum(1 for d in abs_diffs if d <= 50.0) / len(abs_diffs),
+        within_100ms=sum(1 for d in abs_diffs if d <= 100.0) / len(abs_diffs),
+    )
+
+
+def sign_agreement(values: Sequence[float]) -> Optional[float]:
+    """Share of values that share the majority sign, ignoring exact zeros.
+
+    Used to summarise whether independent launches of the same contrast agree
+    on the direction of an effect. Three launches that all move the same way
+    give 1.0; a 2-1 split gives 2/3. Not a p-value: with k=3 launches a sign
+    test has no useful power, so this is a descriptive replication check
+    (Tukey, 1977, exploratory data analysis: look at the signs first).
+    """
+    signs = []
+    for value in values:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(number) or number == 0.0:
+            continue
+        signs.append(1 if number > 0 else -1)
+    if not signs:
+        return None
+    majority = max(signs.count(1), signs.count(-1))
+    return majority / len(signs)
+
+
 def _pearson(x: Sequence[float], y: Sequence[float]) -> Optional[float]:
     n = len(x)
     if n < 2:
@@ -539,3 +644,6 @@ REFERENCE_KEYS = ["bootstrap", "cliffs_delta", "tost", "holm"]
 # carry references to tests it never performed.
 PAIRED_REFERENCE_KEYS = ["bootstrap", "cliffs_delta", "tost", "holm",
                          "wilcoxon", "mcnemar"]
+
+# Cited when independent launches of the same cell are summarised together.
+REPLICATE_REFERENCE_KEYS = ["icc_shrout", "icc_koo", "bland_altman"]

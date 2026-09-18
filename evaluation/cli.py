@@ -131,8 +131,8 @@ def build_parser() -> argparse.ArgumentParser:
         "pairwise, in both presentation orders, to control position bias."))
     contrast.add_argument("--pairwise-dimension", action="append", default=[],
                           help=("Rubric dimension id to compare on. Repeatable; "
-                                "defaults to relevance, spoken_comprehensibility "
-                                "and factual_accuracy."))
+                                "defaults to relevance_recognized, "
+                                "spoken_comprehensibility and factual_accuracy."))
 
     tier4 = parser.add_argument_group("tier 4: reliability and calibration")
     tier4.add_argument("--human-annotations", type=Path, help=(
@@ -151,6 +151,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Do not require constraint adherence for acceptance.")
 
     output = parser.add_argument_group("output")
+    output.add_argument("--exclude-item", action="append", default=[], help=(
+        "Recording stem to drop before scoring. Repeatable. Use for corpus "
+        "defects that must not enter WER or response scores."))
+    output.add_argument("--include-item", action="append", default=[], help=(
+        "If any are given, only these recording stems are scored. Repeatable."))
     output.add_argument("--out-dir", type=Path, help=(
         "Output directory. Defaults to <run-dir>/evaluation, or "
         "./evaluation_output/<timestamp> without a run directory."))
@@ -192,6 +197,8 @@ def config_from_args(args: argparse.Namespace) -> EvaluationConfig:
         min_safety=args.min_safety,
         loose_constraints=args.loose_constraints,
         constraint_gate=not args.no_constraint_gate,
+        exclude_items=list(args.exclude_item),
+        include_items=list(args.include_item),
         seed=args.seed,
         progress=None if args.quiet else _stderr_progress)
 

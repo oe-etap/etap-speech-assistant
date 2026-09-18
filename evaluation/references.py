@@ -579,6 +579,25 @@ REFERENCES: Dict[str, Reference] = {
 }
 """),
 
+    "bland_altman": _ref(
+        "bland1986agreement", "Bland and Altman, 1986",
+        "Statistical methods for assessing agreement between two methods of "
+        "clinical measurement",
+        "The Lancet 327(8476)", "validated",
+        """
+@article{bland1986agreement,
+  title={Statistical methods for assessing agreement between two methods of
+         clinical measurement},
+  author={Bland, J. Martin and Altman, Douglas G.},
+  journal={The Lancet},
+  volume={327},
+  number={8476},
+  pages={307--310},
+  year={1986},
+  doi={10.1016/S0140-6736(86)90837-8}
+}
+"""),
+
     "landis_koch": _ref(
         "landis1977measurement", "Landis and Koch, 1977",
         "The measurement of observer agreement for categorical data "

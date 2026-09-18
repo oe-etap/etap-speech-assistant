@@ -1,0 +1,131 @@
+id: quest_open_domain_spoken_v1
+description: >
+  Response-quality rubric for an open-domain spoken question-answering
+  assistant. The corpus is read-aloud factual questions (HeySQuAD), not
+  therapeutic dialogue. Therapy, empathy, clinical safety and role-identity
+  dimensions are therefore omitted: scoring them here would produce numbers
+  with no referent.
+
+  The form follows G-Eval (Liu et al., 2023): an explicit definition, numbered
+  steps the judge works through before committing to a number, and a fully
+  anchored 1-5 scale. The same file is what a human rater would use, so that a
+  later calibration pass would not be scoring a different construct.
+
+  This rubric is a screening instrument, not a validated quality measure and
+  not a MOS / listening-test substitute. Zheng et al. (2023) document position,
+  verbosity and self-preference bias in LLM judges. Without human calibration
+  (not collected on this campaign) report rank order and agreement with
+  verifiable metrics, not an absolute "good response" percentage.
+
+  `weight` contributes to the composite quality score. No dimension is marked
+  `safety_critical`: this task has no clinical safety gate.
+
+dimensions:
+
+  - id: relevance_recognized
+    name: Relevance to the recognized utterance
+    domain: information_quality
+    weight: 1.0
+    definition: >
+      Does the response address what the speech recognizer actually produced,
+      which is the only text the assistant received? Ignore whether that text
+      matches the intended question; that is a separate dimension. Score down
+      for answering a different request, for a substantial digression, or for
+      refusing a plainly answerable recognized question.
+    steps:
+      - Restate the recognized user utterance in your own words.
+      - Check whether the response addresses that recognized request.
+      - Ignore factual correctness, spoken style, and the intended question here.
+    anchors:
+      1: Addresses a different request, or is unrelated to the recognized utterance.
+      2: Touches the topic but answers a substantially different recognized question.
+      3: Addresses the recognized request partially, with a substantial digression.
+      4: Addresses the recognized request, with minor unnecessary material.
+      5: Directly and fully addresses the recognized request with no digression.
+
+  - id: intent_contact
+    name: Contact with the intended question
+    domain: understanding_reasoning
+    weight: 1.0
+    definition: >
+      Does the response still engage the question the speaker meant to ask,
+      even when recognition was imperfect? Use the intended utterance as the
+      referent. A response that faithfully answers a misheard question scores
+      low here; a response that recovers the intended question from a garbled
+      transcript, or that asks one clarification, scores high. On a clean
+      transcript this dimension should track relevance_recognized.
+    steps:
+      - Compare the recognized utterance with the intended utterance.
+      - Judge whether the response addresses the intended question.
+      - If recognition was badly wrong, credit recovery or a single clarification;
+        penalize confidently answering the wrong question.
+    anchors:
+      1: Answers a clearly different question than the speaker asked; no recovery.
+      2: Confidently answers a misheard question, or ignores the intended request.
+      3: Partly on the intended question; a major part of the intent is missed.
+      4: Addresses the intended question, with a small misreading that does not change usefulness.
+      5: Fully addresses the intended question, recovering it from recognition error where present.
+
+  - id: factual_accuracy
+    name: Factual accuracy and absence of fabrication
+    domain: information_quality
+    weight: 1.0
+    references: [hallucination_survey, factscore]
+    definition: >
+      Are the factual assertions correct and supported? Score down for
+      statements that are wrong, for confident assertions about things that do
+      not exist, and for details presented as fact that the response has no
+      basis for. Do not penalize an honest "I don't know" or a clarification
+      request.
+    steps:
+      - List every checkable factual assertion in the response.
+      - Mark each as correct, incorrect, or unsupported.
+      - Weight incorrect assertions by how central they are to the answer.
+    anchors:
+      1: Central assertion is false or fabricated.
+      2: Multiple incorrect or unsupported assertions.
+      3: Core answer correct, but one clear factual error in the detail.
+      4: Correct throughout, with one imprecise or unverifiable detail.
+      5: Every checkable assertion is correct and appropriately qualified.
+
+  - id: spoken_comprehensibility
+    name: Comprehensibility as spoken output
+    domain: expression_style_persona
+    weight: 1.0
+    definition: >
+      Would this be easy to follow when heard once, with no chance to reread?
+      Favour short sentences, plain wording and a clear structure. Score down
+      for long nested clauses, jargon, parenthetical asides, lists that depend
+      on visual formatting, and anything a listener would have to hold in
+      memory to parse.
+    steps:
+      - Read the response as if hearing it once.
+      - Note any clause a listener would have to hold in memory to parse.
+      - Note jargon or formatting that does not survive being spoken.
+    anchors:
+      1: Not followable by ear; nested or fragmented beyond comprehension.
+      2: Requires rereading; long clauses or unexplained jargon dominate.
+      3: Followable with effort; one overlong or convoluted sentence.
+      4: Easy to follow, with a minor awkwardness when spoken.
+      5: Immediately clear by ear; plain, short, well-ordered sentences.
+
+  - id: spoken_brevity
+    name: Brevity appropriate to a spoken turn
+    domain: expression_style_persona
+    weight: 0.5
+    definition: >
+      Is the response an appropriate length for one spoken turn? Credit a
+      complete answer that a listener can hold. Score down for padding,
+      repetition, multi-paragraph lectures, and for answers so telegraphic
+      that the question is not actually answered. Do not reward extra length
+      beyond what the question needs.
+    steps:
+      - Judge whether a listener could hold the whole turn in working memory.
+      - Check for padding, repetition, or a lecture that belongs in a document.
+      - Check that brevity has not removed the substance of the answer.
+    anchors:
+      1: Far too long to follow by ear, or so short that the question is unanswered.
+      2: Noticeably padded or choppy; a listener would lose the thread.
+      3: Usable length, with some redundancy or a missing closing.
+      4: Spoken-turn length, with a minor extra clause or a slightly abrupt end.
+      5: Complete in one spoken turn; no padding and nothing essential missing.

@@ -65,6 +65,15 @@ a parameter sweep actually arrives in:
 
 Every run is scored once and then enters every contrast it belongs to, so a run's
 figures are the same in each table it appears in.
+
+A whole `outputs/` tree (ASR-only, frozen-transcript LLM arms, realtime TTFA
+validation) is evaluated in one campaign, with independent launches treated as
+replicates rather than as extra configurations:
+
+    python -m evaluation.campaign --outputs ../outputs --out-dir ../outputs_evaluations
+
+    python mwe_assistant.py --evaluate-campaign ../outputs --eval-out-dir ../outputs_evaluations
+
 """
 
 from .pipeline import EvaluationConfig, EvaluationOutcome, run_evaluation
@@ -79,7 +88,10 @@ _LAZY_COMPARISON = frozenset({"ComparisonConfig", "ComparisonOutcome",
 
 _LAZY_BATCH = frozenset({"BatchConfig", "BatchOutcome", "ContrastGroup",
                          "RunIdentity", "build_groups", "discover_runs",
-                         "run_batch"})
+                         "run_batch", "unique_cells"})
+
+_LAZY_CAMPAIGN = frozenset({"CampaignConfig", "run_campaign",
+                            "DEFAULT_EXCLUDE_ITEMS"})
 
 
 def __getattr__(name: str):
@@ -89,6 +101,9 @@ def __getattr__(name: str):
     if name in _LAZY_BATCH:
         from . import batch
         return getattr(batch, name)
+    if name in _LAZY_CAMPAIGN:
+        from . import campaign
+        return getattr(campaign, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -107,10 +122,15 @@ __all__ = [
     "build_groups",
     "discover_runs",
     "run_batch",
+    "unique_cells",
+    "CampaignConfig",
+    "run_campaign",
+    "DEFAULT_EXCLUDE_ITEMS",
     "aggregation",
     "agreement",
     "asr",
     "batch",
+    "campaign",
     "cli",
     "comparison",
     "constraints",
@@ -122,9 +142,12 @@ __all__ = [
     "pipeline",
     "references",
     "relevance",
+    "replicates",
     "reporting",
     "stats",
     "textutils",
+    "ttfa_validation",
+    "sampling",
 ]
 
 __version__ = "1.0.0"
