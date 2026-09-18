@@ -13,4 +13,5 @@ audios/*
 !audios/heyval/metadata.csv
 vosk/
 piper/
-prompts/
+prompts/*
+!prompts/short-opener.txt
