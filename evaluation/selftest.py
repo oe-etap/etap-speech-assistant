@@ -264,14 +264,14 @@ def test_json_recovery() -> None:
 
 
 def test_rubric_loads() -> None:
-    rubric = Rubric.load(
+    therapy = Rubric.load(
         __file__.replace("selftest.py", "rubrics/quest_therapy_v1.yaml"))
-    check(len(rubric.dimensions) >= 10,
-          f"rubric should define the full dimension set, got "
-          f"{len(rubric.dimensions)}")
-    check(len(rubric.safety_dimensions) >= 3,
-          "rubric must mark safety-critical dimensions for the gate")
-    for dimension in rubric.dimensions:
+    check(len(therapy.dimensions) >= 10,
+          f"therapy rubric should define the full dimension set, got "
+          f"{len(therapy.dimensions)}")
+    check(len(therapy.safety_dimensions) >= 3,
+          "therapy rubric must mark safety-critical dimensions for the gate")
+    for dimension in therapy.dimensions:
         check(set(dimension.anchors) == {1, 2, 3, 4, 5},
               f"dimension {dimension.dim_id} must anchor every scale point, "
               f"has {sorted(dimension.anchors)}")
@@ -282,10 +282,23 @@ def test_rubric_loads() -> None:
     # run reports empathy figures for questions that express nothing.
     smoke = Record(item_id="s", stt_text="hi", llm_text="Hello.",
                    category="open_domain_smoke_test")
-    empathy = next(d for d in rubric.dimensions
+    empathy = next(d for d in therapy.dimensions
                    if d.dim_id == "empathic_nonjudgmental")
     check(not empathy.applicable_to(smoke),
           "empathy must be skipped for open-domain smoke-test items")
+
+    spoken = Rubric.load(
+        __file__.replace("selftest.py", "rubrics/quest_open_domain_spoken_v1.yaml"))
+    ids = [d.dim_id for d in spoken.dimensions]
+    check(ids == ["relevance_recognized", "intent_contact", "factual_accuracy",
+                  "spoken_comprehensibility", "spoken_brevity"],
+          f"open-domain rubric dimensions drifted: {ids}")
+    check(not spoken.safety_dimensions,
+          "open-domain spoken QA has no clinical safety gate")
+    for dimension in spoken.dimensions:
+        check(set(dimension.anchors) == {1, 2, 3, 4, 5},
+              f"open-domain dimension {dimension.dim_id} must anchor every "
+              f"scale point, has {sorted(dimension.anchors)}")
 
 
 # --------------------------------------------------------------------------
@@ -803,6 +816,36 @@ def test_answer_key() -> None:
           "the unanswerable subset must report its own rate")
 
 
+def test_wrapped_excel_answer_key() -> None:
+    """Spreadsheet exports wrap each row in quotes and pad trailing semicolons."""
+    import tempfile
+    from pathlib import Path as _Path
+
+    from .loaders import load_answer_key
+
+    table = (
+        "id,filename,transcription,question,context,answer,is_impossible,"
+        "plausible_answers;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;\n"
+        '"12,00012.wav,what could be once his mother own,'
+        'What did Beyonce\'s mother own?,""A short passage."",salon,False,"'
+        ";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;\n"
+        '"30,00030.wav,what was one subject he never developed,'
+        'What did he never develop?,""Another passage."",,True,theology"'
+        ";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;\n")
+    with tempfile.TemporaryDirectory() as directory:
+        path = _Path(directory) / "wrapped.csv"
+        path.write_text(table, encoding="utf-8")
+        key = load_answer_key(path)
+
+    check(key["00012"]["reference_answers"] == ["salon"],
+          f"a wrapped answerable row must yield the gold span, got "
+          f"{key.get('00012')}")
+    check(key["00030"]["reference_answers"] == ["theology"]
+          and key["00030"]["answer_unsupported"] is True,
+          f"a wrapped unanswerable row must take the plausible span, got "
+          f"{key.get('00030')}")
+
+
 def test_word_error_rate() -> None:
     from .asr import (align, character_error_rate, content_recall,
                       evaluate_asr_fidelity, number_readings, stratum_of,
@@ -1302,6 +1345,156 @@ def test_recognizer_pairing_and_checks() -> None:
           f"a changed reference utterance must be reported, got {scoped}")
 
 
+def test_squad_answer_dicts_and_exclusions() -> None:
+    """HeySQuAD answers are JSON dicts; known-bad stems must drop out."""
+    import tempfile
+    from pathlib import Path as _Path
+
+    from .loaders import exclude_records, load_answer_key
+
+    table = (
+        "filename,question,answers,is_impossible,plausible_answers\n"
+        '57096c95200fba1400367fbe.wav,What band?,"[{""answer_start"": 24, '
+        '""text"": ""Ku band""}, {""answer_start"": 24, ""text"": ""Ku band""}]",'
+        "False,[]\n"
+        "5729e500af94a219006aa6b5.wav,Bad row?,\"[{""text"": ""nope""}]\","
+        "False,[]\n")
+    with tempfile.TemporaryDirectory() as directory:
+        path = _Path(directory) / "metadata.csv"
+        path.write_text(table, encoding="utf-8")
+        key = load_answer_key(path)
+
+    check(key["57096c95200fba1400367fbe"]["reference_answers"] == ["Ku band"],
+          f"SQuAD dict answers must yield the text field, got "
+          f"{key.get('57096c95200fba1400367fbe')}")
+
+    records = build_records([
+        {"filename": "57096c95200fba1400367fbe.wav", "stt_text": "what band",
+         "ori_text": "What band?", "llm_text": "The Ku band."},
+        {"filename": "5729e500af94a219006aa6b5.wav", "stt_text": "bad",
+         "ori_text": "Bad row?", "llm_text": "Nope."},
+    ], {}, answers=key)
+    kept = exclude_records(records, ["5729e500af94a219006aa6b5"])
+    check(len(kept) == 1 and kept[0].item_id == "57096c95200fba1400367fbe",
+          f"the mismatched recording must be dropped, got {[r.item_id for r in kept]}")
+
+
+def test_include_records_and_stratified_sample() -> None:
+    """Judge sample is a predeclared subset; allocation is largest-remainder."""
+    from .judge import RubricJudge
+    from .loaders import include_records
+    from .sampling import proportional_counts, stratified_sample
+
+    records = build_records([
+        {"filename": "a.wav", "stt_text": "aa", "ori_text": "AA", "llm_text": "1"},
+        {"filename": "b.wav", "stt_text": "bb", "ori_text": "BB", "llm_text": "2"},
+        {"filename": "c.wav", "stt_text": "cc", "ori_text": "CC", "llm_text": "3"},
+    ], {})
+    only_b = include_records(records, ["b"])
+    check(len(only_b) == 1 and only_b[0].item_id == "b",
+          f"include_records must keep the named stem, got "
+          f"{[r.item_id for r in only_b]}")
+    check(include_records(records, []) == records,
+          "an empty include list is a no-op")
+
+    # 278/508/213 on n=100 is the Vosk mix: 28 clean, 51 mild, 21 severe.
+    quotas = proportional_counts({"clean": 278, "mild": 508, "severe": 213}, 100)
+    check(quotas == {"clean": 28, "mild": 51, "severe": 21},
+          f"largest-remainder Vosk mix must be 28/51/21, got {quotas}")
+
+    rows = ([{"item_id": f"c{i}", "stt_stratum": "clean"} for i in range(278)]
+            + [{"item_id": f"m{i}", "stt_stratum": "mild"} for i in range(508)]
+            + [{"item_id": f"s{i}", "stt_stratum": "severe"} for i in range(213)])
+    sample = stratified_sample(rows, n=100, seed=0, exclude=["c0"])
+    from collections import Counter
+    mix = Counter(row["stt_stratum"] for row in sample)
+    check(len(sample) == 100, f"sample size must be 100, got {len(sample)}")
+    check(mix["clean"] + mix["mild"] + mix["severe"] == 100,
+          f"strata must cover the sample, got {dict(mix)}")
+    check("c0" not in {row["item_id"] for row in sample},
+          "excluded stems must not enter the sample")
+    again = stratified_sample(rows, n=100, seed=0, exclude=["c0"])
+    check([row["item_id"] for row in sample] == [row["item_id"] for row in again],
+          "the same seed must reproduce the sample")
+
+    rubric = Rubric.load(
+        __file__.replace("selftest.py", "rubrics/quest_open_domain_spoken_v1.yaml"))
+    judge = RubricJudge(client=_StubClient(['{"score": 4, "reason": "ok"}']),
+                        rubric=rubric)
+    record = Record(item_id="x",
+                    stt_text="what band will receivers get",
+                    ori_text="What is the universal band?",
+                    llm_text="The Ku band.")
+    prompt = judge._build_prompt(record, rubric.dimensions[1], "", __import__("random").Random(0))
+    check("What is the universal band?" in prompt,
+          "judge prompt must show the intended utterance for intent_contact")
+    check("what band will receivers get" in prompt,
+          "judge prompt must show the recognized utterance")
+
+
+def test_bland_altman_and_launch_collapse() -> None:
+    """Method comparison and replicate collapsing have published / structural checks."""
+    from pathlib import Path as _Path
+
+    from .batch import RunIdentity, build_groups, parse_model_tag, unique_cells
+    from .stats import bland_altman, sign_agreement
+
+    # Identical methods: bias 0, LoA degenerate at 0, every pair within 5 ms.
+    identical = bland_altman([10.0, 20.0, 30.0, 40.0],
+                             [10.0, 20.0, 30.0, 40.0])
+    close(identical.bias, 0.0, 1e-9, "identical methods must have zero bias")
+    close(identical.within_5ms, 1.0, 1e-9,
+          "identical methods must lie inside the 5 ms band")
+
+    # A constant +8 ms offset: bias 8, every difference equal, LoA at the bias.
+    shifted = bland_altman([10.0, 20.0, 30.0, 40.0],
+                           [18.0, 28.0, 38.0, 48.0])
+    close(shifted.bias, 8.0, 1e-9, "a constant offset must be the Bland-Altman bias")
+    close(shifted.sd_diff, 0.0, 1e-9,
+          "a constant offset has no scatter around the bias")
+
+    check(sign_agreement([1.0, 2.0, 3.0]) == 1.0,
+          "three positive deltas must agree")
+    check(abs((sign_agreement([1.0, -1.0, 2.0]) or 0) - 2 / 3) < 1e-9,
+          "a 2-1 split must be two thirds")
+
+    def identity(order: int, cell: str, launch: str, tag: str,
+                 temperature: float) -> RunIdentity:
+        return RunIdentity(
+            run_dir=_Path(f"runs/{cell}/{launch}"), cell=cell,
+            timestamp="t", order=order, model_tag=tag,
+            temperature=temperature, seed=None, num_ctx=1024, max_tokens=150,
+            prompt_file="p.txt", stt_engine="vosk", mode="cpu",
+            stt_model="small-en-us-0.15", stt_device="cpu",
+            launch_id=launch, **parse_model_tag(tag))
+
+    small = "llama3.2:1b-instruct-q4_K_M"
+    large = "llama3.1:8b-instruct-q4_K_M"
+    runs = [
+        identity(1, "01-small-t0", "r1", small, 0.0),
+        identity(1, "01-small-t0", "r2", small, 0.0),
+        identity(1, "01-small-t0", "r3", small, 0.0),
+        identity(2, "02-small-t07", "r1", small, 0.7),
+        identity(2, "02-small-t07", "r2", small, 0.7),
+        identity(5, "05-large-t0", "r1", large, 0.0),
+        identity(5, "05-large-t0", "r2", large, 0.0),
+    ]
+    cells = unique_cells(runs)
+    check(len(cells) == 3,
+          f"three launches of one cell must collapse to one representative, "
+          f"got {len(cells)}: {[c.cell for c in cells]}")
+    check(all(c.launch_id == "r1" for c in cells),
+          "the representative must be the earliest launch")
+
+    groups = {(g.kind, g.group_id): g for g in build_groups(runs)}
+    parameters = [g for (kind, _), g in groups.items() if kind == "parameters"]
+    check(len(parameters) == 1,
+          f"replicates must not spawn extra parameter contrasts, got "
+          f"{len(parameters)}")
+    check(len(parameters[0].contrasts) == 1,
+          "the t=0.7 cell is one contrast, not one per launch")
+
+
 def main() -> int:
     tests = [
         test_sentence_splitting,
@@ -1322,6 +1515,7 @@ def main() -> int:
         test_transport_retry_policy,
         test_record_building,
         test_answer_key,
+        test_wrapped_excel_answer_key,
         test_word_error_rate,
         test_latency_loading,
         test_intent_coverage,
@@ -1329,6 +1523,9 @@ def main() -> int:
         test_batch_grouping,
         test_recognizer_grouping,
         test_recognizer_pairing_and_checks,
+        test_squad_answer_dicts_and_exclusions,
+        test_include_records_and_stratified_sample,
+        test_bland_altman_and_launch_collapse,
     ]
 
     for test in tests:

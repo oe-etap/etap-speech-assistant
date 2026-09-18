@@ -57,7 +57,7 @@ from .comparison import (FAMILIES, ComparisonConfig, ComparisonOutcome,
                          compare_evaluated)
 from .loaders import discover_run
 from .pipeline import EvaluationConfig, EvaluationOutcome, run_evaluation
-from .stats import PAIRED_REFERENCE_KEYS, spearman
+from .stats import PAIRED_REFERENCE_KEYS, REPLICATE_REFERENCE_KEYS, spearman
 
 PathLike = Union[str, Path]
 
@@ -123,6 +123,11 @@ class RunIdentity:
     stt_model: str = ""
     stt_device: str = ""
     stt_compute: str = ""
+    # Independent launch of this cell (`r1`, `r2`, ...). Empty when the tree
+    # has one directory per configuration, which is the older layout.
+    launch_id: str = ""
+    asr_only: bool = False
+    input_mode: str = ""
 
     @property
     def recognizer(self) -> str:
@@ -166,9 +171,23 @@ class RunIdentity:
         return f"{text}/s{self.seed}" if self.seed is not None else text
 
     @property
+    def cell_key(self) -> str:
+        """The configuration this launch is a replicate of.
+
+        Contrasts are about cells, not about which interleaved round ran first.
+        Grouping by this key, rather than by directory, is what stops three
+        launches of the same model from being treated as three decoding settings.
+        """
+        if self.cell:
+            return self.cell
+        return "|".join([self.model_tag, self.setting, self.recognizer,
+                         self.prompt_file, self.mode, str(self.asr_only)])
+
+    @property
     def label(self) -> str:
         """Identifier used in every table, unique within a batch."""
-        return f"{self.order:02d} {self.short_model} {self.setting}"
+        base = f"{self.order:02d} {self.short_model} {self.setting}"
+        return f"{base} [{self.launch_id}]" if self.launch_id else base
 
     @property
     def key(self) -> str:
@@ -198,6 +217,9 @@ class RunIdentity:
             "stt_compute": self.stt_compute,
             "recognizer": self.recognizer,
             "mode": self.mode,
+            "launch_id": self.launch_id,
+            "asr_only": self.asr_only,
+            "input_mode": self.input_mode,
         }
 
 
@@ -264,14 +286,40 @@ def discover_runs(root: PathLike) -> List[RunIdentity]:
     return runs
 
 
+def unique_cells(runs: Sequence[RunIdentity]) -> List[RunIdentity]:
+    """One representative launch per configuration cell.
+
+    Independent launches of the same cell are replicates, not additional
+    configurations. The representative is the earliest launch id so that a
+    contrast's baseline is a property of the cell rather than of whichever
+    round happened to be discovered first.
+    """
+    grouped: Dict[str, List[RunIdentity]] = {}
+    for run in runs:
+        grouped.setdefault(run.cell_key, []).append(run)
+    representatives = []
+    for members in grouped.values():
+        members = sorted(members, key=lambda r: (r.launch_id or "zzz",
+                                                 r.order, r.timestamp))
+        representatives.append(members[0])
+    return sorted(representatives, key=lambda r: (r.order, r.cell_key))
+
+
+def launches_of(cell: RunIdentity,
+                runs: Sequence[RunIdentity]) -> List[RunIdentity]:
+    """Every independent launch of the same configuration cell."""
+    return [run for run in runs if run.cell_key == cell.cell_key]
+
+
 def _identify(run_dir: Path, root: Path, order: int) -> RunIdentity:
     """Read one run's configuration into a RunIdentity."""
     context = discover_run(run_dir)
     config = context.config
-    cell = run_dir.parent.name if run_dir.parent != root else run_dir.name
+    cell, launch_id = _cell_and_launch(run_dir, root, config)
 
     leading = re.match(r"^(\d+)", cell)
     parsed = parse_model_tag(config.get("ollama_model") or "")
+    asr_flag = config.get("asr_only")
 
     return RunIdentity(
         run_dir=run_dir,
@@ -286,8 +334,45 @@ def _identify(run_dir: Path, root: Path, order: int) -> RunIdentity:
         prompt_file=str(config.get("system_prompt_file") or ""),
         stt_engine=str(config.get("stt_engine") or ""),
         mode=str(config.get("mode") or ""),
+        launch_id=launch_id,
+        asr_only=asr_flag is True or str(asr_flag).strip().lower()
+        in {"true", "1", "yes"},
+        input_mode=str(config.get("input_mode") or ""),
         **_recognizer_fields(config),
         **parsed)
+
+
+def _cell_and_launch(run_dir: Path, root: Path,
+                     config: Dict[str, Any]) -> Tuple[str, str]:
+    """Resolve the configuration cell and the launch from config, then path.
+
+    The pipeline writes `<cell>/<launch>/<timestamp>/`. Reading the cell from
+    the parent of the timestamp would call the launch (`r1`) the cell, and
+    three replicates of one model would be compared as if they were three
+    decoding settings. The recorded `cell_id` / `launch_id` win; the path is
+    the fallback for trees that predate those keys.
+    """
+    cell = str(config.get("cell_id") or "").strip()
+    launch_id = str(config.get("launch_id") or "").strip()
+    try:
+        relative = run_dir.resolve().relative_to(Path(root).resolve())
+        parts = relative.parts
+    except ValueError:
+        parts = (run_dir.name,)
+
+    if not cell:
+        if len(parts) >= 3:
+            cell = parts[-3]
+        elif len(parts) == 2:
+            cell = parts[-2]
+        else:
+            cell = run_dir.name
+    if not launch_id:
+        if len(parts) >= 3:
+            launch_id = parts[-2]
+        elif re.fullmatch(r"r\d+", run_dir.parent.name, re.IGNORECASE):
+            launch_id = run_dir.parent.name
+    return cell, launch_id
 
 
 def _recognizer_fields(config: Dict[str, Any]) -> Dict[str, str]:
@@ -360,6 +445,8 @@ class BatchConfig:
     # Which contrasts to build. Restricting this does not change any score, only
     # which comparison tables are produced.
     group_kinds: List[str] = field(default_factory=lambda: list(GROUP_KINDS))
+    # Independent launches to keep (`r1`, `r2`, ...). None keeps every launch.
+    launch_ids: Optional[List[str]] = None
 
     progress: Optional[Callable[[str], None]] = None
 
@@ -422,10 +509,15 @@ def build_groups(runs: Sequence[RunIdentity],
     in it, which is what makes the difference attributable to that property. A
     group with nothing to compare is not emitted.
 
+    Independent launches of the same cell are collapsed first: they are
+    replicates, not additional configurations, and leaving them in would treat
+    r2 of a greedy run as a decoding-parameter change.
+
     Where the batch spans more than one recognizer, the recognizer held fixed is
     named in the group identifier, so that two otherwise identical groups behind
     different recognizers cannot share a name or a directory.
     """
+    runs = unique_cells(runs)
     groups: List[ContrastGroup] = []
     label_stt = len({run.recognizer for run in runs}) > 1
     for kind in kinds:
@@ -616,6 +708,8 @@ class BatchOutcome:
     groups: List[ContrastGroup] = field(default_factory=list)
     comparisons: List[Tuple[ContrastGroup, ComparisonOutcome]] = \
         field(default_factory=list)
+    replicate_rows: List[Dict[str, Any]] = field(default_factory=list)
+    replicate_report: str = ""
     warnings: List[str] = field(default_factory=list)
     report: str = ""
     alpha: float = 0.05
@@ -715,6 +809,7 @@ class BatchOutcome:
                 rows.append({
                     "run": run.label,
                     "cell": run.cell,
+                    "launch_id": run.launch_id,
                     "model_tag": run.model_tag,
                     "family": run.family,
                     "size_label": run.size_label,
@@ -756,7 +851,8 @@ class BatchOutcome:
                  "n_items": self.outcome_for(run).summary.n_items,
                  "generation_settings":
                      self.outcome_for(run).context.generation_settings,
-                 "results_dir": f"runs/{_slug(run.cell)}",
+                 "results_dir": (f"runs/{_slug(run.cell)}/"
+                                 f"{_slug(run.launch_id or run.timestamp)}"),
                  "latency_log": (str(self.outcome_for(run).latency.path)
                                  if self.outcome_for(run).latency
                                  and self.outcome_for(run).latency.path else None)}
@@ -774,7 +870,9 @@ class BatchOutcome:
         target.mkdir(parents=True, exist_ok=True)
 
         for run in self.runs:
-            self.outcome_for(run).write(target / "runs" / _slug(run.cell))
+            self.outcome_for(run).write(
+                target / "runs" / _slug(run.cell) / _slug(run.launch_id
+                                                          or run.timestamp))
 
         for group, comparison in self.comparisons:
             comparison.write(target / "comparisons" / group.kind
@@ -788,6 +886,11 @@ class BatchOutcome:
         _write_csv(target / "input_quality_impact.csv", self.impact_table())
         _write_csv(target / "input_reference.csv", self.asr_reference())
         _write_csv(target / "all_items.csv", self.all_items())
+        if self.replicate_rows:
+            _write_csv(target / "launch_replicates.csv", self.replicate_rows)
+        if self.replicate_report:
+            reporting.write_text(target / "launch_replicates.txt",
+                                 self.replicate_report)
         return target
 
 
@@ -820,6 +923,7 @@ def _leaderboard_row(run: RunIdentity,
     row: Dict[str, Any] = {
         "run": run.label,
         "cell": run.cell,
+        "launch_id": run.launch_id,
         "model_tag": run.model_tag,
         "family": run.family,
         "size_label": run.size_label,
@@ -909,7 +1013,7 @@ def _leaderboard_row(run: RunIdentity,
 
 def _batch_reference_keys(outcome: "BatchOutcome") -> List[str]:
     """Every method reference the batch's own artefacts rely on."""
-    keys = list(PAIRED_REFERENCE_KEYS)
+    keys = list(PAIRED_REFERENCE_KEYS) + list(REPLICATE_REFERENCE_KEYS)
     for run in outcome.runs:
         keys.extend(outcome.outcome_for(run).reference_keys)
     return keys
@@ -959,6 +1063,10 @@ def run_batch(config: BatchConfig) -> BatchOutcome:
         ValueError: the root holds no run with a transcript file.
     """
     runs = discover_runs(config.root)
+    if config.launch_ids:
+        wanted = {str(name).strip().lower() for name in config.launch_ids if name}
+        runs = [run for run in runs
+                if str(run.launch_id or "").strip().lower() in wanted]
     if not runs:
         raise ValueError(f"no run directory with transcripts under {config.root}")
 
@@ -977,6 +1085,14 @@ def run_batch(config: BatchConfig) -> BatchOutcome:
         warnings.extend(f"{run.label}: {text}"
                         for text in outcomes[run.key].warnings)
 
+    from .replicates import analyse_replicates, render_replicate_report
+
+    replicate_rows, replicate_text = analyse_replicates(runs, outcomes)
+    if replicate_rows:
+        warnings.append(
+            "launch-level analysis is reported separately from item-paired "
+            "contrasts: recordings within one launch are not system replicates")
+
     settings = ComparisonConfig(evaluation=base, alpha=config.alpha,
                                 n_boot=config.n_boot, seed=config.seed,
                                 include_checks=config.include_checks,
@@ -992,6 +1108,8 @@ def run_batch(config: BatchConfig) -> BatchOutcome:
 
     outcome = BatchOutcome(root=Path(config.root), runs=runs, outcomes=outcomes,
                            groups=groups, comparisons=comparisons,
+                           replicate_rows=replicate_rows,
+                           replicate_report=replicate_text,
                            warnings=warnings, alpha=config.alpha,
                            answer_key=config.evaluation.answer_key
                            if config.evaluation else None)
@@ -1131,6 +1249,7 @@ def render_batch_report(outcome: BatchOutcome) -> str:
     lines += _quality_leaderboard(outcome, sections)
     lines += _answer_accuracy_section(outcome, sections)
     lines += _runtime_leaderboard(outcome, sections)
+    lines += _replicate_section(outcome, sections)
     lines += _strata_section(outcome, sections)
     lines += _impact_section(outcome, sections)
     lines += _contrast_section(outcome, sections)
@@ -1417,6 +1536,19 @@ def _runtime_leaderboard(outcome: BatchOutcome,
             name = recognizer or "recognizer not recorded"
             lines.append(f"  {name}: {min(values):.0f}-{max(values):.0f} ms "
                          f"over {len(values)} run(s)")
+    lines += [THICK, ""]
+    return lines
+
+
+def _replicate_section(outcome: BatchOutcome, sections: _Sections) -> List[str]:
+    """Host-stable claims rest on independent launches, not on items in one run."""
+    if not outcome.replicate_report and not outcome.replicate_rows:
+        return []
+    lines = sections.title("LAUNCH REPLICATES (the experimental unit for configuration claims)")
+    if outcome.replicate_report:
+        lines.extend(outcome.replicate_report.splitlines())
+    else:
+        lines.append("No cell was launched more than once.")
     lines += [THICK, ""]
     return lines
 
@@ -1732,14 +1864,25 @@ def build_parser() -> argparse.ArgumentParser:
         "run is graded."))
     parser.add_argument("--selfcheck-samples", type=int, default=0, help=(
         "Self-consistency resamples per item, in every run."))
-    parser.add_argument("--no-latency", action="store_true", help=(
-        "Do not read the latency logs, scoring responses without their timings."))
+    parser.add_argument("--exclude-item", action="append", default=[], help=(
+        "Recording stem to drop before scoring. Repeatable. Use for corpus "
+        "defects (mismatched wav and metadata) that must not enter WER or "
+        "response scores."))
+    parser.add_argument("--include-item", action="append", default=[], help=(
+        "If any are given, only these recording stems are scored. Repeatable."))
+    parser.add_argument("--launch", action="append", default=[], help=(
+        "Keep only these independent launches (e.g. r1). Repeatable."))
+    parser.add_argument("--rubric", type=Path, help=(
+        "Rubric YAML for the judge tier. Defaults to the open-domain spoken "
+        "QA rubric."))
     parser.add_argument("--latency-warmup", type=int, help=(
         "Leading items to exclude from the timing aggregates of every run. "
         "Defaults to the convention each run recorded in its own "
         "log_averages.json, so that these figures and the run's published "
         "summary describe the same items. Quality scores are unaffected: a "
         "warm-up item is scored, only its timings are dropped."))
+    parser.add_argument("--no-latency", action="store_true", help=(
+        "Do not read latency logs. Quality scores are unaffected."))
 
     parser.add_argument("--alpha", type=float, default=0.05,
                         help="Significance level (default: %(default)s).")
@@ -1768,16 +1911,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         selfcheck_samples=args.selfcheck_samples,
         include_latency=not args.no_latency,
         latency_warmup=args.latency_warmup,
+        exclude_items=list(args.exclude_item),
+        include_items=list(args.include_item),
         seed=args.seed,
         progress=None if args.quiet else _stderr_progress)
     if args.constraints:
         settings.constraints = args.constraints
+    if args.rubric:
+        settings.rubric = args.rubric
 
     config = BatchConfig(
         root=args.root, out_dir=args.out_dir, evaluation=settings,
         alpha=args.alpha, n_boot=args.n_boot, seed=args.seed,
         include_checks=not args.no_check_metrics,
         group_kinds=list(args.group) if args.group else list(GROUP_KINDS),
+        launch_ids=list(args.launch) or None,
         progress=None if args.quiet else _stderr_progress)
 
     try:

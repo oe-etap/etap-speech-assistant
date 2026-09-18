@@ -39,7 +39,8 @@ from .judge import Rubric, build_panel, compare_pairwise
 from .latency import (REFERENCE_KEYS as LATENCY_REFS, RunLatency, item_key,
                       load_run_latency, summarize_stages)
 from .loaders import (Record, RunContext, build_records, discover_run,
-                      load_answer_key, load_scenario_spec, load_transcripts)
+                      exclude_records, include_records, load_answer_key,
+                      load_scenario_spec, load_transcripts)
 from .ollama_client import DEFAULT_URL, OllamaClient
 from .relevance import (REFERENCE_KEYS as RELEVANCE_REFS, EmbeddingBackend,
                         build_idf_index, evaluate_relevance)
@@ -47,10 +48,14 @@ from .stats import REFERENCE_KEYS as STATS_REFS
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONSTRAINTS = PACKAGE_DIR / "rubrics" / "constraints_short_opener.yaml"
-DEFAULT_RUBRIC = PACKAGE_DIR / "rubrics" / "quest_therapy_v1.yaml"
+# Open-domain spoken QA. The therapy rubric remains in rubrics/ but is not the
+# default: this campaign has no therapeutic dialogue to score.
+DEFAULT_RUBRIC = PACKAGE_DIR / "rubrics" / "quest_open_domain_spoken_v1.yaml"
+THERAPY_RUBRIC = PACKAGE_DIR / "rubrics" / "quest_therapy_v1.yaml"
 
 # Dimensions used for pairwise configuration contrasts when none are named.
-DEFAULT_PAIRWISE_DIMENSIONS = ["relevance", "spoken_comprehensibility",
+DEFAULT_PAIRWISE_DIMENSIONS = ["relevance_recognized",
+                               "spoken_comprehensibility",
                                "factual_accuracy"]
 
 PathLike = Union[str, Path, None]
@@ -92,6 +97,14 @@ class EvaluationConfig:
     include_latency: bool = True
     # Leading items to exclude as warm-up. None follows the run's own aggregate.
     latency_warmup: Optional[int] = None
+
+    # Recording stems (filename without extension) dropped before scoring.
+    # Corpus defects that survived construction belong here, not in a filter
+    # applied after the numbers are known.
+    exclude_items: List[str] = field(default_factory=list)
+    # When set, only these stems are scored. Used to restrict the judge tier
+    # to a predeclared stratified sample without re-scoring the full set.
+    include_items: List[str] = field(default_factory=list)
 
     # Tier 2
     selfcheck_samples: int = 0
@@ -260,20 +273,39 @@ def run_evaluation(config: EvaluationConfig) -> EvaluationOutcome:
         + list(FACT_REFS) + list(STATS_REFS)
 
     results = [ItemResult(record=record) for record in records]
+    asr_only = _is_asr_only(context, records)
 
-    _run_tier0(results, spec, context, config, tiers)
-    _run_input_fidelity(results, records, config, tiers, reference_keys)
-    _run_tier1(results, records, config, tiers)
-    latency = _run_latency(results, context, config, tiers, reference_keys)
-    _run_tier2(results, context, config, tiers)
-    judge_cost = _run_tier3(results, context, rubric, config, tiers,
-                            reference_keys, warnings)
-
-    policy = AcceptancePolicy(
-        min_quality_composite=config.min_quality,
-        min_safety_score=config.min_safety,
-        require_constraint_pass=config.constraint_gate,
-        strict_constraints=not config.loose_constraints)
+    if asr_only:
+        # An ASR-only run has no assistant response. Scoring empty strings
+        # against the spoken-format prompt would report a 0% adherence that is
+        # a property of the run mode, not of a model.
+        tiers["tier 0 constraints and readability"] = "off (asr-only run)"
+        tiers["tier 1 relevance"] = "off (asr-only run)"
+        _run_input_fidelity(results, records, config, tiers, reference_keys)
+        latency = _run_latency(results, context, config, tiers, reference_keys)
+        tiers["tier 2 audit atoms"] = "off (asr-only run)"
+        tiers["tier 2 self-consistency"] = "off (asr-only run)"
+        tiers["tier 2 atomic factual precision"] = "off (asr-only run)"
+        tiers["tier 3 rubric grading"] = "off (asr-only run)"
+        judge_cost = None
+        policy = AcceptancePolicy(
+            min_quality_composite=config.min_quality,
+            min_safety_score=config.min_safety,
+            require_constraint_pass=False,
+            strict_constraints=not config.loose_constraints)
+    else:
+        _run_tier0(results, spec, context, config, tiers)
+        _run_input_fidelity(results, records, config, tiers, reference_keys)
+        _run_tier1(results, records, config, tiers)
+        latency = _run_latency(results, context, config, tiers, reference_keys)
+        _run_tier2(results, context, config, tiers)
+        judge_cost = _run_tier3(results, context, rubric, config, tiers,
+                                reference_keys, warnings)
+        policy = AcceptancePolicy(
+            min_quality_composite=config.min_quality,
+            min_safety_score=config.min_safety,
+            require_constraint_pass=config.constraint_gate,
+            strict_constraints=not config.loose_constraints)
     for result in results:
         score_item(result, rubric, policy)
 
@@ -301,6 +333,19 @@ def run_evaluation(config: EvaluationConfig) -> EvaluationOutcome:
         latency=latency, warnings=warnings)
 
 
+def _is_asr_only(context: RunContext, records: Sequence[Record]) -> bool:
+    """True when this run produced transcripts but no assistant responses.
+
+    Read from the recorded configuration when present, and from the transcripts
+    as a fallback: an older ASR-only directory that did not set the flag still
+    has empty `llm_text` on every item.
+    """
+    flag = context.config.get("asr_only")
+    if flag is True or str(flag).strip().lower() in {"true", "1", "yes"}:
+        return True
+    return bool(records) and all(record.is_empty_response for record in records)
+
+
 def _load_inputs(config: EvaluationConfig) -> tuple:
     """Resolve the run context and build the record list."""
     if config.run_dir:
@@ -323,7 +368,12 @@ def _load_inputs(config: EvaluationConfig) -> tuple:
     entries = load_transcripts(context.transcripts_path)
     spec_index = load_scenario_spec(config.spec)
     answer_key = load_answer_key(config.answer_key)
-    return context, build_records(entries, spec_index, answers=answer_key)
+    records = build_records(entries, spec_index, answers=answer_key)
+    if config.exclude_items:
+        records = exclude_records(records, config.exclude_items)
+    if config.include_items:
+        records = include_records(records, config.include_items)
+    return context, records
 
 
 def _run_tier0(results: List[ItemResult], spec: ConstraintSpec,

@@ -1,167 +1,151 @@
-# Response evaluation
+# LLM-válaszok kiértékelése
 
-This package scores the LLM replies of one speech-to-speech pipeline run
-(ASR → LLM → TTS) with methods taken from the literature. The input is the
-`transcripts.yaml` or `transcripts.jsonl` that the run already wrote. The output
-is a readable report, a CSV, a JSON file, and optionally BibTeX.
+Ez a csomag a beszéd-beszéd pipeline (ASR → LLM → TTS) egy futásának LLM-válaszait pontozza,
+irodalomból átvett módszerekkel. Bemenet a futás által amúgy is kiírt `transcripts.yaml`,
+kimenet egy olvasható riport, egy CSV, egy JSON és opcionálisan BibTeX.
 
-Working principle: **tier 0 is decidable; everything else is an estimate.** The
-report names the source and the validation status of every method, so the
-numbers remain traceable.
+Vezérelv: **a 0. szint eldönthető, minden más becslés.** A riport minden módszernél
+kiírja a forrást és a validáltsági szintet, hogy a számok visszakövethetők legyenek.
 
-The package does three jobs: score one run; compare two runs pairwise when the
-question is whether a parameter change improved the replies (see
-[Comparing two runs](#comparing-two-runs-for-parameter-tuning)); and score and
-compare a whole configuration grid in one pass (see
-[Evaluating a run grid](#evaluating-a-run-grid-in-one-pass)).
+Három dologra használható: egy futás kiértékelésére, két futás páros összehasonlítására, ha
+azt kell eldönteni, hogy egy paraméterváltoztatás javított-e a válaszokon (lásd
+[Két futás összehasonlítása](#két-futás-összehasonlítása-paraméterhangoláshoz)), illetve egy
+egész futásrács egy lépésben való kiértékelésére és összevetésére (lásd
+[Futásrács kiértékelése](#futásrács-kiértékelése-egy-lépésben)).
 
-The package is self-contained: it imports nothing from the rest of the pipeline,
-and it can be called in two ways. On Windows the interpreter is often `py`
-rather than `python`; both forms are equivalent.
+A csomag önálló: nem importál semmit a pipeline többi részéből, és kétféleképpen hívható.
 
-## From the command line
+## Indítás parancssorból
 
 ```powershell
-cd etap-speech-assistant-main
-python -m evaluation --run-dir ..\output-template\20260809_164356
+cd etap-speech-assistant-mwe-main
+py -m evaluation --run-dir ..\output-template\20260809_164356
 ```
 
-That command finishes with no model and no network. The older
-`python evaluate_responses.py ...` form still works: the launcher left in the
-package root calls the same entry point.
+Ez a parancs modell és internet nélkül lefut. A korábbi `py evaluate_responses.py ...`
+forma is működik: az a gyökérben maradt indító ugyanezt hívja.
 
-## As a function
+## Hívás függvényként
 
 ```python
 from evaluation import EvaluationConfig, run_evaluation
 
 outcome = run_evaluation(EvaluationConfig(
     run_dir="output-template/20260809_164356",
-    judge_models=["qwen2.5:7b-instruct"],      # optional
-    progress=print))                            # optional status callback
+    judge_models=["qwen2.5:7b-instruct"],      # elhagyható
+    progress=print))                            # elhagyható állapotjelzés
 
 print(outcome.summary.acceptance_rate)
 print(outcome.results[0].relevance["request_coverage"])
-outcome.write("output", emit_bibtex=True)       # this is the only disk write
+outcome.write("kimenet", emit_bibtex=True)      # csak itt ír lemezre
 ```
 
-`run_evaluation` **neither writes files nor prints**; it returns objects, so a
-single number can be read without parsing a report. Field names on
-`EvaluationConfig` match the flags, with hyphens turned into underscores
-(`--judge-model` → `judge_models` as a list). The command line calls the same
-function, so the two paths cannot drift apart.
+A `run_evaluation` **nem ír fájlt és nem nyomtat**; az objektumokat adja vissza, így egy
+szám kiolvasásához nem kell riportot visszaparsolni. A `EvaluationConfig` mezőnevei a
+kapcsolókkal egyeznek, alulvonással (`--judge-model` → `judge_models` lista). A parancssor
+ugyanezt a függvényt hívja, tehát a két út nem tud elcsúszni egymástól.
 
-## Comparing two runs (for parameter tuning)
+## Két futás összehasonlítása (paraméterhangoláshoz)
 
-When a model is run on a large set of input–output pairs, item-by-item human
-labelling is not realistic. That is what **paired comparison** is for: it
-compares two configurations that answered the same inputs, item by item, with
-neither human labels nor a judge model, and reports whether the change improved
-the replies.
+Ha nagy mennyiségű bemenet-kimenet páron fut a modell, itemenkénti humán kiértékelés nem
+reális. Erre való a **páros összehasonlítás**: ugyanazokra a bemenetekre futtatott két
+konfigurációt vet össze itemenként, humán címke és bíráló modell nélkül, és megmondja,
+hogy a paraméterváltoztatás javított-e.
 
 ```powershell
-python -m evaluation.comparison --baseline ..\runs\temp08 --contrast ..\runs\temp02
+py -m evaluation.comparison --baseline ..\futasok\temp08 --contrast ..\futasok\temp02
 ```
 
 ```python
 from evaluation import ComparisonConfig, compare_runs
 
-outcome = compare_runs(ComparisonConfig(baseline="runs/temp08",
-                                        contrast=["runs/temp02"]))
+outcome = compare_runs(ComparisonConfig(baseline="futasok/temp08",
+                                        contrast=["futasok/temp02"]))
 pair = outcome.pairs[0]
 print([m.metric.key for m in pair.improvements])
-print([m.metric.key for m in pair.regressions])
-outcome.write("output")
+print([m.metric.key for m in pair.regressions])   # a rontásokat is kiírja
+outcome.write("kimenet")
 ```
 
-Several variants can share one baseline (`--contrast` is repeatable), so every
-point of a parameter sweep is measured against the same reference.
+Egy alapvonalhoz több változat is megadható (`--contrast` ismételhető), így egy
+paramétersöprés minden pontja ugyanahhoz a referenciához mérhető.
 
-### Why paired
+### Miért páros
 
-Both runs receive the same prompts, so the comparison can be paired item by
-item. Prompt-to-prompt scatter — often larger than the parameter effect —
-cancels, and a difference is detectable on a much smaller sample. Pairing is by
-user text, not by order, so a reordered or partly failed run does not silently
-misalign; the *k*-th occurrence of a repeated prompt is matched with the *k*-th
-occurrence on the other side.
+A két futás ugyanazokat a promptokat kapja, ezért az összevetés itemenként párosítható. Így
+a promptok közti szóródás — ami sokszorosa a paraméter hatásának — kiesik, és jóval kisebb
+mintán is kimutatható a különbség. A párosítás a felhasználói szöveg alapján történik, nem
+sorrend szerint, tehát átrendezett vagy részben hibás futás esetén sem csúszik el; az
+ismétlődő prompt k-adik előfordulása a másik oldal k-adik előfordulásával párosul.
 
-### What each report row states
+### Amit a riport soronként közöl
 
-| Column | Meaning |
+| Oszlop | Jelentés |
 | --- | --- |
-| `delta` | mean paired difference (variant minus baseline) in the metric's own units |
-| `95% CI` | percentile bootstrap interval for that mean paired difference |
-| `better/worse` | how many items moved for the better, and how many for the worse |
-| `effect` | Cliff's δ with the usual band label; empty on a binary metric, where `delta` itself is the effect size |
-| `p(adj)` | Holm-adjusted *p*-value, within the metric's own family (`adherence`, `response`, `runtime`) |
-| `verdict` | `improved`, `degraded`, `equivalent`, `no detected change`, or `descriptive` |
+| `delta` | átlagos páros különbség (változat mínusz alapvonal) a metrika saját egységében |
+| `95% CI` | percentilis bootstrap intervallum a páros különbségek átlagára |
+| `better/worse` | hány item mozdult jobbra, illetve rosszabbra |
+| `effect` | Cliff δ a szokásos sávcímkével; bináris metrikánál üres, ott a `delta` maga a hatásméret |
+| `p(adj)` | Holm-korrigált p-érték, a metrika saját családján belül (`adherence`, `response`, `runtime`) |
+| `verdict` | `improved`, `degraded`, `equivalent`, `no detected change` vagy `descriptive` |
 
-Test: **McNemar** on a binary (pass/fail) metric, because only items whose
-verdict changed carry information; **Wilcoxon signed-rank** on a continuous
-metric, because bounded scales are not normal.
+Teszt: bináris (átment/megbukott) metrikán **McNemar**, mert csak azok az itemek hordoznak
+információt, amelyeknek megváltozott a verdiktjük; folytonos metrikán **Wilcoxon
+előjeles rangpróba**, mert a korlátos skálák nem normálisak.
 
-### Three properties that make the verdict trustworthy
+### Három dolog, ami miatt a verdikt megbízható
 
-**Direction is declared, not inferred.** Improvement or degradation is reported
-only where it is known which way is better. Word count and sentence count stay
-`descriptive`: neither longer nor shorter is inherently better, and the table
-does not invent a verdict for them.
+**Az irány deklarált, nem következtetett.** Csak ott mond javulást vagy romlást, ahol
+tudható, mi a jobb. A szószám és a mondatszám `descriptive` marad: sem a hosszabb, sem a
+rövidebb nem eleve jobb, ezekre a tábla nem ad verdiktet.
 
-**Significance is corrected within each metric family.** Twenty metrics at the
-five-percent level have about a two-thirds chance of at least one false hit if
-left uncorrected, so Holm's step-down procedure runs on the scored rows — but
-separately inside each of the three predeclared families (`adherence`,
-`response`, `runtime`), so the number of logged timings cannot dilute the
-evidence for a quality claim. The report states, per family, how many tests
-were corrected.
+**A szignifikancia metrikacsaládon belül korrigált.** Húsz metrika ötszázalékos szinten
+korrekció nélkül nagyjából kétharmad eséllyel ad legalább egy hamis találatot, ezért a
+pontozott sorokra Holm lépcsős eljárása fut — de a három előre deklarált családon
+(`adherence`, `response`, `runtime`) belül külön-külön, hogy egy minőségi állítás
+bizonyítékát ne hígítsa fel a mellé mért időadatok száma. A riport családonként kiírja, hány
+tesztre korrigált.
 
-**Magnitude is separated from detectability.** On a large sample a difference of
-no consequence still reaches significance, so every row carries an effect size,
-and where a negligible-change margin is declared an equivalence test can
-conclude that *the change does not matter* — a stronger claim than failure to
-detect one.
+**A nagyság el van választva a kimutathatóságtól.** Nagy mintán a jelentéktelen különbség is
+szignifikáns lesz, ezért minden sor hatásméretet is közöl, és ahol van előre rögzített
+elhanyagolhatósági küszöb, ott ekvivalencia-teszt dönthet úgy, hogy *a változtatás nem
+számít* — ez erősebb állítás, mint hogy nem mutatható ki.
 
-### Flags and output
+### Paraméterek és kimenet
 
-| Flag | Default | Role |
+| Kapcsoló | Alapérték | Szerep |
 | --- | --- | --- |
-| `--baseline` | – | run directory used as the reference |
-| `--contrast` | – | run produced with the changed setting; repeatable |
-| `--spec`, `--constraints` | – | applied **identically** to both runs |
-| `--judge-model` | – | costly: grades every run |
-| `--judge-url` | `localhost:11434` | Ollama endpoint, used only with `--judge-model` |
-| `--selfcheck-samples` | 0 | self-consistency resampling on both runs |
-| `--alpha` | 0.05 | significance level |
-| `--n-boot` | 2000 | bootstrap resamples per metric |
-| `--seed` | 0 | seed for bootstrap resampling |
-| `--no-check-metrics` | off | do not compare the individual constraint checks |
-| `--out-dir` | `./comparison_output` | output directory |
-| `--quiet` | off | do not print the report to stdout |
+| `--baseline` | – | az alapvonalként szolgáló futás könyvtára |
+| `--contrast` | – | a megváltoztatott beállítással készült futás; ismételhető |
+| `--spec`, `--constraints` | – | **mindkét** futásra azonosan alkalmazva |
+| `--judge-model` | – | költséges: minden futást végigbíráltat |
+| `--selfcheck-samples` | 0 | önkonzisztencia mindkét futáson |
+| `--alpha` | 0.05 | szignifikanciaszint |
+| `--n-boot` | 2000 | bootstrap újramintázás metrikánként |
+| `--no-check-metrics` | ki | ne hasonlítsa össze az egyes ellenőrzéseket külön-külön |
+| `--out-dir` | `./comparison_output` | kimeneti könyvtár |
 
-Output: `comparison_report.txt`, `comparison_metrics.csv` (one row per metric,
-for machine processing) and `comparison_results.json`. The report header lists
-which settings differ between the two `config_used.yaml` files — and warns if
-none do, because then the difference is sampling noise.
+Kimenet: `comparison_report.txt`, `comparison_metrics.csv` (metrikánként egy sor, gépi
+feldolgozásra) és `comparison_results.json`. A riport fejléce kiírja, mely beállítások
+térnek el a két `config_used.yaml` között — és figyelmeztet, ha egyik sem, mert akkor a
+különbség csak mintavételi zaj.
 
-### What is worth tuning
+### Mit érdemes hangolni rajta
 
-The comparison runs without a model, so it is cheap on any prompt set: tier-0
-checks are decidable, coverage and readability are deterministic, and a rerun
-reproduces them. Turning on `--judge-model` grades both runs: that is slow, and
-the judge rows inherit the judge's limits, so a close call should not be
-decided from those rows alone.
+Modell nélkül is fut, tehát bármilyen nagy prompt-halmazon olcsó: a 0. szint ellenőrzései
+eldönthetők, a lefedettség és az olvashatóság determinisztikus, ezek újrafuttatva ugyanazt
+adják. A `--judge-model` bekapcsolása mindkét futást végigbíráltatja: lassú, és a bírálói
+sorok öröklik a bíráló korlátait, ezért szoros összevetést önmagukban ne döntsenek el.
 
-## Evaluating a run grid in one pass
+## Futásrács kiértékelése egy lépésben
 
-A parameter sweep is not two runs but a grid: one run directory per cell, and
-the question is never “how did this run score” but “which setting was better”.
-Batch mode reads the whole tree, scores every run identically, builds the
-contrasts the grid was made for, and writes every table into one results
-directory.
+Egy paramétersöprés nem két futás, hanem egy rács: cellánként egy futáskönyvtár, és a kérdés
+sosem az, hogy „ez a futás mennyit ért el”, hanem hogy „melyik beállítás volt jobb”. A batch
+mód beolvassa a teljes fát, minden futást azonos módon pontoz, megépíti azokat a
+kontrasztokat, amelyekre a rács készült, és egyetlen eredménykönyvtárba írja az összes táblát.
 
 ```powershell
-python -m evaluation.batch --root ..\results\text-only
+py -m evaluation.batch --root ..\results\text-only
 ```
 
 ```python
@@ -172,539 +156,516 @@ print(outcome.leaderboard()[0]["adherence_item_strict"])
 outcome.write("results/evaluation_result")
 ```
 
-Every run is scored **once**, however many contrasts it appears in. That saves
-work; it also guarantees that a run's figures are the same in every table,
-which re-evaluating per contrast would not.
-
-### The five contrasts
-
-Grouping is built from the recorded configuration (`config_used.yaml`), not from
-the directory name, so a mistyped folder cannot silently produce a wrong
-comparison. A contrast is formed only where **exactly one** property differs
-between the runs — that is what makes the difference attributable to that
-property.
-
-| Contrast | Held fixed | What varies | Baseline |
-| --- | --- | --- | --- |
-| `parameters` | model, quantization, recognizer | decoding setting (`t`, `seed`) | the greedy (`t=0`) run |
-| `quantization` | model, size, setting, recognizer | weight precision | the highest precision (`fp16`) |
-| `model_size` | lineage, precision, setting, recognizer | parameter count | the largest model |
-| `cross_model` | decoding setting, recognizer | the model | the strongest variant |
-| `recognizer` | model and decoding setting | the recognizer (engine, acoustic model, device) | the recognizer used by most of the grid |
-
-The baseline is not a claim that it is best: it is the **reference the change is
-measured against**. A negative delta therefore reads as *this is what the
-cheaper configuration costs*. The number of groups is a property of the
-recorded configurations, not of a fixed grid size. Two decoding settings of one
-model, at one precision and one recognizer, form a `parameters` group whose
-baseline is the greedy run; a size ladder at one precision and one setting forms
-a `model_size` group whose baseline is the largest model of that lineage.
-
-Model contrasts **hold the recognizer fixed**: what the recognizer wrote is the
-model's input, so mixing two recognizers into a model contrast would report an
-input change as a model effect. The recognizer identity includes the engine,
-the acoustic model, the device and the compute precision
-(`vosk-small-en-us-0.15-cpu`, `whisper-small-cuda-int8`), because the same
-engine with another model recognizes differently. Where the grid spans more
-than one recognizer, the group identifier states which one it holds fixed; with
-a single recognizer the names are unchanged. The `recognizer` contrast is the
-only one in which the two sides' transcripts differ: pairing is therefore by
-recording name, not by recognized text, otherwise the items on which the two
-recognizers disagree would be the ones dropped.
-
-The size ladder groups by **lineage**, not by exact family name: the sizes on
-offer are split across releases (llama3.2 is 1B and 3B, llama3.1 is 8B), so a
-ladder that stopped at the family boundary would omit the largest model. Where
-a ladder crosses a release, the group's `varying` field says so — parameter
-count and release both change there, and the two cannot be separated.
-
-### What it checks before it compares
-
-A paired comparison is about the configuration only if everything else was
-held fixed. Batch mode does not assume that: it checks, and it writes every
-breach next to the results it affects: the same item set, the same input text,
-the same system prompt, constraint definition, recognizer, compute mode,
-context window and token cap. The alternative is a difference table that
-silently includes a prompt change.
-
-The check runs **per contrast**, and a breach is attributed to the contrast it
-affects: a grid that spans two recognizers is not a breach if every model
-contrast holds one recognizer fixed. In the `recognizer` contrast the
-recognizer and the transcript are the property under study, so the check
-requires identity of the **intended question** instead.
-
-### Output
-
-Without `--out-dir`, results are written **beside** `--root`, as
-`evaluation_result`: a re-evaluation does not write into the directory it
-reads, and the whole comparison is one archivable unit.
-
-| File | Contents |
-| --- | --- |
-| `summary_report.txt` | the grid's one readable report: inputs, two leaderboards, answer agreement, strata, contrasts, source list |
-| `leaderboard.csv` | one row per run: the configuration and every headline metric side by side |
-| `comparison_index.csv` | every metric of every contrast, with *p*-value and verdict, for machine processing |
-| `input_reference.csv` | the shared input per recognizer: intended text, recognized text, per-item error rates |
-| `input_quality_strata.csv` | breakdown by run × input quality |
-| `input_quality_impact.csv` | rank correlation of recognition error with every response metric |
-| `all_items.csv` | every item of every run in one table (number of runs × *n*), for a pivot or a figure |
-| `batch_manifest.json` | which runs were read, with which settings, and where their results were written |
-| `runs/<cell>/` | per-run report, per-item CSV, JSON, and a copy of `config_used.yaml` |
-| `comparisons/<kind>/<group>/` | the full paired-comparison table of one contrast |
-
-### Flags
-
-| Flag | Default | Role |
-| --- | --- | --- |
-| `--root` | – | directory holding the runs; searched recursively for a transcript |
-| `--out-dir` | `<root>/../evaluation_result` | output directory |
-| `--group` | all five | build only the named contrast; repeatable |
-| `--spec`, `--constraints` | – | applied **identically** to every run |
-| `--answer-key` | – | corpus metadata table (CSV) with reference answers, applied **identically** to every run |
-| `--embedding-model` | – | sentence-transformers model for embedding similarity, in every run |
-| `--judge-model`, `--selfcheck-samples` | – | costly: runs on every cell |
-| `--no-latency` | off | do not read the latency logs |
-| `--latency-warmup` | the value recorded in the run's `log_averages.json` | leading items to drop from the timing aggregates; quality scores are unaffected |
-| `--no-check-metrics` | off | do not compare the individual constraint checks |
-| `--alpha`, `--n-boot`, `--seed` | 0.05, 2000, 0 | as in paired comparison |
-| `--quiet` | off | do not print the report to stdout |
-
-## Dependencies
-
-`requests`, `PyYAML`, `numpy` — install with
-`pip install -r evaluation/requirements.txt`. `scipy` and
-`sentence-transformers` are optional and detected at runtime. Model-backed
-tiers need a locally running Ollama server; if it is absent the run does not
-stop, it only records the skipped tier.
-
-## Package layout
-
-| File | Role |
-| --- | --- |
-| `pipeline.py` | `EvaluationConfig`, `EvaluationOutcome`, `run_evaluation()` — orchestration |
-| `cli.py`, `__main__.py` | command-line layer over `run_evaluation` |
-| `comparison.py` | paired comparison of two runs, with its own command line |
-| `batch.py` | scoring a run grid and building the contrasts, with its own command line |
-| `constraints.py` | tier 0: decidable checks |
-| `asr.py` | recognizer fidelity against the intended question: WER, CER, content recall, strata |
-| `latency.py` | per-item stage times and resource cost from the run's latency log |
-| `relevance.py` | tier 1: coverage and overlap |
-| `factuality.py` | tier 2: audit atoms, self-consistency, atomic claims |
-| `judge.py` | tier 3: rubric, panel, pairwise contrast |
-| `agreement.py`, `stats.py` | tier 4 and the statistical tools |
-| `aggregation.py` | per-item scores, run-level summary, acceptance policy |
-| `reporting.py` | report, CSV, JSON |
-| `references.py` | method → literature → validation-status registry |
-| `loaders.py` | transcripts, scenario spec, corpus answer key, and run artefacts |
-| `textutils.py` | sentence splitting, normalization, syllable counts — shared by the metrics |
-| `ollama_client.py` | HTTP layer to the local model: retries, JSON recovery |
-| `selftest.py` | offline checks against worked or published values |
-| `fake_ollama.py` | protocol-faithful stub server for the model-backed tiers |
-| `requirements.txt` | the three required dependencies, plus the two optional ones in comments |
-
-Two data directories ship with the package. `rubrics/` **is not optional**: the
-code's defaults refer to it.
-
-| File | Role |
-| --- | --- |
-| `rubrics/constraints_short_opener.yaml` | definition of the 15 tier-0 checks (default of `--constraints`) |
-| `rubrics/quest_therapy_v1.yaml` | the 15-dimension judge rubric (default of `--rubric`) |
-
-`examples/` is a template: copy and edit it; the package does not need it to
-run.
-
-| File | Role |
-| --- | --- |
-| `examples/scenarios_open_domain_smoke.yaml` | full scenario spec with reference answers and forbidden patterns |
-| `examples/scenarios_minimal_categories.yaml` | variant without references: category and expected behaviour only |
-| `examples/scenarios_therapy_template.yaml` | therapy template; this file lists **every** field that is read and the 11 category names |
-| `examples/human_annotations_example.csv` | tier-4 input format: `item_id,rater_id,dimension,score` |
-
-## Tiers
-
-| Tier | What it measures | When it runs |
-| --- | --- | --- |
-| 0 | prompt adherence, readability | always, no model |
-| – | recognizer fidelity (WER, CER, content recall, strata) | when the transcript has `ori_text` |
-| – | stage times and resource cost | when a `latency_log_*.csv` sits beside the run |
-| 1 | relevance, reference overlap, answer agreement | always; overlap and agreement need `--answer-key` or `--spec` |
-| 2 | factual commitments, hallucination | audit atoms always; the rest optional |
-| 3 | rubric grading | with `--judge-model` |
-| 4 | rater agreement, calibration | with `--human-annotations` |
-
-### Input quality and runtime
-
-The two unnumbered rows are not about the reply. They describe **what the model
-was given** and **what the reply cost**. Neither needs a model or a reference
-answer.
-
-Recognizer fidelity is measured against the transcript's `ori_text`, i.e. the
-question that was intended to be spoken. It is not a quality score: it bounds
-what the model *could* answer. On a numeric reference, several spoken
-realizations (cardinal, year, digit-by-digit) are tried and the best match
-counts, so the recognizer is not charged for hearing “1990” spoken aloud. Items
-are placed in three WER strata — `clean` (exact), `mild` (at most one third of
-the reference words damaged), `severe` (more than that) — and the report also
-gives prompt adherence by stratum. Coverage should not be compared across
-strata: a correct closed answer does not repeat the question, so its coverage
-is low for a reason that does not involve the model.
-
-Runtime comes from the run's own `latency_log_*.csv`, joined per item by
-recording name — not by order, so a broken run cannot shift the rest. The
-stages overlap and do not start from the same instant, so they cannot be
-summed: `stt` is the recording arriving at speaking pace (on file input, the
-length of the audio, not a compute cost), `ttfa` runs from the end of speech to
-the first emitted audio — that is the wait the user perceives — and
-`e2e_response_ready` is the whole item including the recording, so it mainly
-reflects speech length. When models are compared, `ttfa` and token throughput
-are the informative columns.
-
-Resource columns (device memory, GPU utilisation) are near-constant within a
-run, so they are summarized at run level rather than compared item by item.
-
-## Flags (single run)
-
-| Flag | Default | Role |
-| --- | --- | --- |
-| `--run-dir` | – | run directory; transcripts, config and system prompt are read from it |
-| `--transcripts` | – | standalone transcript file when the rest of the run artefacts are missing |
-| `--spec` | – | scenario spec: category, reference answer, required/forbidden content |
-| `--answer-key` | – | corpus metadata table (CSV): `answer` / `plausible_answers` by `is_impossible` |
-| `--system-prompt` | from the run | overrides the system prompt used for judging and resampling |
-| `--label` | run directory name | label written into the report |
-| `--constraints` | `constraints_short_opener.yaml` | definition of the tier-0 checks |
-| `--max-tokens` | from config | `num_predict` cap used for truncation detection |
-| `--embedding-model` | – | e.g. `all-MiniLM-L6-v2`; downloads on first use |
-| `--selfcheck-samples` | 0 | self-consistency resamples; 0 = off |
-| `--selfcheck-model` | from config | must be **the model that produced the replies** |
-| `--selfcheck-temperature` | 0.8 | resampling temperature |
-| `--fact-precision` | off | atomic-claim decomposition and labelling |
-| `--max-claims` | 10 | claim cap per reply |
-| `--judge-model` | – | judge Ollama tag; repeatable, several models form a panel |
-| `--judge-url` | `localhost:11434` | Ollama endpoint |
-| `--judge-samples` | 1 | samples per dimension; above 1 approximates a G-Eval expected score |
-| `--judge-timeout` | 300 | per-request timeout in seconds |
-| `--rubric` | `quest_therapy_v1.yaml` | rubric definition |
-| `--compare-run-dir` | – | second run for A/B judging, in both presentation orders |
-| `--pairwise-dimension` | relevance, spoken_comprehensibility, factual_accuracy | rubric dimension for that A/B comparison; repeatable |
-| `--human-annotations` | – | long-format CSV: `item_id,rater_id,dimension,score` |
-| `--min-quality` | 3.5 | acceptance threshold on the quality composite |
-| `--min-safety` | 4.0 | threshold on the worst safety dimension |
-| `--loose-constraints` | off | gate on the loose verdict, ignoring formatting-only failures |
-| `--no-constraint-gate` | off | do not require constraint adherence for acceptance |
-| `--out-dir` | `<run-dir>/evaluation` | output directory |
-| `--emit-bibtex` | off | BibTeX for the methods actually used |
-| `--seed` | 0 | seed for bootstrap resampling |
-| `--quiet` | off | do not print the report to stdout |
-
-> Acceptance thresholds must be **fixed before measurement**: they are written
-> into the report header, and tuning them afterwards makes the acceptance rate
-> meaningless.
-
-## Output (single run)
-
-| File | Contents |
-| --- | --- |
-| `evaluation_report.txt` | readable report: sections, source list, interpretation limits |
-| `evaluation_items.csv` | one row per item, with every metric |
-| `evaluation_results.json` | full structured output |
-| `evaluation_references.bib` | BibTeX, with `--emit-bibtex` |
-
-## Computed values and how to read them
-
-The tables below follow the columns of `evaluation_items.csv`, in file order.
-A column is present only if the tier that produces it ran — each section states
-when — so a model-free run's CSV is shorter, not incomplete.
-
-**Status:** `verifiable` = decided by construction, `validated` = a validated
-instrument or published statistical theory, `established` = a widely used
-method with published human correlation, `surrogate` = a deliberate
-simplification of a published method. Where the source is `–`, there is no
-paper behind it: a local but deterministic computation.
-
-### Identification (always)
-
-| Column | Meaning | Source | Status |
-| --- | --- | --- | --- |
-| `item_id` | stable identifier; from the recording name, the scenario spec, or a serial | – | verifiable |
-| `filename` | recording name; the join key to the latency log and across runs | – | verifiable |
-| `category` | scenario category; this decides which checks and rubric dimensions apply | – | verifiable |
-| `safety_critical_item` | whether the item is safety-critical | – | verifiable |
-| `stt_text`, `llm_text` | the scored input and reply, verbatim | – | verifiable |
-| `ori_text` | the intended spoken question, when the transcript has it | – | verifiable |
-| `reference_answer` | the answer the item is scored against, when an answer key or spec supplied one | – | verifiable |
-| `answer_unsupported` | whether the corpus marks the item as unanswerable | – | verifiable |
-
-### Tier 0 — decidable prompt adherence (always)
-
-| Column | Meaning | Source | Status |
-| --- | --- | --- | --- |
-| `constraint_item_pass_strict` | whether **every** hard constraint held; the headline adherence indicator | Zhou et al., 2023 (IFEval) | verifiable |
-| `constraint_item_pass_loose` | the same after formatting transforms; if it differs from strict, the failure is formatting-only | Zhou et al., 2023 (IFEval) | verifiable |
-| `constraint_check_rate_strict` | fraction of checks passed; inapplicable checks leave the denominator | Jiang et al., 2024 (FollowBench) | verifiable |
-| `constraint_check_rate_loose` | the same with the loose verdict | Jiang et al., 2024 (FollowBench) | verifiable |
-| `constraint_failures_strict` | names of the failed checks, semicolon-separated; an audit trail | – | verifiable |
-| `constraint_failures_loose` | the same with the loose verdict | – | verifiable |
-
-The strict/loose pair follows IFEval's dual evaluation. The 15 checks: non-empty
-reply, opening sentence ≤ 5 words, opening sentence ends with a full stop, 0–2
-detail sentences, 1–3 sentences in total, English, no simulated dialogue, no
-follow-up question (advisory), completeness, token-cap truncation, word count
-(advisory), spoken duration (advisory), no markup, and required and forbidden
-content from the scenario spec.
-
-### Descriptive and readability metrics (always)
-
-| Column | Meaning | Source | Status |
-| --- | --- | --- | --- |
-| `word_count`, `sentence_count`, `char_count` | length | – | verifiable |
-| `mean_words_per_sentence` | mean sentence length | – | verifiable |
-| `opening_words` | word count of the first sentence; the measured value of the opener constraint | – | verifiable |
-| `estimated_tokens` | an **estimate**, not a measured token count; used as a truncation suspicion | – (heuristic in place of a tokenizer) | surrogate |
-| `estimated_spoken_seconds` | estimated spoken duration at 2.5 words/s | – (heuristic) | surrogate |
-| `flesch_reading_ease` | higher = easier | Flesch, 1948 | validated |
-| `flesch_kincaid_grade` | difficulty in US school-grade years | Kincaid et al., 1975 | validated |
-
-### Recognizer fidelity (when `ori_text` is present)
-
-| Column | Meaning | Source | Status |
-| --- | --- | --- | --- |
-| `stt_wer` | word error rate against the intended question; among spoken variants of numbers, the best match counts | Levenshtein, 1966 | verifiable |
-| `stt_cer` | character error rate; a misspelled word costs less here than in WER | Levenshtein, 1966 | verifiable |
-| `stt_substitutions`, `stt_deletions`, `stt_insertions` | errors by type | Levenshtein, 1966 | verifiable |
-| `stt_content_recall` | how many of the content (non-function) words survived recognition | – | verifiable |
-| `stt_exact_match` | whether recognition matches the reference verbatim | – | verifiable |
-| `stt_stratum` | `clean`, `mild` or `severe` from WER | Wang et al., 2003 | verifiable |
-
-WER is not a quality score but a bound: it says how *different* a question the
-model received (Wang et al., 2003).
-
-### Runtime and resources (when a latency log is present)
-
-| Column | Meaning | Source | Status |
-| --- | --- | --- | --- |
-| `lat_stt`, `lat_stt_endpoint_delay` | arrival of the recording, and finalization after the end of speech; controls, not about the model | – | verifiable |
-| `lat_llm_prompt_eval`, `lat_llm_ttft`, `lat_llm_first_chunk_fill`, `lat_llm_ttfc` | prompt evaluation, first token, fill of the first speakable chunk, first speakable unit | – | verifiable |
-| `lat_tts_first_chunk` | blocking synthesis of the first audio chunk | – | verifiable |
-| `lat_ttfa` | from the end of speech to the first emitted audio: the wait the user perceives | Walker et al., 1997 (PARADISE) | verifiable |
-| `lat_llm_eval`, `lat_tts_total` | full generation and synthesis time; both grow with reply length | – | verifiable |
-| `lat_e2e_response_ready` | wall-clock span of the item, including the recording | – | verifiable |
-| `llm_prompt_tokens`, `llm_eval_tokens`, `llm_tokens_per_sec` | the engine's own token counts and throughput | – | verifiable |
-| `llm_chunk_count` | number of speakable chunks released | – | verifiable |
-| `tts_audio_ms` | duration of the synthesized audio | – | verifiable |
-| `stt_rtf`, `input_duration_ms`, `trailing_silence_ms` | recognizer real-time factor, input length, trailing silence; from the log extras | – | verifiable |
-
-The report also gives the median and the 95th percentile, because a spoken
-assistant is judged by the late replies (Dean and Barroso, 2013). Device memory
-and GPU utilisation are summarized at run level (`llm_vram_mb`,
-`llm_model_vram_mb`, `gpu_util_percent`, …); they do not appear as item-level
-CSV columns.
-
-### Tier 1 — relevance (`reference_*` columns need `--answer-key` or `--spec`)
-
-| Column | Meaning | Source | Status |
-| --- | --- | --- | --- |
-| `request_coverage` | IDF-weighted coverage of the **recognized** question's content words; no reference answer needed | – (IDF-weighted overlap) | surrogate |
-| `intent_coverage` | the same against the **intended** question, when `ori_text` is present | – (IDF-weighted overlap) | surrogate |
-| `coverage_intent_gap` | the difference: how much of the interaction the recognizer removed | – | verifiable |
-| `echo_ratio` | how much of the question is repeated back; a high value suggests an empty echo | – | verifiable |
-| `request_response_cosine` | embedding similarity of question and reply; only with `--embedding-model` | Zhang et al., 2020 (related method) | surrogate |
-| `intent_response_cosine` | the same against the intended question; needs `ori_text` and `--embedding-model` | Zhang et al., 2020 (related method) | surrogate |
-| `answer_presence` | 0/1: whether the reference-answer span occurs in the reply (after SQuAD normalization, contiguously) | Chen et al., 2017 | established |
-| `reference_exact_match` | 0/1: whether the normalized reply *is* the reference answer | Rajpurkar et al., 2016 (SQuAD) | established |
-| `reference_answer_words` | length of the reference answer in words: this is what separates a short span from a paragraph extract | – | verifiable |
-| `reference_token_f1` | token-level overlap with the reference answer | Rajpurkar et al., 2016 (SQuAD) | established |
-| `reference_rouge_1` | unigram overlap | Lin, 2004 | established |
-| `reference_rouge_l` | longest-common-subsequence overlap | Lin, 2004 | established |
-| `reference_cosine` | embedding similarity to the reference; only with `--embedding-model` | Zhang et al., 2020 (related method) | surrogate |
-
-With several reference answers, the best match is kept. Overlap metrics
-correlate poorly with human judgement in dialogue (Liu et al., 2016), so they
-are for **screening**, not as a quality score.
-
-For an assistant that answers in a sentence, `answer_presence` is the
-informative one of the three agreement metrics: `reference_exact_match` is
-structurally near zero because the model does not return the bare span, and
-`reference_token_f1` is driven down by every extra word in the sentence.
-`answer_presence` is an **upper bound** on correctness: a reply that quotes the
-span while asserting something else still scores, a correct paraphrase does
-not — graded correctness needs a judge model (`--judge-model`) or a human
-round.
-
-#### The corpus's own answer key (`--answer-key`)
-
-Reference answers come from the corpus metadata table (CSV), not from a
-hand-written spec, so the `reference_*` columns trace back to the published
-dataset. The columns follow the SQuAD 2.0 convention (Rajpurkar et al., 2018):
-
-| Item state | Which column is the reference | What a match supports |
-| --- | --- | --- |
-| `is_impossible=FALSE` | `answer`: the annotated correct span | on a match, the reply was correct |
-| `is_impossible=TRUE` | `plausible_answers`: what the annotator found acceptable | on a match, the reply *resembles* what an annotator would have said — not correctness |
-
-The key is joined by **recording name** (item identifier, filename, then
-question text, in that order), because a misheard transcript must still be
-scored against the answer of the item the system was given. If both `--spec`
-and `--answer-key` are present, the spec wins: it was written for one
-evaluation, the key describes the whole corpus.
-
-The loader repairs two export artefacts, both because the silent alternative
-would bias the measurement: a leftover quote pair around the answer is stripped,
-and if a paragraph has leaked into the answer column the span after the closing
-quote is taken as the answer. A row with no answer in either column is left
-without a reference and is not entered into the key.
-
-The run summary (`answer_accuracy`, and the `leaderboard.csv` `*_short_span` /
-`*_plausible` columns) reports three subsets separately, because they do not
-support the same claim: (1) an answerable item with a short span of at most 8
-words — here presence is evidence of correctness; (2) an unanswerable item,
-with only a plausible answer; (3) an answerable item whose span is a paragraph
-extract, which a few-sentence reply cannot reproduce. A pooled rate would
-represent none of them correctly.
-
-### Tier 2 — factual commitments and hallucination
-
-`audit_atoms` is always produced. The `selfcheck_*` columns appear when
-`--selfcheck-samples` > 0, the `factprecision_*` columns when `--fact-precision`
-is set.
-
-| Column | Meaning | Source | Status |
-| --- | --- | --- | --- |
-| `audit_atoms` | extracted years, quantities, names and their counts: a checklist for human audit | Ji et al., 2023 (taxonomy) | verifiable |
-| `selfcheck_kernel` | `token_f1_surrogate` or `embedding_cosine`: which support measure ran | Manakul et al., 2023 | surrogate |
-| `selfcheck_samples` | how many resamples were compared | Manakul et al., 2023 | established |
-| `selfcheck_mean_inconsistency` | 0–1; how poorly the resamples support the reply's sentences | Manakul et al., 2023 | established |
-| `selfcheck_max_inconsistency` | the worst sentence | Manakul et al., 2023 | established |
-| `selfcheck_flagged_sentences` | sentences above the threshold, verbatim | Manakul et al., 2023 | established |
-| `selfcheck_error` | why it was skipped, when it was | – | verifiable |
-| `factprecision_n_claims` | number of atomic claims judged | Min et al., 2023 (FActScore) | established |
-| `factprecision_supported`, `factprecision_unsupported`, `factprecision_unverifiable` | counts of the three labels | Min et al., 2023 (FActScore) | established |
-| `factprecision_precision` | fraction of supported claims | Min et al., 2023 (FActScore) | established |
-| `factprecision_knowledge_source` | whether a reference answer was the knowledge source, or the model's own knowledge | – | verifiable |
-| `factprecision_unsupported_claims` | claims labelled unsupported | Min et al., 2023 (FActScore) | established |
-| `factprecision_error` | why it was skipped, when it was | – | verifiable |
-
-Two limits: self-consistency catches hallucination that comes from
-**uncertainty**; a confident, consistently repeated falsehood stays invisible.
-The default support measure is token overlap, not the published BERTScore/NLI
-kernel, so absolute values are not comparable with published SelfCheckGPT
-figures — they rank items within a run. On `factprecision_precision` without a
-reference, the judge's own knowledge is the yardstick, so
-`factprecision_knowledge_source` must be read before the number is reported.
-
-### Tier 3 — rubric (only with `--judge-model`)
-
-| Column | Meaning | Source | Status |
-| --- | --- | --- | --- |
-| `judge_<dimension>` | 15 dimensions on a 1–5 scale, with anchors | Liu et al., 2023 (G-Eval); Kim et al., 2024 (Prometheus 2) | established |
-| `judge_<dimension>_panel_spread` | on a panel, the largest disagreement; a large value means an unreliable dimension | Verga et al., 2024 | established |
-| `quality_composite` | weighted mean of the **non**-safety dimensions | Tam et al., 2024 (QUEST) | validated |
-| `safety_minimum` | the worst safety dimension; it gates, it is not averaged | Singhal et al., 2023 | validated |
-
-The rubric is built on the QUEST frame, but the weights are a local decision,
-not part of the published instrument. Pairwise comparison with
-`--compare-run-dir` runs every pair in both orders; a verdict that flips with
-order is a tie, because that is position bias, not a preference (Zheng et al.,
-2023).
-
-### Acceptance (always)
-
-| Column | Meaning | Source | Status |
-| --- | --- | --- | --- |
-| `accepted` | verdict of the predeclared policy | Gallifant et al., 2025 (TRIPOD-LLM) | verifiable |
-| `acceptance_reasons` | why it failed; empty on a pass | – | verifiable |
-
-If an input the decision needs is missing — for example the quality composite
-on a run without a judge — `accepted` stays empty; it is not defaulted to fail.
-
-### Tier 4 — agreement and calibration (only with `--human-annotations`)
-
-These are run-level values. They do not appear in the per-item CSV; they are in
-the report and the JSON.
-
-| Metric | Reading | Source | Status |
-| --- | --- | --- | --- |
-| `percent_agreement` | raw agreement among rater pairs; a baseline | – | verifiable |
-| `krippendorff_alpha_ordinal` / `_nominal` | handles missing cells and more than two raters | Krippendorff, 2018 | validated |
-| `cohen_kappa`, `fleiss_kappa` | chance-corrected agreement; band labels follow Landis and Koch | Cohen, 1960; Fleiss, 1971; Landis and Koch, 1977 | validated |
-| `gwet_ac1` | read this instead of κ on unbalanced categories | Gwet, 2008; Feinstein and Cicchetti, 1990 | validated |
-| `icc_2_1`, `icc_2_k` | two-way random model; label follows Koo and Li | Shrout and Fleiss, 1979; Koo and Li, 2016 | validated |
-| `judge_bias_vs_human`, `judge_mae_vs_human` | the judge's systematic offset and mean absolute error | – | verifiable |
-| `judge_human_spearman`, `judge_human_kendall_tau` | rank correlation of judge and human | – (rank correlation) | validated |
-| PPI estimate | a valid interval even when the judge is systematically wrong | Angelopoulos et al., 2023; Boyeau et al., 2024 | validated |
-
-### Aggregation
-
-Every run-level mean has a percentile bootstrap interval (Efron and Tibshirani,
-1993), which does not assume normality. Also available: Cliff's δ (1993), TOST
-equivalence (Lakens, 2017) and Holm correction (1979); two-run comparison adds
-the Wilcoxon signed-rank test (1945) and McNemar's test (1947).
-
-Holm correction runs **per metric family** — `adherence`, `response`,
-`runtime` — not over the whole table. The families are declared in the code in
-advance, so they are not chosen after seeing the results. The reason: most of
-the roughly forty metrics are milliseconds, and a single pooled correction
-would let the number of logged timings dilute the evidence a quality claim
-needs — and that number is a property of how finely the pipeline is
-instrumented, not of the question.
-
-## Literature used
-
-Status: `verifiable` = decided by construction, `validated` = a validated
-instrument or published statistical theory, `established` = a widely used
-method with published human correlation, `surrogate` = a deliberate
-simplification of a published method.
-
-| Method | Source | Status |
-| --- | --- | --- |
-| verifiable instruction following | Zhou et al., 2023 (IFEval) | verifiable |
-| token-level F1 | Rajpurkar et al., 2016 (SQuAD) | established |
-| ROUGE-1, ROUGE-L | Lin, 2004 | established |
-| limits of overlap metrics | Liu et al., 2016 | validated |
-| readability | Flesch, 1948; Kincaid et al., 1975 | validated |
-| self-consistency | Manakul et al., 2023 (SelfCheckGPT) | established |
-| token-overlap support kernel | – (in place of the published BERTScore/NLI kernel) | surrogate |
-| atomic factual precision | Min et al., 2023 (FActScore) | established |
-| rubric grading | Liu et al., 2023 (G-Eval); Kim et al., 2024 (Prometheus 2) | established |
-| judge panel | Verga et al., 2024 | established |
-| position-bias control | Zheng et al., 2023 | established |
-| health-evaluation frame | Tam et al., 2024 (QUEST) | validated |
-| empathy | Sharma et al., 2020 (EPITOME) | validated |
-| over-refusal | Röttger et al., 2024 (XSTest) | established |
-| clinical overreach | Singhal et al., 2023 | validated |
-| Krippendorff's α | Krippendorff, 2018 | validated |
-| Cohen's κ, Fleiss's κ | Cohen, 1960; Fleiss, 1971 | validated |
-| Gwet's AC1, prevalence paradox | Gwet, 2008; Feinstein and Cicchetti, 1990 | validated |
-| ICC | Shrout and Fleiss, 1979; Koo and Li, 2016 | validated |
-| prediction-powered inference | Angelopoulos et al., 2023 | validated |
-| bootstrap interval | Efron and Tibshirani, 1993 | validated |
-| Cliff's δ, TOST, Holm | Cliff, 1993; Lakens, 2017; Holm, 1979 | validated |
-| paired rank test, paired binary test | Wilcoxon, 1945; McNemar, 1947 | validated |
-| edit distance, word and character error rate | Levenshtein, 1966 | verifiable |
-| limits of WER as a proxy for understanding | Wang et al., 2003 | established |
-| the 95th percentile as the user-perceived delay | Dean and Barroso, 2013 | established |
-| cost measurement for spoken dialogue systems | Walker et al., 1997 (PARADISE) | validated |
-
-`--emit-bibtex` writes BibTeX entries for the methods actually used, so the
-bibliography does not swell with unused items.
-
-## Limits that a paper using these numbers should also state
-
-A judge score is a **screening tool, not a validated instrument**; without
-human calibration it should not be published as a quality estimate.
-Self-consistency values rank items within the run; they are not comparable with
-published SelfCheckGPT figures. The readability formulae were validated on
-written text; intelligibility of synthesized speech needs a listening test
-(ITU-T P.85 or P.808). Finally, coverage bounds every claim: a figure computed
-on open-domain items does not support a statement about therapy scenarios.
-
-## Self-test
+Minden futás **egyszer** értékelődik ki, akárhány kontrasztban szerepel. Ez nemcsak munkát
+spórol: így egy futás számai minden táblában ugyanazok, amit a kontrasztonkénti
+újraértékelés nem garantálna.
+
+## Teljes kimenetfa kiértékelése (`evaluation.campaign`)
+
+Az új mérési kampány több fát ír az `outputs/` alá (ASR-only, fagyasztott átiratú
+LLM-karok három független indítással, valós idejű TTFA-validáció). Ezeket egy
+lépésben a kampány mód értékeli ki, és az `outputs_evaluations/` alá írja:
 
 ```powershell
-python -m evaluation.selftest
+py -m evaluation.campaign --outputs ..\outputs --out-dir ..\outputs_evaluations
 ```
 
-The suite runs without a network. It checks the statistics against worked or
-published values, because a wrong coefficient still returns a plausible number.
-The printed line `OK: N checks passed` is the current count (224 as of this
-writing).
+Ugyanez a pipeline belépési pontjáról:
+
+```powershell
+py mwe_assistant.py --evaluate-campaign ..\outputs --eval-out-dir ..\outputs_evaluations
+```
+
+A `config/<round>/<timestamp>/` elrendezésben a kerekek **replikátumok**, nem külön
+konfigurációk. A kontrasztok cellánként épülnek; a launch-szintű ICC(2,1)
+(Shrout és Fleiss, 1979) és a launch-tartomány a host-stabil állításokhoz kell.
+A mért és a rekonstruált TTFA egyezését Bland–Altman (1986) vizsgálja. A két ismert
+hibás felvétel (`572a0bfaaf94a219006aa77a`, `5729e500af94a219006aa6b5`) alapból
+kimarad.
+
+### Az öt kontraszt
+
+A csoportosítás a rögzített konfigurációból (`config_used.yaml`) készül, nem a könyvtárnévből,
+így egy félreírt mappanév nem tud csendben hibás összehasonlítást előállítani. Kontraszt csak
+ott jön létre, ahol **pontosan egy** tulajdonság tér el a futások között — ez teszi a
+különbséget ahhoz a tulajdonsághoz köthetővé.
+
+| Kontraszt | Mit tart fixen | Mi változik | Alapvonal |
+| --- | --- | --- | --- |
+| `parameters` | modell, kvantálás, felismerő | dekódolási beállítás (`t`, `seed`) | a greedy (`t=0`) futás |
+| `quantization` | modell, méret, beállítás, felismerő | súlypontosság | a legnagyobb pontosság (`fp16`) |
+| `model_size` | modellvonal, pontosság, beállítás, felismerő | paraméterszám | a legnagyobb modell |
+| `cross_model` | dekódolási beállítás, felismerő | a modell | a legerősebb változat |
+| `recognizer` | modell és dekódolási beállítás | a felismerő (motor, akusztikus modell, eszköz) | a rács többségében használt felismerő |
+
+Az alapvonal nem azt állítja, hogy az a legjobb: az a **referencia, amihez a változást
+mérjük**. Ezért a negatív delta úgy olvasandó, hogy *ennyibe kerül a takarékosabb
+konfiguráció*. A 16 cellás rács (2 modellvonal, 6 méret, 3 kvantálás, 2 dekódolási
+beállítás) ebből 16 csoportot és 32 páros összevetést ad.
+
+A felismerőt a modellkontrasztok **fixen tartják**: amit a felismerő kiírt, az a modell
+bemenete, így két felismerő összekeverése egy bemenetváltozást jelentene modellhatásként. A
+felismerő azonosítója a motor mellett az akusztikus modellt, az eszközt és a számítási
+pontosságot is tartalmazza (`vosk-small-en-us-0.15-cpu`, `whisper-small-cuda-int8`), mert
+ugyanaz a motor más modellel másképp ismer fel. Ahol a rács több felismerőt fog át, a
+csoportazonosító kiírja, melyiket tartja fixen; egyetlen felismerő esetén a nevek
+változatlanok. A `recognizer` kontraszt az egyetlen, amelyben a két oldal átirata eltér: a
+párosítás ezért a felvétel nevére megy, nem a felismert szövegre, különben épp azok az itemek
+esnének ki, amelyeken a két felismerő nem egyezik.
+
+A méret-létra **modellvonal** szerint csoportosul, nem pontos családnév szerint: a kapható
+méretek kiadások között oszlanak el (a llama3.2 az 1b és 3b, a llama3.1 a 8b), így a
+családhatárnál megálló létrából épp a legnagyobb modell maradna ki. Ahol a létra átlép egy
+kiadást, azt a csoport `varying` mezője kiírja — ott a paraméterszám mellett a kiadás is
+változik, és ezt nem lehet szétválasztani.
+
+### Amit előbb ellenőriz, mint hogy összehasonlítana
+
+A páros összevetés csak akkor a konfigurációról szól, ha minden más fixen volt. A batch ezt
+nem feltételezi, hanem ellenőrzi, és minden sérülést azokkal az eredményekkel együtt ír ki,
+amelyeket érint: ugyanaz az item-halmaz, ugyanaz a bemeneti szöveg, ugyanaz a rendszerprompt,
+ellenőrzés-definíció, felismerő, számítási mód, kontextusablak és tokenkorlát. Az alternatíva
+egy olyan különbségtábla, amiben csendben benne van egy promptcsere is.
+
+Az ellenőrzés **kontrasztonként** fut, és a sérülést ahhoz a kontraszthoz írja ki, amelyet
+érint: egy két felismerőt átfogó rács nem sérülés, ha minden modellkontraszt egy felismerőt
+tart fixen. A `recognizer` kontrasztban a felismerő és az átirat eltérése maga a vizsgált
+tulajdonság, ezért ott a **szándékolt kérdés** azonosságát ellenőrzi helyettük.
+
+### Kimenet
+
+`--out-dir` nélkül a `--root` **mellé** ír, `evaluation_result` néven: így az újraértékelés
+nem ír bele abba a könyvtárba, amit olvas, és a teljes összevetés egy archiválható egység.
+
+| Fájl | Tartalom |
+| --- | --- |
+| `summary_report.txt` | a rács egyetlen olvasható jelentése: bemenet, két rangsor, válasz-egyezés, strátumok, kontrasztok, forrásjegyzék |
+| `leaderboard.csv` | futásonként egy sor: a konfiguráció és minden fő mérőszám egymás mellett |
+| `comparison_index.csv` | minden kontraszt minden metrikája p-értékkel és verdikttel, gépi feldolgozásra |
+| `input_reference.csv` | a közös bemenet felismerőnként: szándékolt szöveg, felismert szöveg, itemenkénti hibaarányok |
+| `input_quality_strata.csv` | futás × bemeneti minőség szerinti bontás |
+| `input_quality_impact.csv` | a felismerési hiba rangkorrelációja minden válasz-mérőszámmal |
+| `all_items.csv` | minden futás minden iteme egy táblában (futásszám × n), pivotálásra vagy ábrához |
+| `batch_manifest.json` | mely futásokat olvasta, milyen beállításokkal, és hova írta az eredményüket |
+| `runs/<cella>/` | futásonkénti riport, itemenkénti CSV, JSON, és a `config_used.yaml` másolata |
+| `comparisons/<típus>/<csoport>/` | egy kontraszt teljes páros összehasonlító táblája |
+
+### Paraméterek
+
+| Kapcsoló | Alapérték | Szerep |
+| --- | --- | --- |
+| `--root` | – | a futásokat tartalmazó könyvtár; rekurzívan keres transzkriptet |
+| `--out-dir` | `<root>/../evaluation_result` | kimeneti könyvtár |
+| `--group` | mind az öt | csak a megadott kontraszt épüljön meg; ismételhető |
+| `--spec`, `--constraints` | – | **minden** futásra azonosan alkalmazva |
+| `--answer-key` | – | a korpusz metaadat-táblája (CSV) a referencia-válaszokkal, **minden** futásra azonosan |
+| `--judge-model`, `--selfcheck-samples` | – | költséges: minden futásra lefut |
+| `--no-latency` | ki | ne olvassa a latencianaplókat |
+| `--latency-warmup` | a futás `log_averages.json`-jában rögzített érték | hány kezdő elem maradjon ki a latenciaösszesítésből; a minőségi pontszámokat nem érinti |
+| `--alpha`, `--n-boot`, `--seed` | 0.05, 2000, 0 | mint a páros összehasonlításnál |
+| `--quiet` | ki | ne írja a jelentést a kimenetre |
+
+## Függőségek
+
+`requests`, `PyYAML`, `numpy` — telepítés: `pip install -r evaluation/requirements.txt`.
+A `scipy` és a `sentence-transformers` opcionális, futásidőben észlelt. A modellt igénylő
+szintekhez helyben futó Ollama kell; ha nincs, a futás nem áll le, csak jelzi a kimaradt
+szintet.
+
+## A csomag szerkezete
+
+| Fájl | Szerep |
+| --- | --- |
+| `pipeline.py` | `EvaluationConfig`, `EvaluationOutcome`, `run_evaluation()` — a vezénylés |
+| `cli.py`, `__main__.py` | parancssori réteg a `run_evaluation` fölött |
+| `comparison.py` | két futás páros összehasonlítása, saját parancssorral |
+| `batch.py` | egy futásrács kiértékelése és a kontrasztok megépítése, saját parancssorral |
+| `replicates.py` | független indítások (launch) mint kísérleti egység: ICC, tartomány |
+| `ttfa_validation.py` | mért vs. rekonstruált TTFA, Bland–Altman egyezés |
+| `campaign.py` | teljes `outputs/` fa kiértékelése `outputs_evaluations/` alá |
+| `constraints.py` | 0. szint: eldönthető ellenőrzések |
+| `asr.py` | felismerési hűség a szándékolt kérdéshez képest: WER, CER, tartalmi fedés, strátumok |
+| `latency.py` | itemenkénti szakaszidők és erőforrás-költség a futás latencianaplójából |
+| `relevance.py` | 1. szint: lefedettség és átfedés |
+| `factuality.py` | 2. szint: audit-atomok, önkonzisztencia, atomi állítások |
+| `judge.py` | 3. szint: rubrika, panel, páros összevetés |
+| `agreement.py`, `stats.py` | 4. szint és a statisztikai eszközök |
+| `aggregation.py` | itemenkénti pontszámok, futásszintű összegzés, elfogadási politika |
+| `reporting.py` | riport, CSV, JSON előállítása |
+| `references.py` | módszer → irodalom → validáltsági szint nyilvántartás |
+| `loaders.py` | transzkript, forgatókönyv-leírás, korpusz-válaszkulcs és futás-artefaktumok beolvasása |
+| `textutils.py` | mondatvágás, normalizálás, szótagszámlálás — a mérőszámok közös alapja |
+| `ollama_client.py` | HTTP-réteg a helyi modellhez: újrapróbálkozás, JSON-visszanyerés |
+| `selftest.py` | 177 ellenőrzés, hálózat nélkül |
+| `fake_ollama.py` | protokoll-hű teszt-szerver a modellt igénylő szintekhez |
+| `requirements.txt` | a három kötelező függőség, plusz a két opcionális megjegyzésben |
+
+Két adatkönyvtár tartozik a csomaghoz. A `rubrics/` **nem elhagyható**: a kód
+alapértelmezései hivatkoznak rá.
+
+| Fájl | Szerep |
+| --- | --- |
+| `rubrics/constraints_short_opener.yaml` | a 0. szint 15 ellenőrzésének definíciója (`--constraints` alapértéke) |
+| `rubrics/quest_therapy_v1.yaml` | a 15 dimenziós bírálati rubrika (`--rubric` alapértéke) |
+
+Az `examples/` ezzel szemben sablon: másold és írd át, a csomag működéséhez nem kell.
+
+| Fájl | Szerep |
+| --- | --- |
+| `examples/scenarios_open_domain_smoke.yaml` | teljes forgatókönyv-leírás referencia-válaszokkal és tiltott mintákkal |
+| `examples/scenarios_minimal_categories.yaml` | referencia nélküli változat: csak kategória és elvárt viselkedés |
+| `examples/scenarios_therapy_template.yaml` | terápiás sablon; ez sorolja fel **minden** olvasott mezőt és a 11 kategórianevet |
+| `examples/human_annotations_example.csv` | a 4. szint bemeneti formátuma: `item_id,rater_id,dimension,score` |
+
+## Szintek
+
+| Szint | Mit mér | Mikor fut |
+| --- | --- | --- |
+| 0 | prompt-megfelelés, olvashatóság | mindig, modell nélkül |
+| – | felismerési hűség (WER, CER, tartalmi fedés, strátumok) | ha a transzkript tartalmaz `ori_text`-et |
+| – | szakaszidők és erőforrás-költség | ha a futás mellett van `latency_log_*.csv` |
+| 1 | relevancia, referencia-átfedés, válasz-egyezés | mindig; az átfedéshez és az egyezéshez `--answer-key` vagy `--spec` kell |
+| 2 | ténykötelmek, hallucináció | audit-atomok mindig; a többi opcionális |
+| 3 | rubrika-alapú bírálat | `--judge-model` esetén |
+| 4 | értékelői egyetértés, kalibráció | `--human-annotations` esetén |
+
+### Bemeneti minőség és futásidő
+
+A két számozás nélküli sor nem a válaszról szól, hanem arról, hogy **mit kapott a modell** és
+**mibe került a válasz**. Egyik sem igényel modellt vagy referencia-választ.
+
+A felismerési hűség a transzkript `ori_text` mezőjéhez, vagyis a szándékolt elhangzott
+kérdéshez mér. Ez nem minőségi pontszám: azt korlátozza, hogy a modell mire *tudott*
+válaszolni. A számokat tartalmazó referenciánál több elhangzási változat (tőszámnév, évszám,
+számjegyenkénti olvasat) közül a legjobban illeszkedő számít, hogy a felismerő ne kapjon
+hibapontot azért, mert az „1990”-et kimondva hallotta. Az itemek WER alapján három
+strátumba kerülnek — `clean` (hibátlan), `mild` (a referenciaszavak legfeljebb harmada
+sérült), `severe` (ennél több) —, és a jelentés strátumonként is közli a prompt-megfelelést.
+Lefedettséget strátumok között nem érdemes összevetni: egy zárt kérdésre adott helyes válasz
+nem ismétli meg a kérdést, így a lefedettsége a modelltől független okból alacsony.
+
+A futásidő a futás saját `latency_log_*.csv`-jéből jön, itemenként, a felvétel neve szerint
+párosítva — nem sorrend szerint, hogy egy megszakadt futás se csúsztassa el az egészet. A
+szakaszok átfedik egymást és nem ugyanabból a pillanatból indulnak, ezért nem összegezhetők:
+a `stt` a felvétel beszédtempóban való beérkezése (fájlbemeneten a hang hossza, nem
+számítási költség), a `ttfa` a beszéd végétől az első kiadott hangig tart — ez az, amit a
+felhasználó kivár —, az `e2e_response_ready` pedig a teljes tétel, a felvétellel együtt,
+ezért főleg a beszéd hosszát tükrözi. Modellek összevetésénél a `ttfa` és a tokenátbocsátás
+a beszédes oszlop.
+
+## Paraméterek
+
+| Kapcsoló | Alapérték | Szerep |
+| --- | --- | --- |
+| `--run-dir` | – | futás könyvtára; ebből olvassa a transzkriptet, a configot és a rendszerpromptot |
+| `--transcripts` | – | önálló transzkript-fájl, ha nincs meg a futás többi artefaktuma |
+| `--spec` | – | forgatókönyv-leírás: kategória, referencia-válasz, kötelező/tiltott tartalom |
+| `--answer-key` | – | a korpusz metaadat-táblája (CSV): `answer` / `plausible_answers` az `is_impossible` szerint |
+| `--system-prompt` | futásból | felülírja a bíráláshoz használt rendszerpromptot |
+| `--constraints` | `constraints_short_opener.yaml` | a 0. szint ellenőrzéseinek definíciója |
+| `--max-tokens` | configból | a vágás-detektáláshoz használt `num_predict` korlát |
+| `--embedding-model` | – | pl. `all-MiniLM-L6-v2`; első használatkor letöltést igényel |
+| `--selfcheck-samples` | 0 | önkonzisztencia-újramintázás darabszáma; 0 = kikapcsolva |
+| `--selfcheck-model` | configból | **a válaszokat előállító** modell legyen |
+| `--selfcheck-temperature` | 0.8 | újramintázási hőmérséklet |
+| `--fact-precision` | ki | atomi állításokra bontás és címkézés |
+| `--max-claims` | 10 | állítás-korlát válaszonként |
+| `--judge-model` | – | bíráló Ollama-tag; ismételhető, több modell panelt alkot |
+| `--judge-url` | `localhost:11434` | Ollama végpont |
+| `--judge-samples` | 1 | minta dimenziónként; 1 fölött G-Eval-szerű várható érték |
+| `--rubric` | `quest_therapy_v1.yaml` | a rubrika definíciója |
+| `--compare-run-dir` | – | második futás A/B összevetéshez, mindkét sorrendben |
+| `--human-annotations` | – | hosszú formátumú CSV: `item_id,rater_id,dimension,score` |
+| `--min-quality` | 3.5 | elfogadási küszöb a minőségi kompozitra |
+| `--min-safety` | 4.0 | küszöb a legrosszabb biztonsági dimenzióra |
+| `--loose-constraints` | ki | a megengedő verdikt alapján kapuz, formázási hibát elnézve |
+| `--out-dir` | `<run-dir>/evaluation` | kimeneti könyvtár |
+| `--emit-bibtex` | ki | BibTeX a ténylegesen használt módszerekhez |
+| `--seed` | 0 | bootstrap újramintázás magja |
+
+> Az elfogadási küszöböket **mérés előtt** kell rögzíteni: bekerülnek a riport fejlécébe,
+> utólagos hangolásuk értelmetlenné teszi az elfogadási arányt.
+
+## Kimenet
+
+| Fájl | Tartalom |
+| --- | --- |
+| `evaluation_report.txt` | olvasható riport: szakaszok, forrásjegyzék, értelmezési korlátok |
+| `evaluation_items.csv` | itemenként egy sor, minden mérőszámmal |
+| `evaluation_results.json` | teljes strukturált kimenet |
+| `evaluation_references.bib` | BibTeX, `--emit-bibtex` esetén |
+
+## Számított értékek és értelmezésük
+
+Az alábbi táblázatok az `evaluation_items.csv` oszlopait követik, a fájlbeli sorrendben.
+Egy oszlop csak akkor kerül be, ha az őt előállító szint lefutott — ez minden szakasz
+elején szerepel —, tehát egy modell nélküli futás CSV-je rövidebb, nem hiányos.
+
+A **Státusz** oszlop jelentése: `verifiable` = konstrukció szerint eldől, `validated` =
+validált eszköz vagy publikált elmélet, `established` = elterjedt, emberi korrelációval
+alátámasztott módszer, `surrogate` = publikált módszer tudatos egyszerűsítése. Ahol a
+forrás `–`, ott nincs mögötte publikáció: saját, de determinisztikus számítás.
+
+### Azonosítás (mindig)
+
+| Oszlop | Jelentés | Forrás | Státusz |
+| --- | --- | --- | --- |
+| `item_id` | stabil azonosító; a felvétel nevéből, a forgatókönyv-leírásból vagy sorszámból | – | verifiable |
+| `filename` | a felvétel neve; ez a kapocs a latencianaplóhoz és futások között | – | verifiable |
+| `category` | a forgatókönyv-kategória; ez dönti el, mely ellenőrzések és rubrika-dimenziók élnek | – | verifiable |
+| `safety_critical_item` | biztonságkritikus-e az item | – | verifiable |
+| `stt_text`, `llm_text` | a kiértékelt bemenet és válasz, szó szerint | – | verifiable |
+| `ori_text` | a szándékolt elhangzott kérdés, ha a transzkript tartalmazza | – | verifiable |
+
+### 0. szint – eldönthető prompt-megfelelés (mindig)
+
+| Oszlop | Jelentés | Forrás | Státusz |
+| --- | --- | --- | --- |
+| `constraint_item_pass_strict` | teljesült-e **minden** kemény megszorítás; ez a fő megfelelési mutató | Zhou et al., 2023 (IFEval) | verifiable |
+| `constraint_item_pass_loose` | ugyanaz, formázási átalakítások után; ha a szigorútól eltér, a hiba pusztán formázási | Zhou et al., 2023 (IFEval) | verifiable |
+| `constraint_check_rate_strict` | a teljesített ellenőrzések aránya; a nem alkalmazható ellenőrzés kimarad a nevezőből | Jiang et al., 2024 (FollowBench) | verifiable |
+| `constraint_check_rate_loose` | ugyanaz megengedő verdikttel | Jiang et al., 2024 (FollowBench) | verifiable |
+| `constraint_failures_strict` | a bukott ellenőrzések neve, pontosvesszővel; audit-nyom | – | verifiable |
+| `constraint_failures_loose` | ugyanaz megengedő verdikttel | – | verifiable |
+
+A szigorú/megengedő pár az IFEval kettős kiértékelését követi. A 15 ellenőrzés: nem üres
+válasz, nyitómondat ≤ 5 szó, nyitómondat végén pont, 0–2 részletmondat, összesen 1–3 mondat,
+angol nyelv, nincs szimulált dialógus, nincs visszakérdezés (tájékoztató), befejezettség,
+tokenvágás, szószám (tájékoztató), beszédidő (tájékoztató), nincs markup, valamint a
+forgatókönyvből jövő kötelező és tiltott tartalom.
+
+### Leíró és olvashatósági mérőszámok (mindig)
+
+| Oszlop | Jelentés | Forrás | Státusz |
+| --- | --- | --- | --- |
+| `word_count`, `sentence_count`, `char_count` | terjedelem | – | verifiable |
+| `mean_words_per_sentence` | átlagos mondathossz | – | verifiable |
+| `opening_words` | az első mondat szószáma; a nyitómondat-megszorítás mért értéke | – | verifiable |
+| `estimated_tokens` | **becslés**, nem mért tokenszám; a vágás gyanújához használjuk | – (tokenizáló helyett heurisztika) | surrogate |
+| `estimated_spoken_seconds` | becsült beszédidő 2,5 szó/mp mellett | – (heurisztika) | surrogate |
+| `flesch_reading_ease` | magasabb = könnyebb | Flesch, 1948 | validated |
+| `flesch_kincaid_grade` | iskolai évfolyamban kifejezett nehézség | Kincaid et al., 1975 | validated |
+
+### Felismerési hűség (ha van `ori_text`)
+
+| Oszlop | Jelentés | Forrás | Státusz |
+| --- | --- | --- | --- |
+| `stt_wer` | szóhibaarány a szándékolt kérdéshez; a számok elhangzási változatai közül a legjobb illeszkedés számít | Levenshtein, 1966 | verifiable |
+| `stt_cer` | karakterhibaarány; egy elírt szó itt kevesebbe kerül, mint a WER-ben | Levenshtein, 1966 | verifiable |
+| `stt_substitutions`, `stt_deletions`, `stt_insertions` | a hibák típus szerinti bontása | Levenshtein, 1966 | verifiable |
+| `stt_content_recall` | a tartalmi (nem funkció-) szavak közül mennyi élte túl a felismerést | – | verifiable |
+| `stt_exact_match` | szó szerint egyezik-e a felismerés a referenciával | – | verifiable |
+| `stt_stratum` | `clean`, `mild` vagy `severe` a WER alapján | Wang et al., 2003 | verifiable |
+
+A WER nem minőségi mutató, hanem korlát: azt mondja meg, mennyire *más* kérdést kapott a
+modell (Wang et al., 2003).
+
+### Futásidő és erőforrás (ha van latencianapló)
+
+| Oszlop | Jelentés | Forrás | Státusz |
+| --- | --- | --- | --- |
+| `lat_stt`, `lat_stt_endpoint_delay` | a felvétel beérkezése, illetve a beszédvég utáni lezárás; kontrollváltozók, nem a modellről szólnak | – | verifiable |
+| `lat_llm_prompt_eval`, `lat_llm_ttft`, `lat_llm_ttfc` | prompt-feldolgozás, első token, első kimondható egység | – | verifiable |
+| `lat_ttfa` | a beszéd végétől az első kiadott hangig: amit a felhasználó kivár | Walker et al., 1997 (PARADISE) | verifiable |
+| `lat_llm_eval`, `lat_tts_total` | generálás és szintézis teljes ideje; a válasz hosszával nő | – | verifiable |
+| `lat_e2e_response_ready` | a teljes tétel ideje, a felvétellel együtt | – | verifiable |
+| `llm_prompt_tokens`, `llm_eval_tokens`, `llm_tokens_per_sec` | a motor saját tokenszámai és átbocsátása | – | verifiable |
+| `tts_audio_ms` | a szintetizált hang hossza | – | verifiable |
+
+A jelentés a mediánt és a 95. percentilist is közli, mert egy beszélő asszisztenst a késve
+megérkező válaszok minősítenek (Dean és Barroso, 2013).
+
+### 1. szint – relevancia (a `reference_*` oszlopokhoz `--answer-key` vagy `--spec` referencia-válasz kell)
+
+| Oszlop | Jelentés | Forrás | Státusz |
+| --- | --- | --- | --- |
+| `request_coverage` | a **felismert** kérdés tartalmi szavainak IDF-súlyozott lefedettsége; referencia nem kell hozzá | – (IDF-súlyozott átfedés) | surrogate |
+| `intent_coverage` | ugyanez a **szándékolt** kérdés ellen, ha van `ori_text` | – (IDF-súlyozott átfedés) | surrogate |
+| `coverage_intent_gap` | a kettő különbsége: ennyit vitt el a felismerő az interakcióból | – | verifiable |
+| `echo_ratio` | mennyit ismétel vissza a kérdésből; magas érték üres visszhangra utal | – | verifiable |
+| `request_response_cosine` | beágyazásos hasonlóság kérdés és válasz közt; csak `--embedding-model` esetén | Zhang et al., 2020 (rokon eljárás) | surrogate |
+| `intent_response_cosine` | ugyanez a szándékolt kérdés ellen; `ori_text` és `--embedding-model` kell hozzá | Zhang et al., 2020 (rokon eljárás) | surrogate |
+| `answer_presence` | 0/1: benne van-e a válaszban a referencia-válasz szövege (SQuAD-normalizálás után, összefüggően) | Chen et al., 2017 | established |
+| `reference_exact_match` | 0/1: a normalizált válasz *maga* a referencia-válasz | Rajpurkar et al., 2016 (SQuAD) | established |
+| `reference_answer_words` | a referencia-válasz hossza szóban: e szerint válik el a rövid válasz-szakasz a bekezdés-kivonattól | – | verifiable |
+| `reference_token_f1` | token-szintű átfedés a referencia-válasszal | Rajpurkar et al., 2016 (SQuAD) | established |
+| `reference_rouge_1` | unigram-átfedés | Lin, 2004 | established |
+| `reference_rouge_l` | leghosszabb közös részsorozat szerinti átfedés | Lin, 2004 | established |
+| `reference_cosine` | beágyazásos hasonlóság a referenciához; csak `--embedding-model` esetén | Zhang et al., 2020 (rokon eljárás) | surrogate |
+
+Több referencia-válasz esetén a legjobb egyezés kerül be. Az átfedés-alapú mérőszámok
+dialógusban gyengén korrelálnak az emberi ítélettel (Liu et al., 2016), ezért **szűrésre**
+valók, minőségi pontszámként nem.
+
+Egy mondatban válaszoló asszisztensnél a három egyezés-mérőszám közül az `answer_presence` az
+informatív: az `reference_exact_match` szerkezetileg nulla közeli, mert a modell nem a puszta
+válasz-szakaszt adja vissza, a `reference_token_f1`-et pedig lenyomja a mondat minden további
+szava. Az `answer_presence` **felső korlát** a helyességen: aki idézi a szakaszt, de közben mást
+állít, kap pontot, aki más szavakkal válaszol helyesen, nem kap — graduált helyesség-ítélethez
+bíráló modell (`--judge-model`) vagy emberi kör kell.
+
+#### A korpusz saját válaszkulcsa (`--answer-key`)
+
+A referencia-válaszok nem kézzel írt spec-ből, hanem a korpusz metaadat-táblájából (CSV)
+származnak, így a `reference_*` oszlopok visszavezethetők a publikált adathalmazra. A tábla
+oszlopai a SQuAD 2.0 konvencióját követik (Rajpurkar et al., 2018):
+
+| Az item állapota | Melyik oszlop a referencia | Mit szabad rá alapozni |
+| --- | --- | --- |
+| `is_impossible=FALSE` | `answer`: az annotált helyes szakasz | egyezés esetén a válasz helyes volt |
+| `is_impossible=TRUE` | `plausible_answers`: amit az annotátor elfogadhatónak tartott | egyezés esetén a válasz *hasonlít* arra, amit egy annotátor mondott volna — nem helyesség |
+
+A kulcs a **felvétel neve** szerint kapcsolódik az itemekhez (item-azonosító, fájlnév, majd
+kérdésszöveg sorrendben), mert a félrehallott transzkript is annak az itemnek a válaszával
+mérendő, amit a rendszer kapott. Ha `--spec` és `--answer-key` is megvan, a spec az erősebb:
+azt egy konkrét kiértékeléshez írták, a kulcs az egész korpuszt írja le.
+
+A tábla két hibáját a betöltő kezeli, mindkettőt azért, mert a hallgatólagos alternatíva a
+mérést rontaná: az exportáláskor a válasz körül maradt idézőjelpárt eltávolítja, a válasz-oszlopba
+becsúszott bekezdés után pedig a záró idézőjelet követő szakaszt veszi válasznak. Amelyik sorban
+egyik oszlopban sincs válasz, az item referencia nélkül marad, és ki sem kerül a kulcsba.
+
+A futásösszegzés (`answer_accuracy`, illetve a `leaderboard.csv` `*_short_span`, `*_plausible`
+oszlopai) három részhalmazt külön közöl, mert nem ugyanazt támasztják alá: (1) válaszolható item
+rövid, legfeljebb 8 szavas válasz-szakasszal — itt a jelenlét a helyesség bizonyítéka; (2)
+válaszolhatatlan item, csak elfogadható válasszal; (3) válaszolható item, de a válasz-szakasz
+bekezdés-kivonat, amit néhány mondatos válasz nem tud visszaadni. A poololt arány egyiket sem
+jelentené helyesen.
+
+### 2. szint – ténykötelmek és hallucináció
+
+Az `audit_atoms` mindig előáll. A `selfcheck_*` oszlopok `--selfcheck-samples` > 0, a
+`factprecision_*` oszlopok `--fact-precision` esetén jelennek meg.
+
+| Oszlop | Jelentés | Forrás | Státusz |
+| --- | --- | --- | --- |
+| `audit_atoms` | kigyűjtött évszámok, mennyiségek, nevek és darabszámuk: ellenőrzőlista emberi auditra | Ji et al., 2023 (taxonómia) | verifiable |
+| `selfcheck_kernel` | `token_f1_surrogate` vagy `embedding_cosine`: melyik támogatás-mérték futott | Manakul et al., 2023 | surrogate |
+| `selfcheck_samples` | hány újramintát vetett össze | Manakul et al., 2023 | established |
+| `selfcheck_mean_inconsistency` | 0–1; mennyire nem támogatják a válasz mondatait az újraminták | Manakul et al., 2023 | established |
+| `selfcheck_max_inconsistency` | a legrosszabb mondat értéke | Manakul et al., 2023 | established |
+| `selfcheck_flagged_sentences` | a küszöb fölötti mondatok, szó szerint | Manakul et al., 2023 | established |
+| `selfcheck_error` | miért maradt ki, ha kimaradt | – | verifiable |
+| `factprecision_n_claims` | a megítélt atomi állítások száma | Min et al., 2023 (FActScore) | established |
+| `factprecision_supported`, `factprecision_unsupported`, `factprecision_unverifiable` | a három címke darabszáma | Min et al., 2023 (FActScore) | established |
+| `factprecision_precision` | a támogatott állítások aránya | Min et al., 2023 (FActScore) | established |
+| `factprecision_knowledge_source` | referencia-válasz volt-e a tudásforrás, vagy a modell saját tudása | – | verifiable |
+| `factprecision_unsupported_claims` | a nem támogatottnak címkézett állítások | Min et al., 2023 (FActScore) | established |
+| `factprecision_error` | miért maradt ki, ha kimaradt | – | verifiable |
+
+Két korlát: az önkonzisztencia a **bizonytalanságból** fakadó hallucinációt fogja meg, a
+magabiztosan és következetesen ismételt tévedés láthatatlan marad. A támogatás-mérték
+alapértelmezésben token-átfedés, nem a publikált BERTScore/NLI kernel, ezért az abszolút
+értékek publikált SelfCheckGPT-számokkal nem vethetők össze — a futáson belül rangsorolnak.
+Referencia nélküli `factprecision_precision` esetén a bíráló saját tudása a mérce, ezért a
+`factprecision_knowledge_source` mezőt közlés előtt el kell olvasni.
+
+### 3. szint – rubrika (csak `--judge-model` esetén)
+
+| Oszlop | Jelentés | Forrás | Státusz |
+| --- | --- | --- | --- |
+| `judge_<dimenzió>` | 15 dimenzió 1–5 skálán, horgonyokkal | Liu et al., 2023 (G-Eval); Kim et al., 2024 (Prometheus 2) | established |
+| `judge_<dimenzió>_panel_spread` | panel esetén a legnagyobb eltérés; nagy érték = megbízhatatlan dimenzió | Verga et al., 2024 | established |
+| `quality_composite` | súlyozott átlag a **nem** biztonsági dimenziókból | Tam et al., 2024 (QUEST) | validated |
+| `safety_minimum` | a legrosszabb biztonsági dimenzió; kapuként működik, nem átlagolódik | Singhal et al., 2023 | validated |
+
+A rubrika a QUEST keretére épül, de a súlyozás helyi döntés, nem a publikált eszköz része.
+A `--compare-run-dir` páros összevetésénél minden pár mindkét sorrendben lefut; a
+sorrenddel változó verdikt döntetlen lesz, mert az pozíció-torzítás, nem preferencia
+(Zheng et al., 2023).
+
+### Elfogadás (mindig)
+
+| Oszlop | Jelentés | Forrás | Státusz |
+| --- | --- | --- | --- |
+| `accepted` | az előre rögzített politika verdiktje | Gallifant et al., 2025 (TRIPOD-LLM) | verifiable |
+| `acceptance_reasons` | miért bukott; üres, ha átment | – | verifiable |
+
+Ha a döntéshez szükséges bemenet hiányzik — például bírálat nélküli futásban a minőségi
+kompozit —, az `accepted` üresen marad, nem bukásra alapértelmezik.
+
+### 4. szint – egyetértés és kalibráció (csak `--human-annotations` esetén)
+
+Ezek futásszintű értékek, nem kerülnek az itemenkénti CSV-be; a riportban és a JSON-ban
+találhatók.
+
+| Mérőszám | Értelmezés | Forrás | Státusz |
+| --- | --- | --- | --- |
+| `percent_agreement` | nyers egyetértés az értékelőpárok közt; alapvonal | – | verifiable |
+| `krippendorff_alpha_ordinal` / `_nominal` | hiányzó cellát és több értékelőt is kezel | Krippendorff, 2018 | validated |
+| `cohen_kappa`, `fleiss_kappa` | véletlennel korrigált egyetértés; a sávcímkék Landis és Koch szerint | Cohen, 1960; Fleiss, 1971; Landis és Koch, 1977 | validated |
+| `gwet_ac1` | aszimmetrikus kategóriákon ezt olvassuk κ helyett | Gwet, 2008; Feinstein és Cicchetti, 1990 | validated |
+| `icc_2_1`, `icc_2_k` | kétszempontos véletlen modell; a címke Koo és Li szerint | Shrout és Fleiss, 1979; Koo és Li, 2016 | validated |
+| `judge_bias_vs_human`, `judge_mae_vs_human` | a bíráló szisztematikus eltérése és átlagos hibája | – | verifiable |
+| `judge_human_spearman`, `judge_human_kendall_tau` | rangkorreláció a bíráló és az ember közt | – (rangkorreláció) | validated |
+| PPI-becslés | akkor is érvényes intervallum, ha a bíráló szisztematikusan téved | Angelopoulos et al., 2023; Boyeau et al., 2024 | validated |
+
+### Aggregálás
+
+Minden futásszintű átlaghoz percentilis bootstrap intervallum tartozik (Efron és
+Tibshirani, 1993), ami nem igényel normalitást. Elérhető még Cliff δ (1993), TOST
+ekvivalencia-teszt (Lakens, 2017) és Holm-korrekció (1979); két futás összevetésében ezekhez
+jön a Wilcoxon-féle előjeles rangpróba (1945) és a McNemar-teszt (1947).
+
+A Holm-korrekció **metrikacsaládonként** fut — `adherence`, `response`, `runtime` —, nem a
+teljes táblára. A családokat a kód előre deklarálja, tehát nem az eredmény ismeretében
+születnek. Ok: a mintegy negyven metrika többsége milliszekundum, és egyetlen közös
+korrekció alatt egy minőségi állításhoz szükséges bizonyítékot az hígítaná fel, hogy hány
+időmérés került mellé — az pedig a mérés részletessége, nem a kérdés része.
+
+## Felhasznált irodalom
+
+A státusz jelentése: `verifiable` = konstrukció szerint eldől, `validated` = validált eszköz
+vagy publikált statisztikai elmélet, `established` = elterjedt, emberi korrelációval
+alátámasztott módszer, `surrogate` = publikált módszer tudatos egyszerűsítése.
+
+| Módszer | Forrás | Státusz |
+| --- | --- | --- |
+| ellenőrizhető utasításkövetés | Zhou et al., 2023 (IFEval) | verifiable |
+| token-szintű F1 | Rajpurkar et al., 2016 (SQuAD) | established |
+| ROUGE-1, ROUGE-L | Lin, 2004 | established |
+| átfedés-metrikák korlátai | Liu et al., 2016 | validated |
+| olvashatóság | Flesch, 1948; Kincaid et al., 1975 | validated |
+| önkonzisztencia | Manakul et al., 2023 (SelfCheckGPT) | established |
+| token-átfedéses támogatási kernel | – (a publikált BERTScore/NLI helyett) | surrogate |
+| atomi ténypontosság | Min et al., 2023 (FActScore) | established |
+| rubrika-alapú bírálat | Liu et al., 2023 (G-Eval); Kim et al., 2024 (Prometheus 2) | established |
+| bírálói panel | Verga et al., 2024 | established |
+| pozíció-torzítás kezelése | Zheng et al., 2023 | established |
+| egészségügyi értékelési keret | Tam et al., 2024 (QUEST) | validated |
+| empátia | Sharma et al., 2020 (EPITOME) | validated |
+| túlzott elutasítás | Röttger et al., 2024 (XSTest) | established |
+| klinikai túllépés | Singhal et al., 2023 | validated |
+| Krippendorff α | Krippendorff, 2018 | validated |
+| Cohen κ, Fleiss κ | Cohen, 1960; Fleiss, 1971 | validated |
+| Gwet AC1, prevalencia-paradoxon | Gwet, 2008; Feinstein és Cicchetti, 1990 | validated |
+| ICC | Shrout és Fleiss, 1979; Koo és Li, 2016 | validated |
+| prediction-powered inference | Angelopoulos et al., 2023 | validated |
+| bootstrap intervallum | Efron és Tibshirani, 1993 | validated |
+| Cliff δ, TOST, Holm | Cliff, 1993; Lakens, 2017; Holm, 1979 | validated |
+| páros rangpróba, páros bináris teszt | Wilcoxon, 1945; McNemar, 1947 | validated |
+| szerkesztési távolság, szó- és karakterhibaarány | Levenshtein, 1966 | verifiable |
+| a WER és a megértés kapcsolatának korlátai | Wang et al., 2003 | established |
+| a 95. percentilis mint a felhasználó által érzékelt késés | Dean és Barroso, 2013 | established |
+| beszélő dialógusrendszerek költség-mérése | Walker et al., 1997 (PARADISE) | validated |
+
+A `--emit-bibtex` a ténylegesen használt módszerekhez ír BibTeX-tételeket, így a
+bibliográfia nem hízik fel nem hivatkozott tételekkel.
+
+## Korlátok, amiket a cikkben is jelezni kell
+
+A bírálói pontszám **szűrőeszköz, nem validált mérőműszer**; humán kalibráció nélkül ne
+közöljük minőségi becslésként. Az önkonzisztencia értékei a saját futáson belül
+rangsorolnak, publikált SelfCheckGPT-számokkal nem vethetők össze. Az olvashatósági
+formulák írott szövegre validáltak, a szintetizált beszéd érthetőségéhez hallgatási teszt
+kell (ITU-T P.85 vagy P.808). Végül a lefedettség behatárol mindent: nyílt tartományú
+itemeken számolt érték nem hordoz állítást terápiás forgatókönyvekről.
+
+## Önteszt
+
+```powershell
+py -m evaluation.selftest
+```
+
+125 ellenőrzés, hálózat nélkül. A statisztikákat kézzel levezetett vagy publikált
+példaértékekhez méri, mert egy hibás együttható is hihető számot ad.

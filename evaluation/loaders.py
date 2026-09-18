@@ -18,9 +18,11 @@ the reference-based scores auditable against the published dataset.
 import ast
 import csv
 from dataclasses import dataclass, field
+from io import StringIO
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Sequence
 
 import yaml
 
@@ -254,8 +256,7 @@ def load_answer_key(path: Optional[Path]) -> Dict[str, Dict[str, Any]]:
     if not path.exists():
         raise FileNotFoundError(f"Answer key not found: {path}")
 
-    with open(path, "r", encoding="utf-8-sig", newline="") as handle:
-        rows = list(csv.DictReader(handle))
+    rows = _read_metadata_rows(path)
     if not rows:
         return {}
 
@@ -274,6 +275,93 @@ def load_answer_key(path: Optional[Path]) -> Dict[str, Dict[str, Any]]:
         for key in entry.pop("_keys"):
             index[_spec_key(key)] = entry
     return index
+
+
+_TRAILING_SEMIS = re.compile(r";+\s*$")
+_ROW_ID_WAV = re.compile(r'^"?(\d+),(\d+\.wav),(.+)$', re.DOTALL)
+_IMPOSSIBLE_TAIL = re.compile(r",(True|False),(.*)$")
+
+
+def _read_metadata_rows(path: Path) -> List[Dict[str, str]]:
+    """Read a metadata table, including Excel-wrapped HeySQuAD exports.
+
+    Some spreadsheet exports wrap each data row in an extra quote pair and pad
+    the line with trailing semicolons. A stock DictReader then sees one column
+    and drops the answer key. Trailing padding is stripped, a row that parsed
+    as a single comma-containing field is split again, and remaining 8-column
+    HeySQuAD rows are recovered from the id/filename head and the
+    is_impossible tail.
+    """
+    text = Path(path).read_text(encoding="utf-8-sig")
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    header = _parse_csv_fields(_TRAILING_SEMIS.sub("", lines[0].strip()))
+    header = [name.strip() for name in header]
+    expected = len(header)
+    rows: List[Dict[str, str]] = []
+    for line in lines[1:]:
+        fields = _parse_metadata_row(line, expected)
+        if not fields:
+            continue
+        if len(fields) < expected:
+            fields = fields + [""] * (expected - len(fields))
+        rows.append({header[i]: fields[i] for i in range(expected)})
+    return rows
+
+
+def _parse_metadata_row(line: str, expected: int) -> Optional[List[str]]:
+    """Return one row's fields, or None when the line is not a record."""
+    stripped = _TRAILING_SEMIS.sub("", line.strip())
+    if not stripped:
+        return None
+    fields = _parse_csv_fields(stripped)
+    if len(fields) == expected:
+        return fields
+    if len(fields) == 1 and "," in fields[0]:
+        inner = _parse_csv_fields(fields[0])
+        if len(inner) == expected:
+            return inner
+        recovered = _recover_heysquad_row(fields[0], expected)
+        if recovered:
+            return recovered
+    recovered = _recover_heysquad_row(stripped.strip('"'), expected)
+    return recovered
+
+
+def _parse_csv_fields(text: str) -> List[str]:
+    try:
+        return next(csv.reader(StringIO(text)))
+    except (csv.Error, StopIteration):
+        return [text]
+
+
+def _recover_heysquad_row(text: str, expected: int) -> Optional[List[str]]:
+    """Rebuild an 8-column HeySQuAD row when context quoting was broken."""
+    if expected < 8:
+        return None
+    match = _ROW_ID_WAV.match(text.strip())
+    if not match:
+        return None
+    item_id, filename, rest = match.group(1), match.group(2), match.group(3)
+    tail = _IMPOSSIBLE_TAIL.search(rest)
+    if not tail:
+        return None
+    impossible = tail.group(1)
+    plausible = tail.group(2).strip().strip('"')
+    middle = _parse_csv_fields(rest[:tail.start()])
+    if len(middle) < 3:
+        return None
+    transcription = middle[0]
+    question = middle[1]
+    answer = middle[-1] if len(middle) >= 4 else ""
+    context = ",".join(middle[2:-1]) if len(middle) >= 4 else middle[2]
+    fields = [item_id, filename, transcription, question, context, answer,
+              impossible, plausible]
+    if expected > 8:
+        fields.extend([""] * (expected - 8))
+    return fields
 
 
 def _match_columns(header: Any) -> Dict[str, Optional[str]]:
@@ -326,15 +414,77 @@ def _answer_variants(value: str) -> List[str]:
         value = value.rsplit(_BLED_PASSAGE_MARKER, 1)[1].strip()
 
     if value.startswith("[") and value.endswith("]"):
+        parsed = None
         try:
             parsed = ast.literal_eval(value)
         except (SyntaxError, ValueError):
-            parsed = None
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                parsed = None
         if isinstance(parsed, (list, tuple)):
-            return [text for text in (str(item).strip() for item in parsed) if text]
+            return _unique_answer_texts(parsed)
 
     value = _unwrap_quotes(value)
     return [value] if value else []
+
+
+def _unique_answer_texts(items: Any) -> List[str]:
+    """SQuAD-style answer lists store dicts with a `text` field, not strings.
+
+    A HeySQuAD export writes
+    `[{'answer_start': 24, 'text': 'Ku band'}, ...]`. Taking `str(item)`
+    would score the dict repr against the response; extracting `text` keeps
+    the gold span. Duplicates are dropped, order preserved, because several
+    annotators often write the same span.
+    """
+    texts: List[str] = []
+    seen = set()
+    for item in items:
+        if isinstance(item, dict):
+            text = str(item.get("text") or item.get("answer") or "").strip()
+        else:
+            text = str(item).strip()
+        key = text.lower()
+        if text and key not in seen:
+            seen.add(key)
+            texts.append(text)
+    return texts
+
+
+def item_stem(value: str) -> str:
+    """Recording identity used to exclude or join items, without the extension."""
+    name = Path(str(value or "").replace("\\", "/")).name
+    return Path(name).stem.strip().lower()
+
+
+def exclude_records(records: Sequence[Record],
+                    stems: Sequence[str]) -> List[Record]:
+    """Drop recordings whose stem is in `stems`.
+
+    Used for corpus defects that survived construction: a mismatched wav and
+    metadata row must not enter WER or response scores, or they would be
+    attributed to the recognizer or the model.
+    """
+    blocked = {item_stem(stem) for stem in stems if stem}
+    if not blocked:
+        return list(records)
+    return [record for record in records
+            if item_stem(record.filename or record.item_id) not in blocked]
+
+
+def include_records(records: Sequence[Record],
+                    stems: Sequence[str]) -> List[Record]:
+    """Keep only recordings whose stem is in `stems`.
+
+    Used to restrict a costly tier (LLM-as-judge) to a predeclared sample.
+    An empty `stems` list is a no-op, matching `exclude_records`.
+    """
+    allowed = {item_stem(stem) for stem in stems if stem}
+    if not allowed:
+        return list(records)
+    return [record for record in records
+            if item_stem(record.filename or record.item_id) in allowed]
 
 
 def _unwrap_quotes(value: str) -> str:
